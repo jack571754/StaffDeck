@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Optional
-from uuid import uuid4
 
 from sqlalchemy import JSON, Column, Index, Integer, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
-
-def utc_now() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
-
-
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid4().hex[:16]}"
+from app.db.utils import new_id, utc_now
 
 
 class Tenant(SQLModel, table=True):

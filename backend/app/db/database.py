@@ -60,7 +60,9 @@ _CAPABILITY_SCOPE_TABLES = (
 
 
 def init_db() -> None:
-    import app.db.models  # noqa: F401
+    # Register all models with SQLModel.metadata before create_all.
+    import app.data_query.models
+    import app.db.models
 
     _configure_sqlite_runtime()
     SQLModel.metadata.create_all(engine)
@@ -133,7 +135,6 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_feishu_channel_schema(conn, tables)
         _migrate_channel_inbound_run_schema(conn, tables)
         _migrate_channel_bind_code_constraints(conn, tables)
-        _migrate_wechat_kf_accounts(conn, tables)
         _migrate_capability_scope_schema(conn, inspector, tables)
         _migrate_harness_v2_schema(conn, inspector, tables)
 
@@ -267,6 +268,9 @@ def _migrate_sqlite_skill_schema() -> None:
                 conn.execute(text("ALTER TABLE channel_bindings ADD COLUMN team_id VARCHAR"))
             if "name" not in binding_columns:
                 conn.execute(text("ALTER TABLE channel_bindings ADD COLUMN name VARCHAR"))
+            # 必须在 team_id 列就绪后再迁移 wechat_kf 账号：该迁移查询
+            # channel_bindings.team_id，若早于此执行会在 legacy 表上崩溃。
+            _migrate_wechat_kf_accounts(conn, tables)
 
         if "channel_deliveries" in tables:
             delivery_columns = {column["name"] for column in inspector.get_columns("channel_deliveries")}
