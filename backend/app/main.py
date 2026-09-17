@@ -31,6 +31,7 @@ from app.api import (
     ui_config,
     wechat_kf,
 )
+from app.data_query.api import router as data_query_router
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
 from app.config import get_settings
@@ -151,6 +152,7 @@ app.include_router(sessions.router)
 app.include_router(traces.router)
 app.include_router(mock.router)
 app.include_router(a2a_router)
+app.include_router(data_query_router)
 
 if settings.public_api_enabled:
     app.mount("/api/v1", create_public_api_app())
