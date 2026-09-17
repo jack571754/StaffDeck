@@ -49,6 +49,7 @@ def decrypt_value(ciphertext: str, key: bytes | None = None) -> str:
     """Decrypt a value produced by :func:`encrypt_value`.
 
     If *ciphertext* does not start with ``enc:`` it is returned as-is.
+    Non-string values (None, int, etc.) are passed through unchanged.
 
     Args:
         ciphertext: The encrypted string (or plaintext to pass through).
@@ -57,6 +58,8 @@ def decrypt_value(ciphertext: str, key: bytes | None = None) -> str:
     Raises:
         ValueError: If the ciphertext has the ``enc:`` prefix but cannot be decrypted.
     """
+    if not isinstance(ciphertext, str):
+        return ciphertext  # type: ignore[return-value]
     if not ciphertext.startswith(_PREFIX):
         return ciphertext
     raw = base64.b64decode(ciphertext[len(_PREFIX):])
@@ -72,15 +75,16 @@ def decrypt_value(ciphertext: str, key: bytes | None = None) -> str:
 
 
 def encrypt_config(
-    config: dict,
+    config: dict[str, Any],
     sensitive_keys: list[str],
     key: bytes | None = None,
-) -> dict:
-    """Encrypt specified keys in a configuration dict in-place.
+) -> dict[str, Any]:
+    """Encrypt specified keys in a configuration dict.
 
     Args:
         config: The configuration dictionary (shallow-copied before mutation).
-        sensitive_keys: List of top-level keys whose string values should be encrypted.
+        sensitive_keys: List of top-level keys whose values should be encrypted
+            (converted to string first if not already a string).
         key: Optional 32-byte key. If None, derived from APP_SECRET.
 
     Returns:
@@ -89,16 +93,16 @@ def encrypt_config(
     """
     result = dict(config)
     for k in sensitive_keys:
-        if k in result and isinstance(result[k], str) and result[k]:
-            result[k] = encrypt_value(result[k], key=key)
+        if k in result and result[k] is not None and result[k] != "":
+            result[k] = encrypt_value(str(result[k]), key=key)
     return result
 
 
 def decrypt_config(
-    config: dict,
+    config: dict[str, Any],
     sensitive_keys: list[str],
     key: bytes | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Decrypt specified keys in a configuration dict.
 
     Keys whose values are not encrypted (no ``enc:`` prefix) are left as-is.
