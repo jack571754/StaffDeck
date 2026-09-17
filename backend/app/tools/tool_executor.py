@@ -117,6 +117,15 @@ class ToolExecutor:
                 invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
             )
+        if (tool.tool_type or "http") == "data_query":
+            return self._execute_data_query_tool(
+                tool,
+                tool_call.arguments,
+                agent_id=agent_id,
+                session_id=session_id,
+                active_skill_id=active_skill_id,
+                timeout_seconds_override=timeout_seconds_override,
+            )
         if (tool.tool_type or "http") != "http":
             return self._error(
                 tool.name, "UNSUPPORTED_TOOL_TYPE", f"不支持的工具类型：{tool.tool_type}"
@@ -373,6 +382,50 @@ class ToolExecutor:
             error=None,
         )
 
+    def _execute_data_query_tool(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        active_skill_id: str | None = None,
+        timeout_seconds_override: float | None = None,
+    ) -> ToolResult:
+        from app.data_query.service import execute_query_by_id
+
+        config = tool.config_json if isinstance(tool.config_json, dict) else {}
+        template_id = config.get("template_id")
+        if not template_id:
+            return self._error(
+                tool.name, "MISCONFIGURATION", "工具缺少 template_id 配置。"
+            )
+
+        params = arguments.get("params", {}) if isinstance(arguments, dict) else {}
+        output_format = config.get("output_format", "table")
+
+        try:
+            result = execute_query_by_id(self.db, template_id, tool.tenant_id, params)
+        except ValueError as exc:
+            return self._error(tool.name, "QUERY_ERROR", str(exc))
+        except Exception as exc:
+            return self._error(tool.name, "EXECUTION_FAILED", f"查询执行失败: {exc}")
+
+        text = _format_query_result_text(result, output_format)
+        return ToolResult(
+            tool_name=tool.name,
+            success=True,
+            data={
+                "text": text,
+                "columns": result.columns,
+                "rows": result.rows,
+                "row_count": result.row_count,
+                "execution_time_ms": result.execution_time_ms,
+                "cached": result.cached,
+            },
+            error=None,
+        )
+
     def _execute_a2a_tool(
         self,
         tool: Tool,
@@ -625,3 +678,34 @@ class ToolExecutor:
 
 def _default_port(scheme: str) -> int | None:
     return 443 if scheme.lower() == "https" else 80 if scheme.lower() == "http" else None
+
+
+def _format_query_result_text(result: Any, fmt: str = "table") -> str:
+    """Format a QueryExecuteResult as human-readable text."""
+    if result.row_count == 0:
+        return "查询结果：无数据"
+    if fmt == "json":
+        return json.dumps(
+            {
+                "columns": result.columns,
+                "rows": result.rows,
+                "row_count": result.row_count,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    # Markdown table format
+    lines = []
+    header = "| " + " | ".join(result.columns) + " |"
+    separator = "| " + " | ".join("---" for _ in result.columns) + " |"
+    lines.append(header)
+    lines.append(separator)
+    for row in result.rows:
+        lines.append(
+            "| " + " | ".join(str(row.get(c, "")) for c in result.columns) + " |"
+        )
+    lines.append(
+        f"\n共 {result.row_count} 行，耗时 {result.execution_time_ms:.0f}ms"
+        + ("（缓存命中）" if result.cached else "")
+    )
+    return "\n".join(lines)

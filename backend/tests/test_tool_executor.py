@@ -4,14 +4,14 @@ from pathlib import Path
 
 import httpx
 import pytest
-
-from app.agents.branching import ensure_private_resource_binding
-from app.tools.tool_executor import ToolExecutor
-from app.tools.tool_schema import ToolCall
-from app.db.models import A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
-from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
+
+from app.agents.branching import ensure_private_resource_binding
+from app.db.models import A2ATaskEvent, A2ATaskRun, AgentProfile, MCPServer, Tenant, Tool
+from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
+from app.tools.tool_executor import ToolExecutor
+from app.tools.tool_schema import ToolCall
 
 
 def test_resolve_secret_header(monkeypatch):
@@ -893,6 +893,234 @@ def test_execute_get_tool_preserves_query_string_when_arguments_empty(monkeypatc
         ),
         "params": None,
     }
+
+
+def test_data_query_tool_execution_success() -> None:
+    from unittest.mock import patch
+
+    from app.data_query.models import QueryExecuteResult
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.user_lookup",
+                display_name="用户查询",
+                description="按状态查询用户列表",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://qt_template_001",
+                config_json={"template_id": "qt_template_001", "output_format": "table"},
+                input_schema={"type": "object", "properties": {"status": {"type": "string"}}},
+                output_schema={"type": "object"},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        mock_result = QueryExecuteResult(
+            template_id="qt_template_001",
+            columns=["id", "name", "status"],
+            rows=[
+                {"id": 1, "name": "Alice", "status": "active"},
+                {"id": 2, "name": "Bob", "status": "active"},
+            ],
+            row_count=2,
+            execution_time_ms=12.5,
+            cached=False,
+        )
+
+        with patch(
+            "app.data_query.service.execute_query_by_id", return_value=mock_result
+        ):
+            result = ToolExecutor(db).execute(
+                tenant_id="tenant_demo",
+                tool_call=ToolCall(
+                    name="query.user_lookup",
+                    arguments={"params": {"status": "active"}},
+                ),
+            )
+
+    assert result.success is True
+    assert result.tool_name == "query.user_lookup"
+    assert result.error is None
+    assert result.data is not None
+    assert result.data["row_count"] == 2
+    assert result.data["columns"] == ["id", "name", "status"]
+    assert len(result.data["rows"]) == 2
+    assert "共 2 行" in result.data["text"]
+    assert "Alice" in result.data["text"]
+
+
+def test_data_query_tool_missing_template_id() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.broken",
+                display_name="损坏的查询",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://broken",
+                config_json={},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            tenant_id="tenant_demo",
+            tool_call=ToolCall(name="query.broken", arguments={}),
+        )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "MISCONFIGURATION"
+    assert "template_id" in result.error.message
+
+
+def test_data_query_tool_inactive_template() -> None:
+    from unittest.mock import patch
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.draft",
+                display_name="草稿查询",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://qt_draft",
+                config_json={"template_id": "qt_draft"},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        with patch(
+            "app.data_query.service.execute_query_by_id",
+            side_effect=ValueError("Query template is not active"),
+        ):
+            result = ToolExecutor(db).execute(
+                tenant_id="tenant_demo",
+                tool_call=ToolCall(name="query.draft", arguments={"params": {}}),
+            )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "QUERY_ERROR"
+    assert "not active" in result.error.message
+
+
+def test_data_query_tool_json_format() -> None:
+    from unittest.mock import patch
+
+    from app.data_query.models import QueryExecuteResult
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.json_out",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://qt_json",
+                config_json={"template_id": "qt_json", "output_format": "json"},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        mock_result = QueryExecuteResult(
+            template_id="qt_json",
+            columns=["id"],
+            rows=[{"id": 42}],
+            row_count=1,
+            execution_time_ms=5.0,
+            cached=True,
+        )
+
+        with patch(
+            "app.data_query.service.execute_query_by_id", return_value=mock_result
+        ):
+            result = ToolExecutor(db).execute(
+                tenant_id="tenant_demo",
+                tool_call=ToolCall(name="query.json_out", arguments={"params": {}}),
+            )
+
+    assert result.success is True
+    assert '"id": 42' in result.data["text"]
+
+
+def test_data_query_tool_empty_result() -> None:
+    from unittest.mock import patch
+
+    from app.data_query.models import QueryExecuteResult
+
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.empty",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://qt_empty",
+                config_json={"template_id": "qt_empty"},
+                enabled=True,
+            )
+        )
+        db.commit()
+
+        mock_result = QueryExecuteResult(
+            template_id="qt_empty",
+            columns=[],
+            rows=[],
+            row_count=0,
+            execution_time_ms=2.0,
+            cached=False,
+        )
+
+        with patch(
+            "app.data_query.service.execute_query_by_id", return_value=mock_result
+        ):
+            result = ToolExecutor(db).execute(
+                tenant_id="tenant_demo",
+                tool_call=ToolCall(name="query.empty", arguments={"params": {}}),
+            )
+
+    assert result.success is True
+    assert "无数据" in result.data["text"]
+
+
+def test_data_query_tool_disabled() -> None:
+    with _test_session() as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.add(
+            Tool(
+                tenant_id="tenant_demo",
+                name="query.disabled",
+                tool_type="data_query",
+                method="POST",
+                url="data_query://qt_disabled",
+                config_json={"template_id": "qt_disabled"},
+                enabled=False,
+            )
+        )
+        db.commit()
+
+        result = ToolExecutor(db).execute(
+            tenant_id="tenant_demo",
+            tool_call=ToolCall(name="query.disabled", arguments={}),
+        )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "DISABLED"
 
 
 def _mock_mcp_server_path() -> Path:
