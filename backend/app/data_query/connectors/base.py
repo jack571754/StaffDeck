@@ -44,7 +44,7 @@ class BaseConnector:
     Args:
         data_source: A data source configuration object (e.g.
             :class:`app.data_query.models.DataSource`) with at least
-            ``source_type``, ``config_json``, and ``read_only`` attributes.
+            ``type``, ``config_json``, and ``read_only`` attributes.
     """
 
     def __init__(self, data_source: Any) -> None:
@@ -52,9 +52,9 @@ class BaseConnector:
         self._connected = False
 
     @property
-    def source_type(self) -> str:
+    def type(self) -> str:
         """Return the data source type string."""
-        return getattr(self._data_source, "source_type", "")
+        return getattr(self._data_source, "type", "")
 
     @property
     def config(self) -> dict[str, Any]:

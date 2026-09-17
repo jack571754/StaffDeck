@@ -125,7 +125,7 @@ def test_data_query_models_register_and_create():
         ds = DataSource(
             tenant_id="t_test",
             name="test-db",
-            source_type="postgres",
+            type="postgres",
             config_json={"host": "localhost", "password": "enc:test"},
         )
         session.add(ds)
@@ -134,20 +134,26 @@ def test_data_query_models_register_and_create():
         assert ds.id.startswith("ds_")
         assert ds.name == "test-db"
         assert ds.config_json["host"] == "localhost"
+        assert ds.read_only is True
 
         qt = QueryTemplate(
             tenant_id="t_test",
             data_source_id=ds.id,
             name="list-users",
-            query_text="SELECT * FROM users WHERE status = :status",
-            parameters_json=[{"name": "status", "type": "string", "default": "active"}],
+            query_type="sql",
+            query_content="SELECT * FROM users WHERE status = :status",
+            params_json=[{"name": "status", "type": "string", "default": "active"}],
         )
         session.add(qt)
         session.commit()
         session.refresh(qt)
         assert qt.id.startswith("qt_")
         assert qt.data_source_id == ds.id
-        assert qt.query_text.startswith("SELECT")
+        assert qt.query_content.startswith("SELECT")
+        assert qt.status == "draft"
+        assert qt.cache_ttl == 300
+        assert qt.timeout_seconds == 30
+        assert qt.max_rows == 1000
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +169,8 @@ def test_datasource_read_excludes_config_json():
     assert "config_json" not in field_names
     assert "id" in field_names
     assert "name" in field_names
-    assert "source_type" in field_names
+    assert "type" in field_names
+    assert "read_only" in field_names
 
 
 # ---------------------------------------------------------------------------

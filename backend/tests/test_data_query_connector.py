@@ -24,13 +24,13 @@ from app.data_query.connectors.mysql_connector import (
 
 
 def _make_data_source(
-    source_type: str = "mysql",
+    type: str = "mysql",
     config_json: dict | None = None,
     read_only: bool = True,
 ):
     """Build a lightweight mock data source object."""
     return SimpleNamespace(
-        source_type=source_type,
+        type=type,
         config_json=config_json or {},
         read_only=read_only,
     )
@@ -150,7 +150,7 @@ class TestMySQLConnector:
             "password": "secret",
         }
         cfg.update(cfg_overrides)
-        ds = _make_data_source(source_type="mysql", config_json=cfg)
+        ds = _make_data_source(type="mysql", config_json=cfg)
         return MySQLConnector(ds)
 
     def test_execute_with_params_mocked(self):
@@ -253,7 +253,7 @@ class TestHttpApiConnector:
             "timeout": 10,
         }
         cfg.update(cfg_overrides)
-        ds = _make_data_source(source_type="http_api", config_json=cfg)
+        ds = _make_data_source(type="http_api", config_json=cfg)
         return HttpApiConnector(ds)
 
     def test_execute_list_response(self):
@@ -393,27 +393,27 @@ class TestHttpApiConnector:
 
 class TestGetConnector:
     def test_mysql_returns_mysql_connector(self):
-        ds = _make_data_source(source_type="mysql")
+        ds = _make_data_source(type="mysql")
         connector = get_connector(ds)
         assert isinstance(connector, MySQLConnector)
 
     def test_http_api_returns_http_connector(self):
-        ds = _make_data_source(source_type="http_api")
+        ds = _make_data_source(type="http_api")
         connector = get_connector(ds)
         assert isinstance(connector, HttpApiConnector)
 
     def test_unknown_type_raises_value_error(self):
-        ds = _make_data_source(source_type="postgres")
+        ds = _make_data_source(type="postgres")
         with pytest.raises(ValueError, match="Unsupported data source type"):
             get_connector(ds)
 
-    def test_missing_source_type_raises_value_error(self):
-        ds = SimpleNamespace()  # no source_type
-        with pytest.raises(ValueError, match="no 'source_type'"):
+    def test_missing_type_raises_value_error(self):
+        ds = SimpleNamespace()  # no type
+        with pytest.raises(ValueError, match="no 'type'"):
             get_connector(ds)
 
     def test_all_connectors_inherit_base(self):
         for stype in ("mysql", "http_api"):
-            ds = _make_data_source(source_type=stype)
+            ds = _make_data_source(type=stype)
             connector = get_connector(ds)
             assert isinstance(connector, BaseConnector)

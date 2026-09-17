@@ -28,38 +28,35 @@ class DataSource(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("ds"), primary_key=True)
     tenant_id: str = Field(index=True)
-    name: str
-    description: str | None = None
+    name: str = Field(max_length=100, index=True)
+    description: str = Field(default="", max_length=500)
     # e.g. "mysql", "postgres", "sqlite", "http_api", "clickhouse"
-    source_type: str = Field(index=True)
+    type: str = Field(max_length=20, index=True)
     # Connection/configuration dict; sensitive fields are encrypted with ``enc:`` prefix
     config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    status: str = Field(default="active", index=True)
-    # Optional SQLModel compat: which agent profile / scope can use this source
-    capability_scope: str = Field(default="general", index=True)
-    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    read_only: bool = Field(default=True)
+    status: str = Field(default="active", max_length=20, index=True)
+    last_test_at: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
 class DataSourceCreate(SQLModel):
     name: str
-    description: str | None = None
-    source_type: str
+    description: str = ""
+    type: str
     config_json: dict[str, Any] = Field(default_factory=dict)
+    read_only: bool = True
     status: str = "active"
-    capability_scope: str = "general"
-    metadata_json: dict[str, Any] = Field(default_factory=dict)
 
 
 class DataSourceUpdate(SQLModel):
     name: str | None = None
     description: str | None = None
-    source_type: str | None = None
+    type: str | None = None
     config_json: dict[str, Any] | None = None
+    read_only: bool | None = None
     status: str | None = None
-    capability_scope: str | None = None
-    metadata_json: dict[str, Any] | None = None
 
 
 class DataSourceRead(SQLModel):
@@ -68,11 +65,11 @@ class DataSourceRead(SQLModel):
     id: str
     tenant_id: str
     name: str
-    description: str | None = None
-    source_type: str
+    description: str = ""
+    type: str
+    read_only: bool
     status: str
-    capability_scope: str
-    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    last_test_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -92,58 +89,70 @@ class QueryTemplate(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: new_id("qt"), primary_key=True)
     tenant_id: str = Field(index=True)
+    name: str = Field(max_length=100, index=True)
+    description: str = Field(default="", max_length=1000)
     data_source_id: str = Field(index=True)
-    name: str
-    description: str | None = None
+    # "sql" or "http"
+    query_type: str = Field(default="sql", max_length=20)
     # The query body (SQL statement, API endpoint path, etc.)
-    query_text: str
+    query_content: str = Field(default="")
     # Parameter definitions: [{"name": "...", "type": "string", "default": ...}, ...]
-    parameters_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
-    # Expected output column metadata
-    output_schema_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
-    status: str = Field(default="active", index=True)
-    capability_scope: str = Field(default="general", index=True)
-    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    params_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    # Output column configuration
+    output_config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # Cache TTL in seconds; 0 means no caching
+    cache_ttl: int = Field(default=300)
+    # Execution timeout in seconds
+    timeout_seconds: int = Field(default=30)
+    # Maximum number of rows to return
+    max_rows: int = Field(default=1000)
+    status: str = Field(default="draft", max_length=20, index=True)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
 class QueryTemplateCreate(SQLModel):
-    data_source_id: str
     name: str
-    description: str | None = None
-    query_text: str
-    parameters_json: list[dict[str, Any]] = Field(default_factory=list)
-    output_schema_json: dict[str, Any] = Field(default_factory=dict)
-    status: str = "active"
-    capability_scope: str = "general"
-    metadata_json: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+    data_source_id: str
+    query_type: str = "sql"
+    query_content: str = ""
+    params_json: list[dict[str, Any]] = Field(default_factory=list)
+    output_config_json: dict[str, Any] = Field(default_factory=dict)
+    cache_ttl: int = 300
+    timeout_seconds: int = 30
+    max_rows: int = 1000
+    status: str = "draft"
 
 
 class QueryTemplateUpdate(SQLModel):
-    data_source_id: str | None = None
     name: str | None = None
     description: str | None = None
-    query_text: str | None = None
-    parameters_json: list[dict[str, Any]] | None = None
-    output_schema_json: dict[str, Any] | None = None
+    data_source_id: str | None = None
+    query_type: str | None = None
+    query_content: str | None = None
+    params_json: list[dict[str, Any]] | None = None
+    output_config_json: dict[str, Any] | None = None
+    cache_ttl: int | None = None
+    timeout_seconds: int | None = None
+    max_rows: int | None = None
     status: str | None = None
-    capability_scope: str | None = None
-    metadata_json: dict[str, Any] | None = None
 
 
 class QueryTemplateRead(SQLModel):
     id: str
     tenant_id: str
-    data_source_id: str
     name: str
-    description: str | None = None
-    query_text: str
-    parameters_json: list[dict[str, Any]] = Field(default_factory=list)
-    output_schema_json: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+    data_source_id: str
+    query_type: str
+    query_content: str
+    params_json: list[dict[str, Any]] = Field(default_factory=list)
+    output_config_json: dict[str, Any] = Field(default_factory=dict)
+    cache_ttl: int
+    timeout_seconds: int
+    max_rows: int
     status: str
-    capability_scope: str
-    metadata_json: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
@@ -157,20 +166,18 @@ class QueryExecuteRequest(SQLModel):
     """Request payload for executing a query template with concrete parameters."""
 
     template_id: str
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    # Optional execution options (timeout, pagination, etc.)
-    options: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class QueryExecuteResult(SQLModel):
     """Result payload from executing a query template."""
 
     template_id: str
+    # Column names as ordered list of strings
+    columns: list[str] = Field(default_factory=list)
     # Result rows as list of dicts
     rows: list[dict[str, Any]] = Field(default_factory=list)
-    # Column metadata
-    columns: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
     # Execution stats
     execution_time_ms: float = 0.0
-    error: str | None = None
+    cached: bool = False
