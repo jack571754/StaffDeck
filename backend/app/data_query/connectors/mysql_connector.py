@@ -25,9 +25,14 @@ _SQL_ALLOW_PATTERN = re.compile(
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 
-# Named parameters in :param_name style (Python re has no \k in full lookbehind,
-# we just scan with a simple pattern and require a word boundary).
-_PARAM_PATTERN = re.compile(r":(\w+)")
+# Named parameters in :param_name style. The lookbehinds prevent false
+# positives:
+#   * ``(?<!:`` — keeps PostgreSQL-style casts like ``v::date`` intact;
+#   * ``(?<!\w)`` — keeps string literals like ``'%10:30%'`` (colon preceded
+#     by a digit/word char) from being turned into bind parameters.
+# Known limitation: a ``:name`` occurrence preceded by whitespace *inside* a
+# string literal would still be converted (regex cannot see string quoting).
+_PARAM_PATTERN = re.compile(r"(?<!:)(?<!\w):([a-zA-Z_][a-zA-Z0-9_]*)")
 
 _MYSQL_SENSITIVE_KEYS = ["password"]
 
@@ -98,8 +103,13 @@ class MySQLConnector(BaseConnector):
             )
         return self._decrypted_config
 
-    def _connect(self) -> None:
-        """Open a pymysql connection (lazy, idempotent)."""
+    def _connect(self, timeout: int = 30) -> None:
+        """Open a pymysql connection (lazy, idempotent).
+
+        Args:
+            timeout: Seconds allowed for connect/read/write. The connect
+                phase is capped at 10s; read/write follow the full timeout.
+        """
         if self._conn is not None:
             return
         try:
@@ -129,6 +139,9 @@ class MySQLConnector(BaseConnector):
             password=password,
             charset=charset,
             cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=min(timeout, 10),
+            read_timeout=timeout,
+            write_timeout=timeout,
         )
         self._connected = True
 
@@ -176,7 +189,7 @@ class MySQLConnector(BaseConnector):
                 "queries are allowed in read-only mode"
             )
 
-        self._connect()
+        self._connect(timeout=timeout)
         assert self._conn is not None, "connection should be open after _connect"
 
         converted_query, _ = _convert_params(query)
