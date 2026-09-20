@@ -26,7 +26,8 @@ from app.data_query.models import (
 )
 from app.db import get_session
 from app.db.models import User
-from app.security.auth import get_current_user
+from app.security.auth import ensure_current_user_tenant, get_current_user
+from app.security.permissions import ensure_tenant_admin
 from app.security.tenant import ensure_tenant
 
 router = APIRouter(
@@ -46,10 +47,21 @@ def _resolve_tenant(
     tenant_id: str | None,
     current_user: User,
 ) -> str:
-    """Resolve the tenant_id, falling back to the current user's tenant."""
+    """Resolve the tenant_id and verify the current user belongs to it.
+
+    A logged-in member may only ever operate on their own tenant: passing
+    another tenant's id is rejected with 403 before any tenant lookup, so
+    cross-tenant data sources / templates / executions are unreachable.
+    """
     tid = (tenant_id or "").strip() or str(current_user.tenant_id)
+    ensure_current_user_tenant(tid, current_user)
     ensure_tenant(db, tid)
     return tid
+
+
+def _ensure_tenant_admin(tid: str, current_user: User) -> None:
+    """Require an administrator of *tid* for management endpoints."""
+    ensure_tenant_admin(tid, current_user)
 
 
 def _data_source_read(ds) -> DataSourceRead:
@@ -130,6 +142,7 @@ def create_data_source(
 ) -> DataSourceRead:
     """Create a new data source."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     try:
         ds = service.create_data_source(db, tid, request)
     except ValueError as exc:
@@ -147,6 +160,7 @@ def update_data_source(
 ) -> DataSourceRead:
     """Update an existing data source."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     ds = _get_data_source_or_404(db, ds_id, tid)
     try:
         ds = service.update_data_source(db, ds, request)
@@ -164,6 +178,7 @@ def delete_data_source(
 ) -> None:
     """Delete a data source."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     ds = _get_data_source_or_404(db, ds_id, tid)
     service.delete_data_source(db, ds)
 
@@ -225,6 +240,7 @@ def create_query_template(
 ) -> QueryTemplateRead:
     """Create a new query template."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     try:
         qt = service.create_query_template(db, tid, request)
     except ValueError as exc:
@@ -242,6 +258,7 @@ def update_query_template(
 ) -> QueryTemplateRead:
     """Update an existing query template."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     qt = _get_query_template_or_404(db, qt_id, tid)
     try:
         qt = service.update_query_template(db, qt, request)
@@ -259,6 +276,7 @@ def delete_query_template(
 ) -> None:
     """Delete a query template."""
     tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
     qt = _get_query_template_or_404(db, qt_id, tid)
     service.delete_query_template(db, qt)
 
