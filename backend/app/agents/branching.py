@@ -505,7 +505,74 @@ def visible_tool_rows(
         if not include_inactive and not _tool_runtime_enabled(db, row):
             continue
         visible.append(row)
+
+    # data_query 工具随数据源授权可见：模板所属数据源已绑定（active）即对员工可用
+    _append_source_authorized_data_query_tools(
+        db, tenant_id, agent.id, visible, include_inactive
+    )
     return sorted(visible, key=lambda row: (row.bucket, row.name))
+
+
+def _append_source_authorized_data_query_tools(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+    visible: list[Tool],
+    include_inactive: bool,
+) -> None:
+    """把数据源授权覆盖到的 data_query 工具补进可见集合。"""
+    from app.data_query.models import DataSource, QueryTemplate
+
+    ds_bindings = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == agent_id,
+            AgentResourceBinding.resource_type == "data_source",
+            AgentResourceBinding.status != "deleted",
+        )
+    ).all()
+    ds_ids = {
+        binding.resource_id
+        for binding in ds_bindings
+        if include_inactive or binding.status == "active"
+    }
+    if not ds_ids:
+        return
+    active_source_ids = {
+        row.id
+        for row in db.exec(
+            select(DataSource).where(
+                DataSource.tenant_id == tenant_id, DataSource.status == "active"
+            )
+        ).all()
+        if row.id in ds_ids
+    }
+    if not active_source_ids:
+        return
+    template_ids = {
+        row.id
+        for row in db.exec(
+            select(QueryTemplate).where(
+                QueryTemplate.tenant_id == tenant_id,
+                QueryTemplate.status == "active",
+                QueryTemplate.data_source_id.in_(active_source_ids),
+            )
+        ).all()
+    }
+    if not template_ids:
+        return
+    visible_ids = {row.id for row in visible}
+    data_query_rows = db.exec(
+        select(Tool).where(Tool.tenant_id == tenant_id, Tool.tool_type == "data_query")
+    ).all()
+    for row in data_query_rows:
+        if row.id in visible_ids:
+            continue
+        if not include_inactive and not _tool_runtime_enabled(db, row):
+            continue
+        config = row.config_json if isinstance(row.config_json, dict) else {}
+        if config.get("template_id") in template_ids:
+            visible.append(row)
 
 
 def _tool_runtime_enabled(db: Session, row: Tool) -> bool:

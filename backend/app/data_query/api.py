@@ -11,15 +11,17 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.data_query import service
 from app.data_query.models import (
+    DataSource,
     DataSourceCreate,
     DataSourceRead,
     DataSourceUpdate,
     QueryExecuteRequest,
     QueryExecuteResult,
+    QueryTemplate,
     QueryTemplateCreate,
     QueryTemplateRead,
     QueryTemplateUpdate,
@@ -317,3 +319,76 @@ def execute_query(
         return service.execute_query_by_id(db, request.template_id, tid, request.params)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ===================================================================
+# Agent data-source authorization
+# ===================================================================
+
+
+@router.get("/agents/{agent_id}/templates")
+def list_agent_query_templates(
+    agent_id: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """List active query templates usable by an agent.
+
+    A template is visible to an agent when its data source is bound to the
+    agent (AgentResourceBinding resource_type="data_source", active) and both
+    the data source and the template are active.
+    """
+    from app.api.agents import _ensure_can_access_agent
+    from app.db.models import AgentProfile, AgentResourceBinding
+
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    agent = db.get(AgentProfile, agent_id)
+    if not agent or agent.tenant_id != tid:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    _ensure_can_access_agent(agent, current_user)
+
+    bound_ids = {
+        row.resource_id
+        for row in db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tid,
+                AgentResourceBinding.agent_id == agent_id,
+                AgentResourceBinding.resource_type == "data_source",
+                AgentResourceBinding.status == "active",
+            )
+        ).all()
+    }
+    if not bound_ids:
+        return []
+    active_source_ids = {
+        row.id
+        for row in db.exec(
+            select(DataSource).where(
+                DataSource.tenant_id == tid,
+                DataSource.status == "active",
+            )
+        ).all()
+    }
+    usable_source_ids = bound_ids & active_source_ids
+    if not usable_source_ids:
+        return []
+
+    rows = db.exec(
+        select(QueryTemplate).where(
+            QueryTemplate.tenant_id == tid,
+            QueryTemplate.status == "active",
+            QueryTemplate.data_source_id.in_(usable_source_ids),
+        )
+    ).all()
+    return [
+        {
+            "id": qt.id,
+            "name": qt.name,
+            "description": qt.description,
+            "data_source_id": qt.data_source_id,
+            "query_type": qt.query_type,
+            "params_json": qt.params_json,
+        }
+        for qt in sorted(rows, key=lambda row: row.name)
+    ]

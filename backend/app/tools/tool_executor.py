@@ -14,7 +14,14 @@ from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
 from app.config import get_settings
-from app.db.models import ChatSession, ExternalBusinessTask, MCPServer, Tool, utc_now
+from app.db.models import (
+    AgentResourceBinding,
+    ChatSession,
+    ExternalBusinessTask,
+    MCPServer,
+    Tool,
+    utc_now,
+)
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
 from app.skills.tool_authorization import SopToolAuthorization
 from app.tools.a2a_client import A2AClient, A2AClientError
@@ -74,7 +81,7 @@ class ToolExecutor:
             return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
         if not tool.enabled:
             return self._error(tool.name, "DISABLED", "工具当前未启用。")
-        if agent_id and tool.id not in {
+        if agent_id and (tool.tool_type or "http") != "data_query" and tool.id not in {
             row.id
             for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
         }:
@@ -382,6 +389,30 @@ class ToolExecutor:
             error=None,
         )
 
+    def _agent_bound_data_source_ids(self, tenant_id: str, agent_id: str) -> set[str]:
+        """员工已授权（active 绑定且数据源未停用）的数据源 ID 集合。"""
+        from app.data_query.models import DataSource
+
+        bindings = self.db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tenant_id,
+                AgentResourceBinding.agent_id == agent_id,
+                AgentResourceBinding.resource_type == "data_source",
+                AgentResourceBinding.status == "active",
+            )
+        ).all()
+        if not bindings:
+            return set()
+        source_ids = {row.resource_id for row in bindings}
+        active_rows = self.db.exec(
+            select(DataSource).where(
+                DataSource.tenant_id == tenant_id,
+                DataSource.id.in_(source_ids),
+                DataSource.status == "active",
+            )
+        ).all()
+        return {row.id for row in active_rows}
+
     def _execute_data_query_tool(
         self,
         tool: Tool,
@@ -392,6 +423,7 @@ class ToolExecutor:
         active_skill_id: str | None = None,
         timeout_seconds_override: float | None = None,
     ) -> ToolResult:
+        from app.data_query.models import QueryTemplate
         from app.data_query.service import execute_query_by_id
 
         config = tool.config_json if isinstance(tool.config_json, dict) else {}
@@ -400,6 +432,19 @@ class ToolExecutor:
             return self._error(
                 tool.name, "MISCONFIGURATION", "工具缺少 template_id 配置。"
             )
+
+        if agent_id:
+            # 数据源级授权：模板所属数据源必须在员工绑定集合内
+            template = self.db.get(QueryTemplate, template_id)
+            if not template or template.tenant_id != tool.tenant_id:
+                return self._error(tool.name, "QUERY_ERROR", "查询模板不存在或已被删除。")
+            bound_source_ids = self._agent_bound_data_source_ids(tool.tenant_id, agent_id)
+            if template.data_source_id not in bound_source_ids:
+                return self._error(
+                    tool.name,
+                    "NOT_ALLOWED",
+                    "当前员工未授权该查询模板所属的数据源，请在员工配置中绑定对应数据源。",
+                )
 
         params = arguments.get("params", {}) if isinstance(arguments, dict) else {}
         output_format = config.get("output_format", "table")
