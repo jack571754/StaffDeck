@@ -70,6 +70,8 @@ import ToolsPage, {
   ToolNewPage,
   ToolTestPage,
 } from "./pages/ToolsPage";
+import DataQueryPage from "./pages/data-query/DataQueryPage";
+import QueryTemplateEditorPage from "./pages/data-query/QueryTemplateEditorPage";
 import { useIsMobile } from "./hooks/use-mobile";
 import {
   Dialog,
@@ -167,6 +169,8 @@ function Shell({
             ? "/enterprise/general-skills"
             : location.pathname.startsWith("/enterprise/tools")
               ? "/enterprise/tools"
+              : location.pathname.startsWith("/enterprise/data-query")
+                ? "/enterprise/data-query"
               : location.pathname.startsWith("/enterprise/teams")
                 ? "/enterprise/teams"
                 : location.pathname.startsWith("/enterprise/scheduled-tasks")
@@ -813,6 +817,30 @@ function Shell({
                 path="/enterprise/tools/:toolId/test"
                 element={
                   <ToolTestPage currentUser={auth.user} onLogout={onLogout} />
+                }
+              />
+              <Route
+                path="/enterprise/data-query"
+                element={
+                  <DataQueryPage currentUser={auth.user} onLogout={onLogout} />
+                }
+              />
+              <Route
+                path="/enterprise/data-query/templates/new"
+                element={
+                  <QueryTemplateEditorPage
+                    currentUser={auth.user}
+                    onLogout={onLogout}
+                  />
+                }
+              />
+              <Route
+                path="/enterprise/data-query/templates/:templateId"
+                element={
+                  <QueryTemplateEditorPage
+                    currentUser={auth.user}
+                    onLogout={onLogout}
+                  />
                 }
               />
               <Route
