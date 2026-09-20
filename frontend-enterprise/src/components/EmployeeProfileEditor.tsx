@@ -76,6 +76,7 @@ export default function EmployeeProfileEditor({
   const [saving, setSaving] = useState(false);
   const [dataSources, setDataSources] = useState<DataSource[]>([]);
   const [boundSourceIds, setBoundSourceIds] = useState<string[]>([]);
+  const [grantAll, setGrantAll] = useState(false);
   const profile = useMemo(() => employeeProfile(agent), [agent]);
 
   const update = (patch: Partial<EmployeeProfileFormValues>) => setForm((prev) => ({ ...prev, ...patch }));
@@ -84,14 +85,29 @@ export default function EmployeeProfileEditor({
     setBoundSourceIds((prev) => (next ? Array.from(new Set([...prev, id])) : prev.filter((row) => row !== id)));
   };
 
+  // 勾选集合语义随租户模式翻转：白名单勾选=授权(active)，
+  // 默认全量勾选=排除(inactive)。绑定行存在性始终表示勾选集合。
+  const boundIdsForMode = (mode: boolean, rows: AgentProfileRead['resources']) => {
+    const wanted = mode ? 'inactive' : 'active';
+    return (rows || [])
+      .filter((row) => row.resource_type === 'data_source' && row.status === wanted)
+      .map((row) => row.resource_id);
+  };
+
   useEffect(() => {
     if (!open || !agent || agent.is_overall) return;
-    setBoundSourceIds(
-      (agent.resources || [])
-        .filter((row) => row.resource_type === 'data_source' && row.status === 'active')
-        .map((row) => row.resource_id),
-    );
     let cancelled = false;
+    api
+      .get<{ tenant_id: string; data_query_grant_all?: boolean }>(
+        `/api/enterprise/ui-config?tenant_id=${TENANT_ID}`,
+      )
+      .then((row) => row.data_query_grant_all === true)
+      .catch(() => false)
+      .then((mode) => {
+        if (cancelled) return;
+        setGrantAll(mode);
+        setBoundSourceIds(boundIdsForMode(mode, agent.resources));
+      });
     dataSourcesApi.list()
       .then((rows) => {
         if (!cancelled) setDataSources(rows);
@@ -174,7 +190,9 @@ export default function EmployeeProfileEditor({
           .map((ds) => ({
             resource_type: 'data_source' as const,
             resource_id: ds.id,
-            status: 'active' as const,
+            // 白名单勾选=授权(active)；默认全量勾选=排除(inactive)。
+            // 未勾选不发送绑定行，由后端 PUT 全量替换差集删除旧行。
+            status: (grantAll ? 'inactive' : 'active') as 'active' | 'inactive',
             metadata: {},
           }));
         await api.put<unknown[]>(`/api/enterprise/agents/${agent.id}/resources`, {
@@ -288,7 +306,7 @@ export default function EmployeeProfileEditor({
 
               {agent && !agent.is_overall && (
                 <div className="rounded-[14px] border border-[#e3e7f1] bg-[#fafbfc] p-[14px]">
-                  <LabeledField label="数据权限">
+                  <LabeledField label={grantAll ? '数据权限（排除）' : '数据权限'}>
                     <div className="flex flex-col gap-[8px]">
                       {dataSources.length === 0 && (
                         <span className="text-[12px] text-muted-foreground">
@@ -300,7 +318,7 @@ export default function EmployeeProfileEditor({
                           <Checkbox
                             checked={boundSourceIds.includes(ds.id)}
                             onCheckedChange={(next) => toggleSource(ds.id, next === true)}
-                            aria-label={`授权数据源 ${ds.name}`}
+                            aria-label={`${grantAll ? '排除数据源' : '授权数据源'} ${ds.name}`}
                           />
                           <span>{ds.name}</span>
                           <span className="rounded-[6px] bg-[#f2f3f7] px-[6px] py-[1px] text-[11px] text-[#59627a]">
@@ -315,7 +333,9 @@ export default function EmployeeProfileEditor({
                       ))}
                     </div>
                     <span className="text-[11px] text-muted-foreground">
-                      勾选后，该员工可在对话中使用这些数据源下的查询模板。
+                      {grantAll
+                        ? '全部员工默认可查询所有启用的数据源，此处的勾选表示排除。'
+                        : '勾选后，该员工可在对话中使用这些数据源下的查询模板。'}
                     </span>
                   </LabeledField>
                 </div>

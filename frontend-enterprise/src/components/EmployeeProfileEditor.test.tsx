@@ -220,3 +220,87 @@ describe('EmployeeProfileEditor 数据权限区', () => {
     expect(screen.queryByText('数据权限')).toBeNull();
   });
 });
+
+describe('EmployeeProfileEditor 数据权限双模式', () => {
+  const inactiveBinding = {
+    id: 'bind_2',
+    tenant_id: 'tenant_demo',
+    agent_id: 'agent_1',
+    resource_type: 'data_source' as const,
+    resource_id: 'ds_sales',
+    status: 'inactive',
+    metadata: {},
+    created_at: '2026-09-01T00:00:00Z',
+    updated_at: '2026-09-01T00:00:00Z',
+  };
+
+  it('grant_all 开启时，inactive 绑定回显为勾选（排除集合）且文案为例外语义', async () => {
+    const agent = makeAgent({ resources: [inactiveBinding] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/data-query/data-sources')) return jsonResponse(mockDataSources);
+      if (url.includes('/ui-config')) return jsonResponse({ tenant_id: 'tenant_demo', data_query_grant_all: true });
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderEditor(agent);
+
+    const salesCheckbox = await screen.findByRole('checkbox', { name: /销售数据库/ });
+    expect(salesCheckbox.getAttribute('aria-checked')).toBe('true');
+    const erpCheckbox = screen.getByRole('checkbox', { name: /ERP 库/ });
+    expect(erpCheckbox.getAttribute('aria-checked')).toBe('false');
+    expect(screen.getByText(/数据权限（排除）/)).toBeTruthy();
+  });
+
+  it('grant_all 开启时保存，勾选项写 inactive 排除绑定，未勾选不发 data_source 行', async () => {
+    const agent = makeAgent({ resources: [] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/data-query/data-sources')) return jsonResponse(mockDataSources);
+      if (url.includes('/ui-config')) return jsonResponse({ tenant_id: 'tenant_demo', data_query_grant_all: true });
+      if (url.includes('/resources')) return jsonResponse([]);
+      return jsonResponse(agent);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const user = userEvent.setup();
+    renderEditor(agent);
+
+    const salesCheckbox = await screen.findByRole('checkbox', { name: /销售数据库/ });
+    await user.click(salesCheckbox);
+    await user.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes('/resources') && init?.method === 'PUT')).toBe(true);
+    });
+    const resourcesCall = fetchMock.mock.calls.find(
+      ([input, init]) => String(input).includes('/resources') && init?.method === 'PUT',
+    )!;
+    const payload = JSON.parse(String((resourcesCall[1] as RequestInit).body));
+    const dataSourceRows = payload.resources.filter(
+      (row: { resource_type: string }) => row.resource_type === 'data_source',
+    );
+    expect(dataSourceRows).toHaveLength(1);
+    expect(dataSourceRows[0]).toMatchObject({ resource_type: 'data_source', resource_id: 'ds_sales', status: 'inactive' });
+  });
+
+  it('ui-config 加载失败回退白名单模式：inactive 绑定不勾选', async () => {
+    const agent = makeAgent({ resources: [inactiveBinding] });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/data-query/data-sources')) return jsonResponse(mockDataSources);
+      if (url.includes('/ui-config')) return jsonResponse({}, 500);
+      return jsonResponse({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderEditor(agent);
+
+    const salesCheckbox = await screen.findByRole('checkbox', { name: /销售数据库/ });
+    await waitFor(() => {
+      expect(salesCheckbox.getAttribute('aria-checked')).toBe('false');
+    });
+    expect(screen.queryByText(/数据权限（排除）/)).toBeNull();
+  });
+});
