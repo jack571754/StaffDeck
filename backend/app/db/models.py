@@ -706,6 +706,7 @@ class UIConfig(SQLModel, table=True):
     sandbox_network_mode: str = Field(default="all")
     sandbox_allowed_domains: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     harness_storage_path: Optional[str] = None
+    data_query_grant_all: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

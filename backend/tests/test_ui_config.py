@@ -7,7 +7,9 @@ from app.api import ui_config as ui_config_module
 from app.api.ui_config import UIConfigUpdateRequest, ui_config_read
 from app.api.ui_config import update_enterprise_ui_config
 from app.core.agent_loop import AgentLoop
+from app.db.database import _migrate_ui_configs_data_query_grant_all
 from app.db.models import Tenant, UIConfig, User
+from sqlalchemy import inspect, text as sql_text
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 from app.harness.sandbox import SandboxDiagnostics
@@ -238,3 +240,120 @@ def test_context_runtime_settings_persist_without_restart(
     assert result.context_medium_summary_prefix == "近期记忆："
     assert result.restart_scheduled is False
     assert scheduled == []
+
+
+# ---------------------------------------------------------------------------
+# data_query_grant_all（数据查询默认授权开关）
+# ---------------------------------------------------------------------------
+
+
+def _ui_config_session():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    return engine
+
+
+def _ui_config_admin() -> User:
+    return User(
+        id="user_admin",
+        tenant_id="tenant_demo",
+        username="admin",
+        password_hash="unused",
+        role="admin",
+    )
+
+
+def test_ui_config_read_includes_data_query_grant_all_default_false() -> None:
+    result = ui_config_read(UIConfig(tenant_id="tenant_demo"))
+
+    assert result.data_query_grant_all is False
+
+
+def test_update_ui_config_sets_data_query_grant_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _ui_config_session()
+    monkeypatch.setattr(
+        ui_config_module,
+        "_schedule_application_restart",
+        lambda: None,
+    )
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+        admin = _ui_config_admin()
+
+        result = update_enterprise_ui_config(
+            UIConfigUpdateRequest(tenant_id="tenant_demo", data_query_grant_all=True),
+            db,
+            admin,
+        )
+
+        assert result.data_query_grant_all is True
+        row = db.get(UIConfig, "tenant_demo")
+        assert row is not None
+        assert row.data_query_grant_all is True
+
+
+def test_update_ui_config_omitting_field_preserves_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _ui_config_session()
+    monkeypatch.setattr(
+        ui_config_module,
+        "_schedule_application_restart",
+        lambda: None,
+    )
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+        admin = _ui_config_admin()
+
+        update_enterprise_ui_config(
+            UIConfigUpdateRequest(tenant_id="tenant_demo", data_query_grant_all=True),
+            db,
+            admin,
+        )
+        result = update_enterprise_ui_config(
+            UIConfigUpdateRequest(tenant_id="tenant_demo"),
+            db,
+            admin,
+        )
+
+        assert result.data_query_grant_all is True
+
+
+def test_migration_adds_data_query_grant_all_column(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as conn:
+        conn.execute(
+            sql_text(
+                "CREATE TABLE ui_configs ("
+                "tenant_id VARCHAR PRIMARY KEY, created_at DATETIME, updated_at DATETIME)"
+            )
+        )
+        conn.execute(
+            sql_text(
+                "INSERT INTO ui_configs (tenant_id, created_at, updated_at) "
+                "VALUES ('tenant_demo', '2026-01-01', '2026-01-01')"
+            )
+        )
+
+        _migrate_ui_configs_data_query_grant_all(conn, {"ui_configs"})
+
+    inspector = inspect(engine)
+    columns = {c["name"] for c in inspector.get_columns("ui_configs")}
+    assert "data_query_grant_all" in columns
+    with engine.connect() as conn:
+        value = conn.execute(
+            sql_text("SELECT data_query_grant_all FROM ui_configs WHERE tenant_id='tenant_demo'")
+        ).scalar()
+    assert value in (0, False)
+
+    # 幂等：二次执行不再报错
+    with engine.begin() as conn:
+        _migrate_ui_configs_data_query_grant_all(conn, {"ui_configs"})
