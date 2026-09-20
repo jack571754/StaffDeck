@@ -334,9 +334,12 @@ def list_agent_query_templates(
 ) -> list[dict[str, Any]]:
     """List active query templates usable by an agent.
 
-    A template is visible to an agent when its data source is bound to the
-    agent (AgentResourceBinding resource_type="data_source", active) and both
-    the data source and the template are active.
+    A template is visible to an agent when its data source is authorized for
+    the agent via authorized_data_source_ids(): whitelist mode requires an
+    active AgentResourceBinding resource_type="data_source" row, while the
+    tenant-level data_query_grant_all flag grants all active data sources
+    minus the agent's inactive-bound exclusions. The data source and the
+    template must both be active either way.
     """
     from app.api.agents import _ensure_can_access_agent
     from app.db.models import AgentProfile
