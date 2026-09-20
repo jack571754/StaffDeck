@@ -163,17 +163,48 @@ class _QueryCache:
         """Remove all entries from the cache."""
         self._store.clear()
 
+    def invalidate(self, template_id: str) -> int:
+        """Remove every entry belonging to *template_id*.
+
+        Returns:
+            The number of entries removed.
+        """
+        prefix = f"{template_id}::"
+        stale = [key for key in self._store if key.startswith(prefix)]
+        for key in stale:
+            del self._store[key]
+        return len(stale)
+
 
 # Global singleton cache
 _cache = _QueryCache()
 
 
-def _make_cache_key(template_id: str, params: dict[str, Any]) -> str:
-    """Build a deterministic cache key from template id and sorted params."""
+def invalidate_template_cache(template_id: str) -> int:
+    """Drop all cached results for *template_id* (e.g. after an update).
+
+    Returns:
+        The number of cache entries removed.
+    """
+    return _cache.invalidate(template_id)
+
+
+def _make_cache_key(template: QueryTemplate, params: dict[str, Any]) -> str:
+    """Build a deterministic, content-aware cache key.
+
+    Besides the template id, the key covers a hash of the template's
+    ``query_content`` and ``params_json`` so that editing a template's SQL
+    yields a fresh key even before explicit invalidation, plus the sorted
+    parameter values. The template id is kept as a literal prefix so
+    :meth:`_QueryCache.invalidate` can drop all of a template's entries.
+    """
+    content_hash = hashlib.md5(
+        f"{template.query_content}\x1f{template.params_json}".encode()
+    ).hexdigest()
     # Serialize params in a stable order
-    param_str = ",".join(f"{k}={params[k]}" for k in sorted(params.keys()))
-    raw = f"{template_id}|{param_str}"
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    param_str = ",".join(f"{k}={params[k]!r}" for k in sorted(params.keys()))
+    raw = f"{template.id}|{content_hash}|{param_str}"
+    return f"{template.id}::{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +260,7 @@ class QueryExecutor:
         # 2. Cache lookup
         cache_ttl = template.cache_ttl or 0
         if cache_ttl > 0:
-            cache_key = _make_cache_key(template.id, validated)
+            cache_key = _make_cache_key(template, validated)
             cached = _cache.get(cache_key)
             if cached is not None:
                 return QueryExecuteResult(

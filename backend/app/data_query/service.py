@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from app.data_query.executor import QueryExecutor
+from app.data_query.executor import QueryExecutor, invalidate_template_cache
 from app.data_query.models import (
     DataSource,
     DataSourceCreate,
@@ -116,7 +116,20 @@ def update_data_source(
 
     if request.config_json is not None:
         sensitive_keys = _sensitive_keys_for(ds.type)
-        ds.config_json = encrypt_config(request.config_json, sensitive_keys)
+        # Field-level merge instead of whole-dict replacement: only keys
+        # explicitly present in the request's config_json override the
+        # stored values. Edit forms leave the password field blank (thus
+        # omitting or emptying the key) when the user only renames the
+        # data source, and that must never silently wipe credentials.
+        # (``config_json`` is ``dict | None``; an explicit JSON null is
+        # treated the same as an absent field, i.e. no config change.)
+        merged = decrypt_config(ds.config_json or {}, sensitive_keys)
+        for key, value in request.config_json.items():
+            if key in sensitive_keys and value == "":
+                # An empty sensitive value means "unchanged", never "clear".
+                continue
+            merged[key] = value
+        ds.config_json = encrypt_config(merged, sensitive_keys)
         changed = True
 
     if changed:
@@ -337,6 +350,8 @@ def update_query_template(
         db.add(qt)
         db.commit()
         db.refresh(qt)
+        # Cached results of the previous SQL/params definition are stale now.
+        invalidate_template_cache(qt.id)
 
     return qt
 
