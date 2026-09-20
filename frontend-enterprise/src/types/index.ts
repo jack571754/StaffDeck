@@ -368,6 +368,7 @@ export type UIConfigRead = {
   context_long_summary_prefix: string;
   context_medium_summary_prefix: string;
   sandbox_enabled: boolean;
+  data_query_grant_all: boolean;
   harness_storage_path: string;
   effective_harness_storage_path: string;
   restart_scheduled?: boolean;
