@@ -81,13 +81,13 @@ const CAPABILITY_NAV: NavItem[] = [
   { route: EnterpriseRoute.GeneralSkills, label: '技能', Icon: IconMagicWand },
   { route: EnterpriseRoute.Skills, label: 'SOP', Icon: IconClipboard },
   { route: EnterpriseRoute.Tools, label: '工具', Icon: IconBriefcase },
-  { route: EnterpriseRoute.DataQuery, label: '数据查询', Icon: Database },
 ];
 
 const SYSTEM_NAV: NavItem[] = [
   { route: EnterpriseRoute.Accounts, label: '账号管理', Icon: IconAccounts },
   { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
   { route: EnterpriseRoute.RuntimeSettings, label: '运行设置', Icon: IconSettings },
+  { route: EnterpriseRoute.DataQuery, label: '数据查询', Icon: Database },
 ];
 
 function primaryNavItems(isAdmin: boolean): NavItem[] {

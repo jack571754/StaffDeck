@@ -71,6 +71,7 @@ function renderSidebar(props: {
   selectedAgentId: string;
   onSelectAgent?: (value: string) => void;
   scopeTeams?: TeamRead[];
+  isAdmin?: boolean;
 }) {
   return render(
     <I18nProvider>
@@ -79,7 +80,7 @@ function renderSidebar(props: {
           <AppSidebar
             selected="/enterprise/dashboard"
             onNavigate={() => {}}
-            isAdmin={false}
+            isAdmin={props.isAdmin ?? false}
             scopeAgents={[agent]}
             scopeTeams={props.scopeTeams ?? [team]}
             selectedAgentId={props.selectedAgentId}
@@ -134,6 +135,30 @@ describe('AppSidebar agent switcher team group', () => {
     const trigger = screen.getByLabelText('切换当前员工');
     expect(within(trigger).getByText('当前团队')).toBeTruthy();
     expect(within(trigger).getByText('团队')).toBeTruthy();
+  });
+});
+
+describe('AppSidebar data query nav placement', () => {
+  it('非 admin 的侧边栏不显示数据查询入口', () => {
+    renderSidebar({ selectedAgentId: 'agent-1', isAdmin: false });
+
+    expect(screen.queryByText('数据查询')).toBeNull();
+    expect(screen.getByText('知识库')).toBeTruthy();
+  });
+
+  it('admin 的侧边栏把数据查询归入系统设置组（与账号管理同列）', () => {
+    renderSidebar({ selectedAgentId: 'agent-1', isAdmin: true });
+
+    expect(screen.getByText('数据查询')).toBeTruthy();
+    expect(screen.getByText('账号管理')).toBeTruthy();
+    // 数据查询与账号管理同属最近公共容器（主菜单列表）
+    let container: HTMLElement | null = screen.getByText('数据查询').parentElement;
+    while (container && !container.textContent?.includes('账号管理')) {
+      container = container.parentElement;
+    }
+    expect(container).toBeTruthy();
+    expect(container!.textContent).toContain('数据查询');
+    expect(screen.getByText('知识库')).toBeTruthy();
   });
 });
 
