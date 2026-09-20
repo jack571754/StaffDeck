@@ -110,6 +110,91 @@ function Field({
   );
 }
 
+function OutputConfigSection({
+  value,
+  onChange,
+}: {
+  value: Record<string, unknown>;
+  onChange: (value: Record<string, unknown>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState(() => JSON.stringify(value ?? {}, null, 2));
+  const [error, setError] = useState('');
+
+  // 外部值变化（如保存后回填）且与本地文本解析结果不一致时，重置本地文本
+  useEffect(() => {
+    let current: unknown = null;
+    try {
+      current = JSON.parse(text);
+    } catch {
+      current = null;
+    }
+    if (JSON.stringify(current) !== JSON.stringify(value ?? {})) {
+      setText(JSON.stringify(value ?? {}, null, 2));
+      setError('');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  const handleChange = (next: string) => {
+    setText(next);
+    if (!next.trim()) {
+      setError('');
+      onChange({});
+      return;
+    }
+    try {
+      const parsed = JSON.parse(next) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setError('输出配置需要是 JSON 对象（以 { } 包裹）');
+        return;
+      }
+      setError('');
+      onChange(parsed as Record<string, unknown>);
+    } catch {
+      setError('JSON 格式不正确');
+    }
+  };
+
+  return (
+    <SectionCard
+      title="输出配置"
+      extra={
+        <button
+          type="button"
+          onClick={() => setOpen((prev) => !prev)}
+          className="flex items-center gap-1 text-[12px] text-[#757f9c] hover:text-[#18181a]"
+        >
+          {open ? '收起' : '展开'}
+        </button>
+      }
+    >
+      {open ? (
+        <div className="flex flex-col gap-[8px]">
+          <span className={HINT_CLASS}>
+            可选。以 JSON 对象格式定义输出列配置，用于查询结果的格式化展示。
+          </span>
+          <textarea
+            value={text}
+            onChange={(e) => handleChange(e.target.value)}
+            rows={6}
+            spellCheck={false}
+            placeholder='{"columns": [{"name": "date", "label": "日期"}]}'
+            className="w-full resize-y rounded-md border border-input bg-background p-3 font-mono text-[13px] focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+          {error ? (
+            <span className="text-[12px] text-red-600">{error}</span>
+          ) : null}
+        </div>
+      ) : (
+        <span className={HINT_CLASS}>
+          配置查询结果的输出格式，点击右上角「展开」编辑。
+        </span>
+      )}
+    </SectionCard>
+  );
+}
+
 export default function QueryTemplateEditor({
   template,
   onChange,
@@ -319,9 +404,15 @@ export default function QueryTemplateEditor({
           queryContent={formData.query_content}
           onChange={(content) => updateField('query_content', content)}
         />
+
+        {/* 输出配置（第一期简化为 JSON 编辑） */}
+        <OutputConfigSection
+          value={formData.output_config_json ?? {}}
+          onChange={(cfg) => updateField('output_config_json', cfg)}
+        />
       </div>
 
-      {/* 右侧：参数配置 + 测试运行（占位） */}
+      {/* 右侧：参数配置 + 测试运行 */}
       <div className="flex shrink-0 flex-col gap-[20px]">
         <ParamsConfigPanel
           params={formData.params_json as unknown as QueryParam[]}

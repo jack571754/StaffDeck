@@ -3503,3 +3503,9 @@
   "填入参数后点击「运行测试」查看结果": "Fill in the parameters and click \"Run Test\" to see results",
   "请输入{1}": "Enter {1}"
 }
+  "输出配置": "Output Config",
+  "可选。以 JSON 对象格式定义输出列配置，用于查询结果的格式化展示。": "Optional. Define output column configuration as a JSON object for formatting query results.",
+  "配置查询结果的输出格式，点击右上角「展开」编辑。": "Configure the output format of query results; click \"Expand\" in the top-right corner to edit.",
+  "JSON 格式不正确": "Invalid JSON format",
+  "输出配置需要是 JSON 对象（以 { } 包裹）": "Output config must be a JSON object (wrapped in { })",
+  "{\"columns\": [{\"name\": \"date\", \"label\": \"日期\"}]}": "{\"columns\": [{\"name\": \"date\", \"label\": \"Date\"}]}",

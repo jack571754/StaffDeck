@@ -26,6 +26,24 @@ export default function QueryTemplateEditorPage({ currentUser, onLogout }: Props
   const [template, setTemplate] = useState<QueryTemplate | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+
+  // 编辑器内容变更后标记脏状态；加载完成/保存成功后复位
+  const handleTemplateChange = (next: QueryTemplate | null) => {
+    setTemplate(next);
+    setDirty(true);
+  };
+
+  // 有未保存变更时，关闭/刷新页面前提示
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
 
   // 编辑模式：加载模板数据
   useEffect(() => {
@@ -109,10 +127,12 @@ export default function QueryTemplateEditorPage({ currentUser, onLogout }: Props
         // 替换 URL 为新模板 ID，避免刷新回到新建页
         navigate(`${EnterpriseRoute.DataQuery}/templates/${created.id}`, { replace: true });
         setTemplate(created);
+        setDirty(false);
       } else if (templateId) {
         const updated = await queryTemplatesApi.update(templateId, payload);
         notify.success('保存成功');
         setTemplate(updated);
+        setDirty(false);
       }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存失败');
@@ -159,7 +179,7 @@ export default function QueryTemplateEditorPage({ currentUser, onLogout }: Props
         ) : (
           <QueryTemplateEditor
             template={template}
-            onChange={setTemplate}
+            onChange={handleTemplateChange}
             isNew={isNew}
           />
         )}
