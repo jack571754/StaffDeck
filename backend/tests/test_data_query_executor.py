@@ -172,33 +172,88 @@ class TestQueryCache:
         assert cache.get("k1") is None
         assert cache.get("k2") is None
 
+    def test_invalidate_removes_only_matching_template(self) -> None:
+        """invalidate() drops all entries of one template and keeps others."""
+        cache = _QueryCache()
+        value = QueryResult(columns=["a"], rows=[{"a": 1}])
+        cache.set("qt-1::aaa", value, ttl_seconds=60)
+        cache.set("qt-1::bbb", value, ttl_seconds=60)
+        cache.set("qt-2::ccc", value, ttl_seconds=60)
+
+        removed = cache.invalidate("qt-1")
+
+        assert removed == 2
+        assert cache.get("qt-1::aaa") is None
+        assert cache.get("qt-1::bbb") is None
+        assert cache.get("qt-2::ccc") is not None
+
+    def test_invalidate_unknown_template_is_noop(self) -> None:
+        """invalidate() on an unknown template removes nothing."""
+        cache = _QueryCache()
+        cache.set("qt-1::aaa", QueryResult(), ttl_seconds=60)
+        assert cache.invalidate("qt-other") == 0
+        assert cache.get("qt-1::aaa") is not None
+
 
 class TestMakeCacheKey:
     """Tests for :func:`_make_cache_key`."""
 
+    @staticmethod
+    def _template(
+        *,
+        tpl_id: str = "tpl-1",
+        query_content: str = "SELECT 1",
+        params_json: list[dict[str, Any]] | None = None,
+    ) -> QueryTemplate:
+        return QueryTemplate(
+            id=tpl_id,
+            tenant_id="tenant-1",
+            name="t",
+            data_source_id="ds-1",
+            query_content=query_content,
+            params_json=params_json or [],
+        )
+
     def test_deterministic(self) -> None:
         """Same inputs always produce the same key."""
-        k1 = _make_cache_key("tpl-1", {"a": 1, "b": 2})
-        k2 = _make_cache_key("tpl-1", {"b": 2, "a": 1})
+        template = self._template()
+        k1 = _make_cache_key(template, {"a": 1, "b": 2})
+        k2 = _make_cache_key(template, {"b": 2, "a": 1})
         assert k1 == k2
 
     def test_different_params_different_keys(self) -> None:
         """Different parameter values produce different keys."""
-        k1 = _make_cache_key("tpl-1", {"a": 1})
-        k2 = _make_cache_key("tpl-1", {"a": 2})
+        template = self._template()
+        k1 = _make_cache_key(template, {"a": 1})
+        k2 = _make_cache_key(template, {"a": 2})
         assert k1 != k2
 
     def test_different_template_different_keys(self) -> None:
         """Different template IDs produce different keys."""
-        k1 = _make_cache_key("tpl-1", {"a": 1})
-        k2 = _make_cache_key("tpl-2", {"a": 1})
+        k1 = _make_cache_key(self._template(tpl_id="tpl-1"), {"a": 1})
+        k2 = _make_cache_key(self._template(tpl_id="tpl-2"), {"a": 1})
         assert k1 != k2
 
-    def test_md5_format(self) -> None:
-        """Cache key is a 32-char hex string (MD5)."""
-        key = _make_cache_key("t1", {})
-        assert len(key) == 32
-        assert all(c in "0123456789abcdef" for c in key)
+    def test_key_is_prefixed_with_template_id(self) -> None:
+        """The key starts with the template id for prefix invalidation."""
+        key = _make_cache_key(self._template(tpl_id="tpl-1"), {})
+        assert key.startswith("tpl-1::")
+
+    def test_different_query_content_different_keys(self) -> None:
+        """Editing the template SQL must yield a fresh cache key (I-3)."""
+        k1 = _make_cache_key(self._template(query_content="SELECT 1"), {})
+        k2 = _make_cache_key(self._template(query_content="SELECT 2"), {})
+        assert k1 != k2
+
+    def test_different_params_json_different_keys(self) -> None:
+        """Editing the template's parameter definitions yields a fresh key."""
+        k1 = _make_cache_key(
+            self._template(params_json=[{"name": "a", "type": "string"}]), {}
+        )
+        k2 = _make_cache_key(
+            self._template(params_json=[{"name": "b", "type": "string"}]), {}
+        )
+        assert k1 != k2
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +372,56 @@ class TestQueryExecutor:
             assert mock_connector.execute.call_count == 1  # no extra call
             assert r2.rows == [{"val": 42}]
             assert r2.execution_time_ms == 0.0
+
+    def test_template_sql_edit_not_served_stale_cache(self) -> None:
+        """After the template's SQL changes, execution is fresh (I-3)."""
+        template = self._make_template(cache_ttl=300)
+        ds = self._make_data_source()
+
+        mock_session = MagicMock(spec=Session)
+        mock_session.get.return_value = ds
+
+        mock_connector = MagicMock()
+        mock_connector.execute.side_effect = [
+            QueryResult(columns=["v"], rows=[{"v": "old"}], row_count=1),
+            QueryResult(columns=["v"], rows=[{"v": "new"}], row_count=1),
+        ]
+
+        with patch("app.data_query.executor.get_connector", return_value=mock_connector):
+            executor = QueryExecutor(db_session=mock_session)
+            r1 = executor.execute(template, {})
+            assert r1.cached is False
+
+            # Simulate an edit of the template SQL (same id, same params).
+            template.query_content = "SELECT v FROM t2"
+
+            r2 = executor.execute(template, {})
+
+        assert r2.cached is False
+        assert r2.rows == [{"v": "new"}]
+        assert mock_connector.execute.call_count == 2
+
+    def test_invalidate_template_cache_helper(self) -> None:
+        """invalidate_template_cache drops the template's cached entries."""
+        from app.data_query.executor import invalidate_template_cache
+
+        template = self._make_template(tpl_id="qt-inv", cache_ttl=300)
+        ds = self._make_data_source()
+
+        mock_session = MagicMock(spec=Session)
+        mock_session.get.return_value = ds
+
+        mock_connector = MagicMock()
+        mock_connector.execute.return_value = QueryResult(
+            columns=["v"], rows=[{"v": 1}], row_count=1
+        )
+
+        with patch("app.data_query.executor.get_connector", return_value=mock_connector):
+            executor = QueryExecutor(db_session=mock_session)
+            executor.execute(template, {})
+
+            assert invalidate_template_cache("qt-inv") >= 1
+            assert invalidate_template_cache("qt-inv") == 0
 
     def test_different_params_not_cached(self) -> None:
         """Different parameter values trigger separate executions."""

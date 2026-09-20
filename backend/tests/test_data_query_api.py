@@ -15,6 +15,9 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.data_query.api import router as data_query_router
 from app.data_query.connectors.base import BaseConnector, QueryResult
+from app.data_query.executor import _cache
+from app.data_query.models import DataSource
+from app.data_query.security import decrypt_config
 from app.db import get_session
 from app.db.models import Tenant, User
 from app.security.auth import create_access_token, hash_password
@@ -52,16 +55,18 @@ def _seed_tenant_and_user(
     tenant_id: str = "tenant_a",
     user_id: str = "user_a",
     username: str = "alice",
+    role: str = "admin",
 ) -> User:
     with Session(engine) as db:
-        db.add(Tenant(id=tenant_id, name=f"Tenant {tenant_id}"))
+        if db.get(Tenant, tenant_id) is None:
+            db.add(Tenant(id=tenant_id, name=f"Tenant {tenant_id}"))
         user = User(
             id=user_id,
             tenant_id=tenant_id,
             username=username,
             display_name=username.title(),
             password_hash=hash_password("secret"),
-            role="admin",
+            role=role,
         )
         db.add(user)
         db.commit()
@@ -598,3 +603,408 @@ def test_nonexistent_resources_return_404() -> None:
         headers=headers,
     )
     assert resp.status_code == 400  # ValueError -> 400 from execute_query_by_id
+
+
+# ---------------------------------------------------------------------------
+# 9. Cross-tenant access is rejected with 403 (C-1)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_tenant_access_forbidden() -> None:
+    """A user of tenant B passing ?tenant_id=tenant_a must get 403 everywhere."""
+    engine = _test_engine()
+    user_a = _seed_tenant_and_user(
+        engine, tenant_id="tenant_a", user_id="user_a", username="alice"
+    )
+    user_b = _seed_tenant_and_user(
+        engine, tenant_id="tenant_b", user_id="user_b", username="bob"
+    )
+    client = _make_client(engine)
+
+    # Tenant A creates a data source and a template
+    resp = client.post(
+        "/api/enterprise/data-query/data-sources",
+        params={"tenant_id": "tenant_a"},
+        json=_make_ds_payload(name="A's DS"),
+        headers=_auth(user_a),
+    )
+    assert resp.status_code == 201
+    ds_id = resp.json()["id"]
+
+    resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params={"tenant_id": "tenant_a"},
+        json=_make_qt_payload(ds_id, status="active"),
+        headers=_auth(user_a),
+    )
+    assert resp.status_code == 201
+    qt_id = resp.json()["id"]
+
+    headers_b = _auth(user_b)
+    injected = {"tenant_id": "tenant_a"}  # tenant B user targeting tenant A
+
+    # list / get / test on data sources -> 403
+    resp = client.get(
+        "/api/enterprise/data-query/data-sources", params=injected, headers=headers_b
+    )
+    assert resp.status_code == 403
+    resp = client.get(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=injected,
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.post(
+        f"/api/enterprise/data-query/data-sources/{ds_id}/test",
+        params=injected,
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+
+    # update / delete -> 403
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=injected,
+        json={"name": "Hacked"},
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=injected,
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+
+    # create / update / delete / list on query templates -> 403
+    resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params=injected,
+        json=_make_qt_payload(ds_id),
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.put(
+        f"/api/enterprise/data-query/query-templates/{qt_id}",
+        params=injected,
+        json={"name": "Hacked"},
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        f"/api/enterprise/data-query/query-templates/{qt_id}",
+        params=injected,
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.get(
+        "/api/enterprise/data-query/query-templates", params=injected, headers=headers_b
+    )
+    assert resp.status_code == 403
+
+    # test-run and execute -> 403
+    resp = client.post(
+        f"/api/enterprise/data-query/query-templates/{qt_id}/test",
+        params=injected,
+        json={"params": {"status": "active"}},
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+    resp = client.post(
+        "/api/enterprise/data-query/execute",
+        params=injected,
+        json={"template_id": qt_id, "params": {"status": "active"}},
+        headers=headers_b,
+    )
+    assert resp.status_code == 403
+
+
+def test_member_cannot_manage_but_can_read() -> None:
+    """Members may list/read/execute; only admins manage resources (I-1)."""
+    engine = _test_engine()
+    admin = _seed_tenant_and_user(
+        engine, tenant_id="tenant_a", user_id="user_admin", username="admin"
+    )
+    member = _seed_tenant_and_user(
+        engine,
+        tenant_id="tenant_a",
+        user_id="user_member",
+        username="member",
+        role="member",
+    )
+    client = _make_client(engine)
+    params = {"tenant_id": "tenant_a"}
+
+    resp = client.post(
+        "/api/enterprise/data-query/data-sources",
+        params=params,
+        json=_make_ds_payload(),
+        headers=_auth(admin),
+    )
+    assert resp.status_code == 201
+    ds_id = resp.json()["id"]
+
+    resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params=params,
+        json=_make_qt_payload(ds_id),
+        headers=_auth(admin),
+    )
+    assert resp.status_code == 201
+    qt_id = resp.json()["id"]
+
+    headers_m = _auth(member)
+
+    # Read access is allowed for members
+    resp = client.get(
+        "/api/enterprise/data-query/data-sources", params=params, headers=headers_m
+    )
+    assert resp.status_code == 200
+    resp = client.get(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=params,
+        headers=headers_m,
+    )
+    assert resp.status_code == 200
+
+    # Management is forbidden for members
+    resp = client.post(
+        "/api/enterprise/data-query/data-sources",
+        params=params,
+        json=_make_ds_payload(name="Member DS"),
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=params,
+        json={"name": "Member edit"},
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params=params,
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+    resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params=params,
+        json=_make_qt_payload(ds_id),
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+    resp = client.put(
+        f"/api/enterprise/data-query/query-templates/{qt_id}",
+        params=params,
+        json={"name": "Member edit"},
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+    resp = client.delete(
+        f"/api/enterprise/data-query/query-templates/{qt_id}",
+        params=params,
+        headers=headers_m,
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 10. Updating a data source preserves credentials (C-2)
+# ---------------------------------------------------------------------------
+
+
+def _get_ds_config(engine, ds_id: str) -> dict:
+    with Session(engine) as db:
+        ds = db.get(DataSource, ds_id)
+        assert ds is not None
+        return decrypt_config(ds.config_json or {}, ["password"])
+
+
+def _create_ds(engine, client: TestClient, headers) -> str:
+    resp = client.post(
+        "/api/enterprise/data-query/data-sources",
+        params={"tenant_id": "tenant_a"},
+        json=_make_ds_payload(),
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    return resp.json()["id"]
+
+
+def test_update_data_source_rename_preserves_config() -> None:
+    """Rename-only update keeps host and password (C-2)."""
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    ds_id = _create_ds(engine, client, headers)
+
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params={"tenant_id": "tenant_a"},
+        json={"name": "Renamed"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    cfg = _get_ds_config(engine, ds_id)
+    assert cfg["host"] == "localhost"
+    assert cfg["password"] == "secret123"
+
+
+def test_update_data_source_partial_config_merges() -> None:
+    """config_json without password keeps the stored password (C-2)."""
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    ds_id = _create_ds(engine, client, headers)
+
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params={"tenant_id": "tenant_a"},
+        json={"config_json": {"host": "newhost", "port": 3307}},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    cfg = _get_ds_config(engine, ds_id)
+    assert cfg["host"] == "newhost"
+    assert cfg["port"] == 3307
+    assert cfg["password"] == "secret123"
+    assert cfg["database"] == "testdb"
+
+
+def test_update_data_source_empty_sensitive_value_keeps_old() -> None:
+    """An empty password string means 'unchanged', never 'clear' (C-2)."""
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    ds_id = _create_ds(engine, client, headers)
+
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params={"tenant_id": "tenant_a"},
+        json={"config_json": {"password": ""}},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    cfg = _get_ds_config(engine, ds_id)
+    assert cfg["password"] == "secret123"
+
+
+def test_update_data_source_new_password_updates() -> None:
+    """A non-empty new password replaces the old one (C-2)."""
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    ds_id = _create_ds(engine, client, headers)
+
+    resp = client.put(
+        f"/api/enterprise/data-query/data-sources/{ds_id}",
+        params={"tenant_id": "tenant_a"},
+        json={"config_json": {"password": "brand-new-pass"}},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    cfg = _get_ds_config(engine, ds_id)
+    assert cfg["password"] == "brand-new-pass"
+    assert cfg["host"] == "localhost"
+
+
+# ---------------------------------------------------------------------------
+# 11. Updating a query template invalidates cached results (I-3)
+# ---------------------------------------------------------------------------
+
+
+def test_template_update_invalidates_cache() -> None:
+    """After changing a template's SQL, execution returns fresh results."""
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    params = {"tenant_id": "tenant_a"}
+    _cache.clear()
+
+    ds_id = _create_ds(engine, client, headers)
+    resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params=params,
+        json=_make_qt_payload(ds_id, status="active", cache_ttl=300),
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    qt_id = resp.json()["id"]
+
+    mock_result_old = QueryResult(columns=["v"], rows=[{"v": "old"}], row_count=1)
+    mock_result_new = QueryResult(columns=["v"], rows=[{"v": "new"}], row_count=1)
+
+    class _MockConnector(BaseConnector):
+        def __init__(self, result: QueryResult) -> None:
+            self.result = result
+
+        def test_connection(self) -> bool:
+            return True
+
+        def execute(self, query, params, *, timeout=30, max_rows=1000):
+            return self.result
+
+        def close(self) -> None:
+            pass
+
+    with patch(
+        "app.data_query.executor.get_connector",
+        return_value=_MockConnector(mock_result_old),
+    ):
+        resp = client.post(
+            f"/api/enterprise/data-query/query-templates/{qt_id}/test",
+            params=params,
+            json={"params": {"status": "active"}},
+            headers=headers,
+        )
+    assert resp.status_code == 200
+    assert resp.json()["rows"] == [{"v": "old"}]
+
+    # Cached second run returns the old result...
+    with patch(
+        "app.data_query.executor.get_connector",
+        return_value=_MockConnector(mock_result_old),
+    ):
+        resp = client.post(
+            f"/api/enterprise/data-query/query-templates/{qt_id}/test",
+            params=params,
+            json={"params": {"status": "active"}},
+            headers=headers,
+        )
+    assert resp.status_code == 200
+    assert resp.json()["cached"] is True
+
+    # ...but after editing the SQL, the run is fresh again.
+    resp = client.put(
+        f"/api/enterprise/data-query/query-templates/{qt_id}",
+        params=params,
+        json={"query_content": "SELECT v FROM other_table WHERE status = :status"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    with patch(
+        "app.data_query.executor.get_connector",
+        return_value=_MockConnector(mock_result_new),
+    ):
+        resp = client.post(
+            f"/api/enterprise/data-query/query-templates/{qt_id}/test",
+            params=params,
+            json={"params": {"status": "active"}},
+            headers=headers,
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cached"] is False
+    assert body["rows"] == [{"v": "new"}]

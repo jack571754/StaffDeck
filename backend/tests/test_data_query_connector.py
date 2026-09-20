@@ -136,6 +136,28 @@ class TestConvertParams:
         assert query == "SELECT %(x)s AS a, %(x)s AS b"
         assert names == ["x", "x"]
 
+    def test_postgres_style_cast_not_converted(self):
+        """``v::date`` (double colon cast) must survive conversion (I-4)."""
+        query, names = _convert_params(
+            "SELECT v::date FROM t WHERE t > :start"
+        )
+        assert query == "SELECT v::date FROM t WHERE t > %(start)s"
+        assert names == ["start"]
+
+    def test_time_literal_not_converted(self):
+        """A colon inside a time literal is not a bind parameter (I-4)."""
+        query, names = _convert_params(
+            "SELECT * FROM logs WHERE created_at > :start AND label = '%10:30%'"
+        )
+        assert "'%10:30%'" in query
+        assert "%(10)s" not in query
+        assert "%(30)s" not in query
+        assert names == ["start"]
+        # Known issue: a ``:name`` occurrence preceded by whitespace *inside*
+        # a string literal (e.g. ``' :start '``) is still converted — the
+        # regex cannot see SQL string quoting. Only colon-after-word-char
+        # literals (times, casts) are protected by the lookbehinds.
+
 
 # -- MySQL connector -------------------------------------------------------
 
@@ -240,6 +262,52 @@ class TestMySQLConnector:
             # test_connection closes after ping
             mock_conn.ping.assert_called_once()
             mock_conn.close.assert_called_once()
+
+    def test_execute_passes_timeout_to_pymysql_connect(self):
+        """The execute timeout reaches pymysql as connect/read/write timeouts (I-2)."""
+        connector = self._make_conn()
+
+        mock_cursor = MagicMock()
+        mock_cursor.description = [("n",)]
+        mock_cursor.fetchmany.return_value = [{"n": 1}]
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        mock_pymysql = MagicMock()
+        mock_pymysql.connect.return_value = mock_conn
+        mock_pymysql.cursors.DictCursor = MagicMock()
+
+        with patch.dict("sys.modules", {"pymysql": mock_pymysql}):
+            connector.execute("SELECT 1", {}, timeout=25)
+
+        kwargs = mock_pymysql.connect.call_args.kwargs
+        assert kwargs["connect_timeout"] == 10  # capped at 10s
+        assert kwargs["read_timeout"] == 25
+        assert kwargs["write_timeout"] == 25
+
+    def test_execute_small_timeout_not_capped_upwards(self):
+        """A timeout below 10s is used as-is for connect_timeout."""
+        connector = self._make_conn()
+
+        mock_cursor = MagicMock()
+        mock_cursor.description = None
+        mock_cursor.fetchmany.return_value = []
+
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        mock_pymysql = MagicMock()
+        mock_pymysql.connect.return_value = mock_conn
+        mock_pymysql.cursors.DictCursor = MagicMock()
+
+        with patch.dict("sys.modules", {"pymysql": mock_pymysql}):
+            connector.execute("SELECT 1", {}, timeout=5)
+
+        kwargs = mock_pymysql.connect.call_args.kwargs
+        assert kwargs["connect_timeout"] == 5
+        assert kwargs["read_timeout"] == 5
+        assert kwargs["write_timeout"] == 5
 
 
 # -- HTTP API connector ----------------------------------------------------
