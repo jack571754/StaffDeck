@@ -15,7 +15,6 @@ from sqlmodel import Session, select
 
 from app.data_query import service
 from app.data_query.models import (
-    DataSource,
     DataSourceCreate,
     DataSourceRead,
     DataSourceUpdate,
@@ -340,7 +339,7 @@ def list_agent_query_templates(
     the data source and the template are active.
     """
     from app.api.agents import _ensure_can_access_agent
-    from app.db.models import AgentProfile, AgentResourceBinding
+    from app.db.models import AgentProfile
 
     tid = _resolve_tenant(db, tenant_id, current_user)
     agent = db.get(AgentProfile, agent_id)
@@ -348,29 +347,9 @@ def list_agent_query_templates(
         raise HTTPException(status_code=404, detail="Agent not found")
     _ensure_can_access_agent(agent, current_user)
 
-    bound_ids = {
-        row.resource_id
-        for row in db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == tid,
-                AgentResourceBinding.agent_id == agent_id,
-                AgentResourceBinding.resource_type == "data_source",
-                AgentResourceBinding.status == "active",
-            )
-        ).all()
-    }
-    if not bound_ids:
-        return []
-    active_source_ids = {
-        row.id
-        for row in db.exec(
-            select(DataSource).where(
-                DataSource.tenant_id == tid,
-                DataSource.status == "active",
-            )
-        ).all()
-    }
-    usable_source_ids = bound_ids & active_source_ids
+    from app.data_query.authorization import authorized_data_source_ids
+
+    usable_source_ids = authorized_data_source_ids(db, tid, agent_id)
     if not usable_source_ids:
         return []
 

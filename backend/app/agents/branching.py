@@ -521,32 +521,12 @@ def _append_source_authorized_data_query_tools(
     include_inactive: bool,
 ) -> None:
     """把数据源授权覆盖到的 data_query 工具补进可见集合。"""
-    from app.data_query.models import DataSource, QueryTemplate
+    from app.data_query.authorization import authorized_data_source_ids
+    from app.data_query.models import QueryTemplate
 
-    ds_bindings = db.exec(
-        select(AgentResourceBinding).where(
-            AgentResourceBinding.tenant_id == tenant_id,
-            AgentResourceBinding.agent_id == agent_id,
-            AgentResourceBinding.resource_type == "data_source",
-            AgentResourceBinding.status != "deleted",
-        )
-    ).all()
-    ds_ids = {
-        binding.resource_id
-        for binding in ds_bindings
-        if include_inactive or binding.status == "active"
-    }
-    if not ds_ids:
-        return
-    active_source_ids = {
-        row.id
-        for row in db.exec(
-            select(DataSource).where(
-                DataSource.tenant_id == tenant_id, DataSource.status == "active"
-            )
-        ).all()
-        if row.id in ds_ids
-    }
+    active_source_ids = authorized_data_source_ids(
+        db, tenant_id, agent_id, include_inactive=include_inactive
+    )
     if not active_source_ids:
         return
     template_ids = {

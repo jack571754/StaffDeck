@@ -15,7 +15,6 @@ from sqlmodel import Session, select
 from app.agents.branching import visible_tool_rows
 from app.config import get_settings
 from app.db.models import (
-    AgentResourceBinding,
     ChatSession,
     ExternalBusinessTask,
     MCPServer,
@@ -390,28 +389,10 @@ class ToolExecutor:
         )
 
     def _agent_bound_data_source_ids(self, tenant_id: str, agent_id: str) -> set[str]:
-        """员工已授权（active 绑定且数据源未停用）的数据源 ID 集合。"""
-        from app.data_query.models import DataSource
+        """员工可用的数据源 ID 集合（白名单/默认全量由租户开关决定）。"""
+        from app.data_query.authorization import authorized_data_source_ids
 
-        bindings = self.db.exec(
-            select(AgentResourceBinding).where(
-                AgentResourceBinding.tenant_id == tenant_id,
-                AgentResourceBinding.agent_id == agent_id,
-                AgentResourceBinding.resource_type == "data_source",
-                AgentResourceBinding.status == "active",
-            )
-        ).all()
-        if not bindings:
-            return set()
-        source_ids = {row.resource_id for row in bindings}
-        active_rows = self.db.exec(
-            select(DataSource).where(
-                DataSource.tenant_id == tenant_id,
-                DataSource.id.in_(source_ids),
-                DataSource.status == "active",
-            )
-        ).all()
-        return {row.id for row in active_rows}
+        return authorized_data_source_ids(self.db, tenant_id, agent_id)
 
     def _execute_data_query_tool(
         self,
