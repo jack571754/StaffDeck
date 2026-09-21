@@ -22,6 +22,7 @@ from app.core.harness_attachments import (
     validated_task_image_payloads,
 )
 from app.core.harness_capability_invoker import HarnessCapabilityInvoker
+from app.core.harness_lease_heartbeat import ExecutionLeaseHeartbeat
 from app.core.published_deliverables import list_published_deliverables
 from app.core.harness_session_lease import (
     HarnessSessionLeaseLost,
@@ -993,18 +994,32 @@ class HarnessV2Engine:
                 step_deadline_monotonic=step_deadline_monotonic,
             )
 
-            result = self.task_agent.run(
-                requirement,
-                model_config,
-                invoker.invoke,
-                max_actions=remaining_actions,
-                trace_sink=trace,
-                is_cancelled=lambda: self._is_cancelled(request, session),
-                image_payloads=image_payloads,
-                step_deadline_monotonic=step_deadline_monotonic,
-                step_timeout_seconds=step_timeout_seconds,
-                checkpoint=loop_checkpoint,
+            # LLM 调用期间没有任何续约点（单次最长可达超时×空响应重试 > 900s
+            # 租约），由后台心跳补齐；工具调用路径的 ensure_execution_lease
+            # 续约保持不变，二者共用同一套 fence 语义。
+            lease_heartbeat = ExecutionLeaseHeartbeat(
+                session_lease=self.session_lease,
+                turn_record_id=self.turn_record.id if self.turn_record else None,
+                frame_record_id=row.id,
+                lease_owner=str(self.active_frame_lease_owner or ""),
+                attempt_no=int(self.active_frame_attempt_no or 0),
             )
+            lease_heartbeat.start()
+            try:
+                result = self.task_agent.run(
+                    requirement,
+                    model_config,
+                    invoker.invoke,
+                    max_actions=remaining_actions,
+                    trace_sink=trace,
+                    is_cancelled=lambda: self._is_cancelled(request, session),
+                    image_payloads=image_payloads,
+                    step_deadline_monotonic=step_deadline_monotonic,
+                    step_timeout_seconds=step_timeout_seconds,
+                    checkpoint=loop_checkpoint,
+                )
+            finally:
+                lease_heartbeat.stop()
             if request.channel == "human_handoff_resume" and result.status == "handoff":
                 # The human reply is already the handoff completion signal. Do not
                 # re-enter the same terminal handoff node during the resume turn.
