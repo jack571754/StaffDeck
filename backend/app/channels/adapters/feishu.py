@@ -545,6 +545,38 @@ class FeishuAdapter:
         receive_id_type = str(target.get("receive_id_type") or "").strip()
         if not message_id and (not receive_id or not receive_id_type):
             raise FeishuPermanentError("飞书投递目标无效")
+        is_image = bool(
+            target.get("msg_type") == "image"
+            or target.get("image_key")
+            or text.startswith("feishu_image_key:")
+        )
+        if is_image:
+            img_key = str(
+                target.get("image_key") or text.removeprefix("feishu_image_key:")
+            ).strip()
+            body = {
+                "msg_type": "image",
+                "content": json.dumps({"image_key": img_key}, ensure_ascii=False),
+                "uuid": self._uuid(key, 0),
+            }
+            if message_id:
+                body["reply_in_thread"] = bool(target.get("reply_in_thread"))
+                data = self._post(
+                    binding,
+                    f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply",
+                    params=None,
+                    body=body,
+                )
+            else:
+                body["receive_id"] = receive_id
+                data = self._post(
+                    binding,
+                    f"{FEISHU_API_BASE}/im/v1/messages",
+                    params={"receive_id_type": receive_id_type},
+                    body=body,
+                )
+            return str((data.get("data") or {}).get("message_id") or "").strip() or None
+
         rich_enabled = bool(get_settings().channel_rich_render_enabled)
         use_rich = rich_enabled and has_markdown(text)
         if use_rich:
@@ -588,6 +620,50 @@ class FeishuAdapter:
                 )
             created_message_id = str((data.get("data") or {}).get("message_id") or "").strip() or None
         return created_message_id
+
+    def upload_image(
+        self,
+        binding: ChannelBinding,
+        image_bytes: bytes,
+        image_type: str = "message",
+    ) -> str:
+        """上传图片到飞书并获取 image_key。"""
+        token = self._tokens.get(binding)
+        url = f"{FEISHU_API_BASE}/im/v1/images"
+        files = {
+            "image": ("chart.png", image_bytes, "image/png"),
+        }
+        data = {
+            "image_type": image_type,
+        }
+        with self._client_factory() as client:
+            resp = client.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                files=files,
+                data=data,
+            )
+        payload = resp.json() if resp.content else {}
+        if resp.status_code >= 400 or payload.get("code") != 0:
+            raise FeishuTransientError(f"飞书上传图片失败: {payload.get('msg') or resp.text[:200]}")
+        image_key = str((payload.get("data") or {}).get("image_key") or "").strip()
+        if not image_key:
+            raise FeishuPermanentError("飞书图片上传响应缺少 image_key")
+        return image_key
+
+    def send_image(
+        self,
+        binding: ChannelBinding,
+        target: dict[str, Any],
+        image_key: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """发送单张图片消息，返回 message_id。"""
+        target_copy = dict(target)
+        target_copy["msg_type"] = "image"
+        target_copy["image_key"] = image_key
+        return self.send(binding, target_copy, image_key, idempotency_key=idempotency_key) or ""
 
     def start_ingress(self, binding_id: str) -> None:
         from app.channels import get_feishu_process_manager
