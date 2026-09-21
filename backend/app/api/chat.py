@@ -20,6 +20,7 @@ from starlette.background import BackgroundTask
 
 from app.agents.branching import model_for_agent, visible_published_skills
 from app.channels.service_outbox import stage_channel_delivery
+from app.config import get_settings
 from app.core import AgentLoop
 from app.core.cancellation import cancel_chat_turn, is_chat_turn_cancelled
 from app.core.capability_manifest import CapabilityManifestBuilder
@@ -31,8 +32,8 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     ChatSession,
-    HarnessTurnRecord,
     HarnessTaskFrameRecord,
+    HarnessTurnRecord,
     HumanHandoffRequest,
     Message,
     MessageFeedback,
@@ -59,7 +60,8 @@ from app.observability.spans import (
 )
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
 from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
-from app.security.auth import get_current_user
+from app.security import artifact_share as artifact_share_mod
+from app.security.auth import get_current_user, get_current_user_optional
 from app.security.permissions import agent_owned_by_user, is_admin_user
 from app.security.tenant import ensure_tenant
 from app.session.attachments import (
@@ -71,12 +73,12 @@ from app.session.cleanup import (
     remove_chat_session_workspace,
 )
 from app.session.helpers import public_session
+from app.session.message_read import message_read
 from app.session.message_visibility import (
     internal_message_turn_ids,
     visible_message_content,
     visible_message_rows,
 )
-from app.session.message_read import message_read
 from app.session.origin import pilotdeck_origin_session_ids
 from app.session.session_schema import (
     ChatAttachmentRead,
@@ -2473,6 +2475,215 @@ def download_harness_artifact(
             "X-Content-Type-Options": "nosniff",
         },
         background=BackgroundTask(opened.close),
+    )
+
+
+class ShareLinkRequest(BaseModel):
+    tenant_id: str
+    session_id: str
+    task_frame_id: str
+    path: str
+    ttl_seconds: int | None = None
+
+
+class ShareLinkResponse(BaseModel):
+    token: str
+    url: str
+    expires_at: int
+
+
+# CSP for inline HTML artifacts: sandboxed into an opaque origin (no
+# allow-same-origin), so a script inside the artifact can never reach the parent
+# app's localStorage user token. https:/data:/blob: sources support CDN-backed
+# charts/slides/tailwind. CSP3 ignores `frame-ancestors` when `sandbox` is
+# present, so frame control falls back to X-Frame-Options.
+_HTML_INLINE_CSP = (
+    "sandbox allow-scripts allow-popups allow-forms allow-downloads; "
+    "default-src 'none'; "
+    "script-src 'unsafe-inline' https: data:; "
+    "style-src 'unsafe-inline' https: data:; "
+    "img-src https: data: blob:; "
+    "media-src https: data: blob:; "
+    "font-src https: data:; "
+    "connect-src https:; "
+    "frame-src https: data: blob:; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "form-action https:"
+)
+
+
+def _is_html_previewable(relative_path: str) -> bool:
+    """Only bare .html/.htm files are eligible for inline rendering.
+
+    Deliberately not `mimetypes.guess_type` (which would inline-execute .svg as
+    image/svg+xml and .xml) and not the manifest `content_type` (untrusted
+    source). Everything else falls back to attachment.
+    """
+    return relative_path.lower().endswith((".html", ".htm"))
+
+
+def _shared_artifact_headers(digest: str, size: int) -> dict[str, str]:
+    return {
+        "Cache-Control": "private, no-store",
+        "ETag": f'"sha256:{digest}"',
+        "X-Content-Type-Options": "nosniff",
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "Content-Length": str(size),
+    }
+
+
+@router.get("/artifacts/view/{token}")
+def view_published_artifact(
+    token: str,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: Session = Depends(get_session),
+) -> StreamingResponse:
+    """Render a published Harness artifact inline, or open it anonymously.
+
+    Dual-path auth: a valid signed share token always opens the artifact; when a
+    Bearer user is also present, their session visibility is additionally
+    enforced (a broken Bearer header is 401, never silently downgraded to
+    anonymous). HTML files are served inline under a sandbox CSP; every other
+    extension is served as an attachment.
+    """
+    payload = artifact_share_mod.decode_artifact_share_token(token)
+    tenant_id = payload["tenant_id"]
+    session_id = payload["session_id"]
+    task_frame_id = payload["task_frame_id"]
+    cn_path = payload["path"]
+
+    if current_user is not None:
+        # Enterprise tightening: an authenticated user (e.g. someone who opened
+        # the link in a logged-in browser) may only view the artifact if they
+        # can read the owning session. Always 404, never 403, to avoid leaking
+        # existence. Frontend previews navigate the iframe natively (no Bearer),
+        # so they take the anonymous path and are unaffected.
+        _get_readable_chat_session(db, tenant_id, current_user, session_id)
+
+    frame = db.exec(
+        select(HarnessTaskFrameRecord).where(
+            HarnessTaskFrameRecord.tenant_id == tenant_id,
+            HarnessTaskFrameRecord.session_id == session_id,
+            HarnessTaskFrameRecord.task_id == task_frame_id,
+        )
+    ).first()
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    artifact = _published_workspace_artifact(
+        db,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        task_frame_id=task_frame_id,
+        requested_path=cn_path,
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    opened = None
+    try:
+        opened = open_harness_artifact(
+            harness_task_workspace_path(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                task_frame_id=task_frame_id,
+                db=db,
+            ),
+            cn_path,
+        )
+        digest = opened.sha256()
+        expected_digest = str(artifact.get("sha256") or "").strip().lower()
+        expected_size = artifact.get("size")
+        if (
+            (expected_digest and expected_digest != digest.lower())
+            or (isinstance(expected_size, int) and expected_size != opened.size)
+        ):
+            opened.close()
+            raise HTTPException(status_code=409, detail="Artifact has changed")
+    except (HarnessArtifactAccessError, OSError):
+        if opened is not None:
+            opened.close()
+        raise HTTPException(status_code=404, detail="Artifact not found") from None
+
+    filename = _safe_artifact_download_name(
+        str(artifact.get("display_name") or opened.filename)
+    )
+    fallback_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+    fallback_filename = (fallback_filename or "artifact")[:120]
+
+    headers = _shared_artifact_headers(digest, opened.size)
+    if _is_html_previewable(cn_path):
+        headers["Content-Type"] = "text/html; charset=utf-8"
+        headers["Content-Disposition"] = (
+            f'inline; filename="{fallback_filename}"; '
+            f"filename*=UTF-8''{quote(filename, safe='')}"
+        )
+        headers["X-Frame-Options"] = "SAMEORIGIN"
+        headers["Content-Security-Policy"] = _HTML_INLINE_CSP
+    else:
+        headers["Content-Type"] = "application/octet-stream"
+        headers["Content-Disposition"] = (
+            f'attachment; filename="{fallback_filename}"; '
+            f"filename*=UTF-8''{quote(filename, safe='')}"
+        )
+    return StreamingResponse(
+        opened.iter_bytes(),
+        media_type=headers["Content-Type"],
+        headers=headers,
+        background=BackgroundTask(opened.close),
+    )
+
+
+@router.post("/artifacts/share-link")
+def mint_artifact_share(
+    request: ShareLinkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ShareLinkResponse:
+    """Create a signed, expiring share link for an already-published artifact.
+
+    Only a user who can read the owning session may mint a link, and only for a
+    path that is actually published in a task frame's manifest.
+    """
+    _ensure_request_tenant(request.tenant_id, current_user)
+    _get_readable_chat_session(db, request.tenant_id, current_user, request.session_id)
+    frame = db.exec(
+        select(HarnessTaskFrameRecord).where(
+            HarnessTaskFrameRecord.tenant_id == request.tenant_id,
+            HarnessTaskFrameRecord.session_id == request.session_id,
+            HarnessTaskFrameRecord.task_id == request.task_frame_id,
+        )
+    ).first()
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = _published_workspace_artifact(
+        db,
+        tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        task_frame_id=request.task_frame_id,
+        requested_path=request.path,
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    token = artifact_share_mod.mint_artifact_share_token(
+        tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        task_frame_id=request.task_frame_id,
+        path=request.path,
+        ttl_seconds=(
+            request.ttl_seconds
+            if request.ttl_seconds is not None
+            else artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
+        ),
+    )
+    payload = artifact_share_mod.decode_artifact_share_token(token)
+    return ShareLinkResponse(
+        token=token,
+        url=f"{get_settings().normalized_tool_base_url}"
+        f"/api/chat/artifacts/view/{token}",
+        expires_at=payload["exp"],
     )
 
 
