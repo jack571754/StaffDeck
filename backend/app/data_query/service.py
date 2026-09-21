@@ -12,6 +12,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.data_query.executor import QueryExecutor, invalidate_template_cache
+from app.data_query.intent_router import clear_intent_template_cache
 from app.data_query.models import (
     DataSource,
     DataSourceCreate,
@@ -281,6 +282,7 @@ def create_query_template(
     db.add(qt)
     db.commit()
     db.refresh(qt)
+    clear_intent_template_cache(qt.tenant_id)
     return qt
 
 
@@ -352,14 +354,17 @@ def update_query_template(
         db.refresh(qt)
         # Cached results of the previous SQL/params definition are stale now.
         invalidate_template_cache(qt.id)
+        clear_intent_template_cache(qt.tenant_id)
 
     return qt
 
 
 def delete_query_template(db: Session, qt: QueryTemplate) -> None:
     """Delete a query template row."""
+    tenant_id = qt.tenant_id
     db.delete(qt)
     db.commit()
+    clear_intent_template_cache(tenant_id)
 
 
 def get_query_template(

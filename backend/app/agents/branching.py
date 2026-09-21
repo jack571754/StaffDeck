@@ -479,8 +479,9 @@ def visible_tool_rows(
         return [
             row
             for row in rows
-            if is_open_gallery_resource(db, tenant_id, "tool", row)
-            and (include_inactive or _tool_runtime_enabled(db, row))
+            if is_tool_visible_for_agent(
+                db, tenant_id, row, None, include_inactive=include_inactive
+            )
         ]
 
     bindings = db.exec(
@@ -511,6 +512,112 @@ def visible_tool_rows(
         db, tenant_id, agent.id, visible, include_inactive
     )
     return sorted(visible, key=lambda row: (row.bucket, row.name))
+
+
+def is_tool_visible_for_agent(
+    db: Session,
+    tenant_id: str,
+    row: Tool,
+    agent_id: str | None,
+    include_inactive: bool = True,
+) -> bool:
+    """检查单个工具对指定智能体（或整体智能体/全局广场）是否可见。"""
+    if not row or row.tenant_id != tenant_id:
+        return False
+    agent = get_agent(db, tenant_id, agent_id)
+    if agent_id and not agent:
+        return False
+    if agent and not agent.is_overall:
+        binding = db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tenant_id,
+                AgentResourceBinding.agent_id == agent.id,
+                AgentResourceBinding.resource_type == "tool",
+                AgentResourceBinding.resource_id == row.id,
+                AgentResourceBinding.status != "deleted",
+            )
+        ).first()
+        if binding and is_bound_resource_visible_for_agent(db, tenant_id, "tool", row, binding):
+            return include_inactive or (binding.status == "active" and _tool_runtime_enabled(db, row))
+
+        if (row.tool_type or "http") == "data_query":
+            return _is_data_query_tool_authorized_for_agent(
+                db, tenant_id, agent.id, row, include_inactive=include_inactive
+            )
+        return False
+
+    # 全局/广场视角（agent is None 或 agent.is_overall 为 True）
+    if is_open_gallery_resource(db, tenant_id, "tool", row):
+        return include_inactive or _tool_runtime_enabled(db, row)
+    if (row.tool_type or "http") == "data_query":
+        return _is_data_query_tool_active_in_tenant(
+            db, tenant_id, row, include_inactive=include_inactive
+        )
+    return False
+
+
+def _extract_data_query_template_id(row: Tool) -> str | None:
+    config = row.config_json if isinstance(row.config_json, dict) else {}
+    template_id = config.get("template_id")
+    if not template_id and (row.url or "").startswith("data_query://"):
+        template_id = (row.url or "")[len("data_query://"):]
+    return str(template_id).strip() if template_id else None
+
+
+def _is_data_query_tool_authorized_for_agent(
+    db: Session,
+    tenant_id: str,
+    agent_id: str,
+    row: Tool,
+    include_inactive: bool = True,
+) -> bool:
+    if not include_inactive and not _tool_runtime_enabled(db, row):
+        return False
+    from app.data_query.authorization import authorized_data_source_ids
+    from app.data_query.models import QueryTemplate
+
+    active_source_ids = authorized_data_source_ids(
+        db, tenant_id, agent_id, include_inactive=include_inactive
+    )
+    if not active_source_ids:
+        return False
+
+    template_id = _extract_data_query_template_id(row)
+    if not template_id:
+        return False
+
+    template = db.get(QueryTemplate, template_id)
+    if not template or template.tenant_id != tenant_id:
+        return False
+    if template.status != "active":
+        return False
+    return template.data_source_id in active_source_ids
+
+
+def _is_data_query_tool_active_in_tenant(
+    db: Session,
+    tenant_id: str,
+    row: Tool,
+    include_inactive: bool = True,
+) -> bool:
+    if not include_inactive and not _tool_runtime_enabled(db, row):
+        return False
+    from app.data_query.models import DataSource, QueryTemplate
+
+    template_id = _extract_data_query_template_id(row)
+    if not template_id:
+        return False
+
+    template = db.get(QueryTemplate, template_id)
+    if not template or template.tenant_id != tenant_id:
+        return False
+    if template.status != "active":
+        return False
+
+    ds = db.get(DataSource, template.data_source_id)
+    if not ds or ds.tenant_id != tenant_id:
+        return False
+    return ds.status == "active"
 
 
 def _append_source_authorized_data_query_tools(
@@ -550,8 +657,8 @@ def _append_source_authorized_data_query_tools(
             continue
         if not include_inactive and not _tool_runtime_enabled(db, row):
             continue
-        config = row.config_json if isinstance(row.config_json, dict) else {}
-        if config.get("template_id") in template_ids:
+        template_id = _extract_data_query_template_id(row)
+        if template_id and template_id in template_ids:
             visible.append(row)
 
 
