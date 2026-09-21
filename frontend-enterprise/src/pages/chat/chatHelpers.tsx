@@ -49,8 +49,9 @@ export const CHAT_STREAM_HEARTBEAT_GRACE_MS = 20 * 1000;
 export const CHAT_TRACE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 export const STREAM_TERMINAL_EVENTS = new Set(['complete', 'done', 'stream_end', 'stream_cancelled', 'stream_interrupted', 'error', 'error_occurred']);
 export const HIDDEN_GENERAL_SKILL_TRACE_PHASES = new Set(['replying']);
-const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly']);
+const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly', 'interval']);
 const DRAFT_SCHEDULE_TYPE_LABELS: Record<DraftScheduleType, string> = {
+  interval: '间隔循环',
   once: '一次性',
   daily: '每天',
   weekly: '每周',
@@ -2168,6 +2169,10 @@ function formatAttachmentSize(size: number): string {
 export function formatDraftSchedule(draft: ScheduledTaskDraftRead): string {
   const schedule = draft.schedule || {};
   const scheduleType = normalizeDraftScheduleType(draft.schedule_type);
+  if (scheduleType === 'interval') {
+    const mins = schedule.interval_minutes || Math.round(Number(schedule.interval_seconds || 60) / 60) || 1;
+    return `每 ${mins} 分钟`;
+  }
   if (scheduleType === 'weekly') {
     const weekdays = Array.isArray(schedule.weekdays)
       ? schedule.weekdays.map((item) => DRAFT_WEEKDAY_LABELS[Number(item)]).filter(Boolean).join('、')
@@ -2193,11 +2198,18 @@ export function scheduleTypeLabel(type: ScheduledTaskDraftRead['schedule_type'])
 
 export function scheduleEditValue(draft: ScheduledTaskDraftRead): string {
   const schedule = draft.schedule || {};
+  if (normalizeDraftScheduleType(draft.schedule_type) === 'interval') {
+    return String(schedule.interval_minutes || Math.round(Number(schedule.interval_seconds || 60) / 60) || 1);
+  }
   if (normalizeDraftScheduleType(draft.schedule_type) === 'once') return String(schedule.run_at || '');
   return String(schedule.time || '09:00');
 }
 
 export function scheduleFromEditValue(draft: ScheduledTaskDraftRead, value: string): Record<string, unknown> {
+  if (normalizeDraftScheduleType(draft.schedule_type) === 'interval') {
+    const mins = Math.max(1, Number(value) || 1);
+    return { ...(draft.schedule || {}), interval_minutes: mins, interval_seconds: mins * 60 };
+  }
   if (normalizeDraftScheduleType(draft.schedule_type) === 'once') {
     return { ...(draft.schedule || {}), run_at: value };
   }
@@ -2205,6 +2217,10 @@ export function scheduleFromEditValue(draft: ScheduledTaskDraftRead, value: stri
 }
 
 export function draftScheduleForType(schedule: Record<string, unknown>, type: DraftScheduleType): Record<string, unknown> {
+  if (type === 'interval') {
+    const mins = Math.max(1, Number(schedule.interval_minutes || 1));
+    return { interval_minutes: mins, interval_seconds: mins * 60 };
+  }
   const time = String(schedule.time || '09:00');
   if (type === 'once') {
     return { run_at: String(schedule.run_at || '') };

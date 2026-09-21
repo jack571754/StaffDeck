@@ -556,6 +556,8 @@ export type ScheduledTaskRead = {
   last_status?: string;
   run_count: number;
   source_session_id?: string;
+  execution_mode?: 'agent' | 'pipeline';
+  pipeline_steps?: Array<Record<string, unknown>>;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;

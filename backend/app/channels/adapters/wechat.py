@@ -38,6 +38,7 @@ from app.channels.media import (
 from app.config import get_settings
 from app.db import engine
 from app.db.models import ChannelBinding, utc_now
+from app.security.managed_subprocess import no_window_options
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,7 @@ async def _download_wechat_cdn_curl(url: str) -> tuple[bytes, str]:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **no_window_options(),
             )
             chunks: list[bytes] = []
             total = 0

@@ -5,10 +5,11 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
-ScheduleType = Literal["once", "daily", "weekly", "monthly"]
+ScheduleType = Literal["once", "daily", "weekly", "monthly", "interval"]
 ScheduledTaskStatus = Literal["active", "paused", "completed", "archived"]
 ConcurrencyPolicy = Literal["forbid", "allow"]
 MisfirePolicy = Literal["coalesce", "skip"]
+ExecutionMode = Literal["agent", "pipeline"]
 
 
 class ScheduledTaskBase(BaseModel):
@@ -27,6 +28,8 @@ class ScheduledTaskBase(BaseModel):
     max_runs: Optional[int] = None
     end_at: Optional[str] = None
     source_session_id: Optional[str] = None
+    execution_mode: ExecutionMode = "agent"
+    pipeline_steps: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -49,6 +52,8 @@ class ScheduledTaskUpdateRequest(BaseModel):
     misfire_policy: Optional[MisfirePolicy] = None
     max_runs: Optional[int] = None
     end_at: Optional[str] = None
+    execution_mode: Optional[ExecutionMode] = None
+    pipeline_steps: Optional[list[dict[str, Any]]] = None
     metadata: Optional[dict[str, Any]] = None
 
 
@@ -98,6 +103,8 @@ class ScheduledTaskRead(BaseModel):
     last_status: Optional[str] = None
     run_count: int
     source_session_id: Optional[str] = None
+    execution_mode: str = "agent"
+    pipeline_steps: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str

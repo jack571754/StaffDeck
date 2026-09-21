@@ -187,6 +187,7 @@ export default function ScheduledDraftCard({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="interval">间隔循环</SelectItem>
                 <SelectItem value="once">一次性</SelectItem>
                 <SelectItem value="daily">每天</SelectItem>
                 <SelectItem value="weekly">每周</SelectItem>
@@ -199,7 +200,13 @@ export default function ScheduledDraftCard({
             <Input
               className="h-[32px]"
               value={scheduleValue}
-              placeholder={editableDraft.schedule_type === 'once' ? 'YYYY-MM-DDTHH:mm:ss+08:00' : 'HH:mm'}
+              placeholder={
+                editableDraft.schedule_type === 'once'
+                  ? 'YYYY-MM-DDTHH:mm:ss+08:00'
+                  : editableDraft.schedule_type === 'interval'
+                  ? '分钟数（例如 1 或 5）'
+                  : 'HH:mm'
+              }
               onChange={(event) => updateScheduleValue(event.target.value)}
             />
           </label>

@@ -19,7 +19,8 @@ export type TaskFormValues = {
   title: string;
   prompt: string;
   description?: string;
-  schedule_type: 'once' | 'daily' | 'weekly' | 'monthly';
+  schedule_type: 'once' | 'daily' | 'weekly' | 'monthly' | 'interval';
+  interval_minutes?: number;
   time: string;
   run_at: string;
   weekdays: number[];
@@ -28,6 +29,8 @@ export type TaskFormValues = {
   max_runs?: number;
   sop_id?: string;
   sop_version_policy: 'latest' | 'pinned';
+  execution_mode: 'agent' | 'pipeline';
+  pipeline_steps: Array<Record<string, unknown>>;
 };
 
 export const INITIAL_VALUES: TaskFormValues = {
@@ -35,6 +38,7 @@ export const INITIAL_VALUES: TaskFormValues = {
   prompt: '',
   description: '',
   schedule_type: 'daily',
+  interval_minutes: 1,
   time: '09:00',
   run_at: '',
   weekdays: [0],
@@ -43,6 +47,8 @@ export const INITIAL_VALUES: TaskFormValues = {
   max_runs: undefined,
   sop_id: '',
   sop_version_policy: 'latest',
+  execution_mode: 'agent',
+  pipeline_steps: [],
 };
 
 export type TaskListFilter = 'all' | 'pending' | 'completed' | 'paused';
@@ -115,11 +121,18 @@ export const RUN_STATUS_BADGE: Record<string, { tone: BadgeTone; text: string }>
   skipped: { tone: 'gray', text: '已跳过' },
 };
 
-const SCHEDULE_TYPES = new Set<TaskFormValues['schedule_type']>(['once', 'daily', 'weekly', 'monthly']);
+const SCHEDULE_TYPES = new Set<TaskFormValues['schedule_type']>(['once', 'daily', 'weekly', 'monthly', 'interval']);
 const SCHEDULE_BUILDERS: Record<
   TaskFormValues['schedule_type'],
   (values: TaskFormValues) => Record<string, unknown>
 > = {
+  interval: (values) => {
+    const mins = Math.max(1, Number(values.interval_minutes || 1));
+    return {
+      interval_minutes: mins,
+      interval_seconds: mins * 60,
+    };
+  },
   once: (values) => ({ run_at: values.run_at }),
   weekly: (values) => ({
     time: values.time || '09:00',
@@ -135,6 +148,10 @@ const SCHEDULE_FORMATTERS: Record<
   TaskFormValues['schedule_type'],
   (row: ScheduledTaskRead, schedule: Record<string, unknown>) => string
 > = {
+  interval: (_row, schedule) => {
+    const mins = schedule.interval_minutes || Math.round(Number(schedule.interval_seconds || 60) / 60) || 1;
+    return `每 ${mins} 分钟`;
+  },
   once: (row, schedule) => `一次性 · ${formatTime(String(schedule.run_at || row.next_run_at || ''))}`,
   weekly: (_row, schedule) => {
     const days = Array.isArray(schedule.weekdays)
@@ -155,11 +172,13 @@ export function buildSchedule(values: TaskFormValues): Record<string, unknown> {
 
 export function taskToFormValues(row: ScheduledTaskRead): TaskFormValues {
   const schedule = row.schedule || {};
+  const mins = schedule.interval_minutes || Math.round(Number(schedule.interval_seconds || 60) / 60) || 1;
   return {
     title: row.title,
     prompt: row.prompt,
     description: row.description || '',
     schedule_type: normalizeScheduleType(row.schedule_type),
+    interval_minutes: Number(mins),
     time: String(schedule.time || '09:00'),
     run_at: toDatetimeLocal(String(schedule.run_at || row.next_run_at || '')),
     weekdays: Array.isArray(schedule.weekdays) ? schedule.weekdays.map((item) => Number(item)) : [0],
@@ -168,6 +187,8 @@ export function taskToFormValues(row: ScheduledTaskRead): TaskFormValues {
     max_runs: row.max_runs,
     sop_id: typeof row.metadata?.sop_id === 'string' ? row.metadata.sop_id : '',
     sop_version_policy: row.metadata?.sop_version_policy === 'pinned' ? 'pinned' : 'latest',
+    execution_mode: row.execution_mode === 'pipeline' ? 'pipeline' : 'agent',
+    pipeline_steps: Array.isArray(row.pipeline_steps) ? row.pipeline_steps : [],
   };
 }
 

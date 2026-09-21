@@ -54,7 +54,7 @@ LEASE_SECONDS = 15 * 60
 WORKER_SLEEP_SECONDS = 5
 MISFIRE_GRACE_SECONDS = max(30, WORKER_SLEEP_SECONDS * 2)
 CONFLICT_RETRY_SECONDS = 15
-SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
+SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly", "interval"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
 
@@ -86,8 +86,9 @@ SCHEDULE_DRAFT_PROMPT = """
 - title: 12 到 32 个中文字符，概括自动任务名称
 - prompt: 每次到点后交给数字员工的新会话任务描述，不要包含“帮我设个定时任务”等配置话术
 - description: 可选，解释为什么这样拆解
-- schedule_type: one of "once", "daily", "weekly", "monthly"
+- schedule_type: one of "once", "daily", "weekly", "monthly", "interval"
 - schedule:
+  - interval: {"interval_minutes": 1-1440}
   - once: {"run_at": "YYYY-MM-DDTHH:mm:ss±HH:MM"}
   - daily: {"time": "HH:mm"}
   - weekly: {"time": "HH:mm", "weekdays": [0-6]}，0=周一，6=周日
@@ -97,8 +98,9 @@ SCHEDULE_DRAFT_PROMPT = """
 - confidence: 0 到 1
 - reason: 简短说明
 
-时间不完整时可以合理补齐：只说“每天”默认 09:00；只说“每周一”默认 09:00。
+时间不完整时可以合理补齐：只说“每天”默认 09:00；只说“每周一”默认 09:00；只说“每分钟”默认 interval_minutes=1。
 调度类型判断规则：
+- 用户明确说“每分钟/每N分钟/每隔X分钟/持续轮询”等间隔要求时，生成 interval。
 - 用户只给出一个具体时间点，例如“下午2点10分”“14:10”“今晚8点”，且没有明确“每天/每日/每周/每月/定期/重复”等周期要求时，生成 once。
 - once.run_at 使用 now 所在日期和用户给出的时间；如果该时间已经过去，则顺延到下一天。
 - 只有用户明确说“每天/每日/每晚/每早/每周/每月/工作日/定期/重复”等周期要求时，才生成 daily/weekly/monthly。
@@ -131,6 +133,8 @@ def scheduled_task_read(row: ScheduledTask) -> ScheduledTaskRead:
         last_status=row.last_status,
         run_count=row.run_count,
         source_session_id=row.source_session_id,
+        execution_mode=getattr(row, "execution_mode", "agent") or "agent",
+        pipeline_steps=list(getattr(row, "pipeline_steps_json", []) or []),
         metadata=metadata,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
@@ -186,6 +190,8 @@ def create_scheduled_task(
         max_runs=request.max_runs,
         end_at=end_at,
         source_session_id=request.source_session_id,
+        execution_mode=request.execution_mode or "agent",
+        pipeline_steps_json=list(request.pipeline_steps or []),
         metadata_json=_prepare_scheduled_task_sop_metadata(
             db,
             request.tenant_id,
@@ -256,6 +262,10 @@ def update_scheduled_task(
             row.agent_id,
             row.metadata_json,
         )
+    if request.execution_mode is not None:
+        row.execution_mode = request.execution_mode
+    if request.pipeline_steps is not None:
+        row.pipeline_steps_json = list(request.pipeline_steps)
     row.updated_at = utc_now()
     row.next_run_at = compute_next_run_at(row, after=utc_now()) if row.status == "active" else None
     db.add(row)
@@ -437,14 +447,38 @@ def _prepare_scheduled_task_run(
             )
         ).first()
         if running:
-            run = _create_run(db, task, scheduled_for, "skipped")
-            run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
-            run.finished_at = utc_now()
-            _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
-            db.add(run)
-            db.commit()
-            db.refresh(run)
-            return run
+            now = utc_now()
+            # 若运行记录因服务重启或异常终止，租约已过期且关联会话无活跃执行轮次，自动标记失效回收，避免永久阻塞后续调度
+            is_orphan = False
+            if task.lease_until is None or task.lease_until < now:
+                active_turn = None
+                if running.session_id:
+                    active_turn = db.exec(
+                        select(HarnessTurnRecord).where(
+                            HarnessTurnRecord.session_id == running.session_id,
+                            HarnessTurnRecord.status.in_(["started", "finalizing"]),
+                        )
+                    ).first()
+                if not active_turn:
+                    is_orphan = True
+
+            if is_orphan:
+                running.status = "failed"
+                running.error = "自动任务执行进程异常中断（服务重启或超时），已自动回收标记失效。"
+                running.finished_at = now
+                running.updated_at = now
+                db.add(running)
+                db.commit()
+                db.refresh(running)
+            else:
+                run = _create_run(db, task, scheduled_for, "skipped")
+                run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
+                run.finished_at = utc_now()
+                _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
+                db.add(run)
+                db.commit()
+                db.refresh(run)
+                return run
 
     run = _create_run(db, task, scheduled_for, "running")
     try:
@@ -527,6 +561,12 @@ def _execute_prepared_scheduled_task(
     *,
     manual: bool,
 ) -> ScheduledTaskRun:
+    if getattr(task, "execution_mode", "agent") == "pipeline":
+        from app.scheduled_tasks.pipeline_runner import execute_pipeline
+
+        execute_pipeline(db, task, run, manual=manual)
+        return run
+
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
@@ -934,6 +974,9 @@ def compute_next_run_at(task: ScheduledTask, after: datetime | None = None) -> d
         return run_at if run_at and run_at > (after or utc_now()) else None
     after_local = _to_local(after or utc_now(), task.timezone)
     schedule = task.schedule_json or {}
+    if task.schedule_type == "interval":
+        seconds = int((task.schedule_json or {}).get("interval_seconds") or 60)
+        return _to_utc_naive(after_local + timedelta(seconds=seconds))
     if task.schedule_type == "daily":
         candidate = datetime.combine(after_local.date(), _parse_time(str(schedule.get("time") or DEFAULT_TASK_TIME)))
         candidate = candidate.replace(tzinfo=_tz(task.timezone))
@@ -975,6 +1018,19 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
     schedule_type = _normalize_schedule_type(schedule_type)
     _tz(timezone)
     raw = schedule or {}
+    if schedule_type == "interval":
+        raw_seconds = raw.get("interval_seconds")
+        raw_minutes = raw.get("interval_minutes")
+        if raw_seconds is not None:
+            seconds = max(10, int(raw_seconds))
+            minutes = max(1, seconds // 60) if seconds >= 60 else None
+        else:
+            minutes = max(1, int(raw_minutes or 1))
+            seconds = minutes * 60
+        return {
+            "interval_minutes": minutes,
+            "interval_seconds": seconds,
+        }
     if schedule_type == "once":
         run_at = raw.get("run_at") or raw.get("datetime") or raw.get("start_at")
         parsed = parse_user_datetime(str(run_at or ""), timezone)
@@ -997,6 +1053,11 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
 
 
 def build_rrule(schedule_type: str, schedule: dict[str, Any]) -> str | None:
+    if schedule_type == "interval":
+        seconds = int(schedule.get("interval_seconds") or 60)
+        if seconds % 60 == 0:
+            return f"FREQ=MINUTELY;INTERVAL={max(1, seconds // 60)}"
+        return f"FREQ=SECONDLY;INTERVAL={seconds}"
     time_text = str(schedule.get("time") or DEFAULT_TASK_TIME)
     hour, minute = time_text.split(":", 1)
     if schedule_type == "once":

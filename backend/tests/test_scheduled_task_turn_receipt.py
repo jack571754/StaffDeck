@@ -109,3 +109,59 @@ def test_scheduled_task_shortcut_honors_pre_message_cancellation(monkeypatch) ->
         assert detector_calls == 0
         assert db.exec(select(HarnessTurnRecord)).all() == []
         assert db.exec(select(Message)).all() == []
+
+
+def test_prepare_scheduled_task_run_recovers_orphan_when_forbid() -> None:
+    from datetime import timedelta
+
+    from app.db.models import ScheduledTask, ScheduledTaskRun, utc_now
+    from app.scheduled_tasks.service import _prepare_scheduled_task_run
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as db:
+        now = utc_now()
+        task = ScheduledTask(
+            id="task-orphan-test",
+            tenant_id="tenant-demo",
+            agent_id="agent-demo",
+            created_by_user_id="user-demo",
+            title="测试任务",
+            prompt="测试提示词",
+            concurrency_policy="forbid",
+            lease_until=now - timedelta(minutes=5),  # expired lease
+        )
+        db.add(task)
+        db.commit()
+
+        # Previous run stuck in running without active turn
+        stuck_run = ScheduledTaskRun(
+            id="stuck-run-id",
+            tenant_id="tenant-demo",
+            scheduled_task_id=task.id,
+            agent_id=task.agent_id,
+            user_id=task.created_by_user_id,
+            scheduled_for=now - timedelta(minutes=10),
+            status="running",
+            started_at=now - timedelta(minutes=10),
+        )
+        db.add(stuck_run)
+        db.commit()
+
+        new_scheduled_for = now
+        new_run = _prepare_scheduled_task_run(db, task, new_scheduled_for, manual=False)
+
+        # Stuck run should have been transitioned to failed
+        db.refresh(stuck_run)
+        assert stuck_run.status == "failed"
+        assert "异常中断" in (stuck_run.error or "")
+
+        # New run should be allowed to run
+        assert new_run.status == "running"
+        assert new_run.id != stuck_run.id
+

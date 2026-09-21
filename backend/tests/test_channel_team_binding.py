@@ -491,3 +491,57 @@ def test_channel_binding_team_id_migration_is_idempotent(monkeypatch, tmp_path) 
 
     # 重复执行不炸(列已存在)
     database._migrate_sqlite_skill_schema()
+
+
+def test_wechat_kf_account_migration_on_legacy_bindings_without_team_id(
+    monkeypatch, tmp_path
+) -> None:
+    """回归：_migrate_wechat_kf_accounts 曾在 channel_bindings.team_id 添加前
+    查询该列，导致 legacy 表迁移崩溃（no such column: team_id）。"""
+    db_path = tmp_path / "migrate_kf.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE channel_bindings (
+                    id VARCHAR PRIMARY KEY,
+                    tenant_id VARCHAR,
+                    agent_id VARCHAR,
+                    channel VARCHAR,
+                    status VARCHAR,
+                    credentials_enc VARCHAR,
+                    config_json JSON,
+                    connected BOOLEAN,
+                    created_by_user_id VARCHAR,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO channel_bindings (id, tenant_id, agent_id, channel, status, config_json) "
+                "VALUES ('b1', 'tenant_demo', 'agent_demo', 'wechat_kf', 'active', "
+                ":cfg)"
+            ),
+            {"cfg": '{"open_kfid": "kf_001"}'},
+        )
+
+    monkeypatch.setattr(database, "database_url", f"sqlite:///{db_path}")
+    monkeypatch.setattr(database, "engine", engine)
+
+    # 不应在此抛 no such column: team_id
+    database._migrate_sqlite_skill_schema()
+
+    with engine.connect() as conn:
+        accounts = conn.execute(
+            text("SELECT id, tenant_id, binding_id, open_kfid FROM wechat_kf_accounts")
+        ).mappings().all()
+    assert len(accounts) == 1
+    assert accounts[0]["binding_id"] == "b1"
+    assert accounts[0]["open_kfid"] == "kf_001"
+
+    # 重复执行幂等，仍不炸
+    database._migrate_sqlite_skill_schema()

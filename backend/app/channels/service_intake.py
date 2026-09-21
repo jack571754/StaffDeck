@@ -1541,6 +1541,21 @@ def process_inbound(
 
                 context_injection = build_tl_chat_context(db, team, user_message)
                 interaction_mode = "team_tl"
+            else:
+                # ChatBI 意图快径探测：高置信命中查询模板直调执行，跳过 Harness Agent 循环
+                if not attachments and user_message:
+                    from app.channels.service_intent_fast_path import try_handle_intent_fast_path
+
+                    if try_handle_intent_fast_path(
+                        db=db,
+                        binding=binding,
+                        chat_session=chat_session,
+                        event=event,
+                        user_message=user_message,
+                        user_id=user_id,
+                        target=target,
+                    ):
+                        return True
             request = ChatTurnRequest(
                 tenant_id=binding.tenant_id,
                 session_id=session_id,
