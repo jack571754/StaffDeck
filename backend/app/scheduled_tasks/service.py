@@ -51,6 +51,9 @@ from app.skills.nesting import SopNestingError, expand_sop_for_execution
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TASK_TIME = "09:00"
 LEASE_SECONDS = 15 * 60
+# 僵尸 run 回收宽限期：run 启动/最后进展早于该阈值且会话无活跃 turn 才判孤儿。
+# 必须覆盖 run 创建到 harness turn 建立之间的间隙，以及 pipeline 模式单步执行时长。
+ORPHAN_RUN_GRACE_SECONDS = 15 * 60
 WORKER_SLEEP_SECONDS = 5
 MISFIRE_GRACE_SECONDS = max(30, WORKER_SLEEP_SECONDS * 2)
 CONFLICT_RETRY_SECONDS = 15
@@ -448,9 +451,18 @@ def _prepare_scheduled_task_run(
         ).first()
         if running:
             now = utc_now()
-            # 若运行记录因服务重启或异常终止，租约已过期且关联会话无活跃执行轮次，自动标记失效回收，避免永久阻塞后续调度
+            # 若运行记录因服务重启或异常终止而成为僵尸，自动标记失效回收，避免永久阻塞后续调度。
+            # 判定依据是 run 自身的活性（启动已久且长时间无进展、会话无活跃执行轮次），
+            # 而不是 task.lease_until：worker 路径里 due_scheduled_tasks 刚把 lease 续到
+            # now+LEASE_SECONDS，用 lease 判孤儿在同一次调度内恒为 False，会让僵尸 run
+            # 永远只被 forbid 跳过（2026-09-21 生产事故根因）。
+            stale_before = now - timedelta(seconds=ORPHAN_RUN_GRACE_SECONDS)
+            last_alive = running.updated_at or running.started_at
+            is_stale = (running.started_at is None or running.started_at < stale_before) and (
+                last_alive is None or last_alive < stale_before
+            )
             is_orphan = False
-            if task.lease_until is None or task.lease_until < now:
+            if is_stale:
                 active_turn = None
                 if running.session_id:
                     active_turn = db.exec(

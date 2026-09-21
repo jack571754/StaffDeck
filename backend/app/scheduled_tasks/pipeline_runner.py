@@ -146,6 +146,10 @@ def execute_pipeline(
 
             step_info["duration_ms"] = round((time.perf_counter() - step_start) * 1000, 2)
             step_traces.append(step_info)
+            # 每步心跳：孤儿回收依赖 run.updated_at 判定 pipeline 执行是否仍然存活
+            run.updated_at = utc_now()
+            db.add(run)
+            db.commit()
 
         # Success completion
         total_duration_ms = round((time.perf_counter() - t0) * 1000, 2)
