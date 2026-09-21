@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
@@ -31,7 +33,6 @@ from app.api import (
     ui_config,
     wechat_kf,
 )
-from app.data_query.api import router as data_query_router
 from app.async_jobs import shutdown_async_jobs, start_async_jobs
 from app.channels import start_channel_services, stop_channel_services
 from app.config import get_settings
@@ -40,13 +41,18 @@ from app.core.harness_recovery import (
     start_harness_recovery_sweeper,
     stop_harness_recovery_sweeper,
 )
+from app.data_query.api import router as data_query_router
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
 from app.public_api import create_public_api_app
 from app.public_api.jobs import cleanup_public_api_records, recover_public_jobs
 from app.public_api.maintenance import start_public_api_maintenance, stop_public_api_maintenance
 from app.public_api.webhooks import enqueue_due_webhook_deliveries
-from app.runtime_lock import acquire_runtime_instance_lock, release_runtime_instance_lock
+from app.runtime_lock import (
+    RuntimeInstanceLockError,
+    acquire_runtime_instance_lock,
+    release_runtime_instance_lock,
+)
 from app.scheduled_tasks.worker import start_background_worker, stop_background_worker
 from app.teams.sweeper import start_timeout_sweeper, stop_timeout_sweeper
 from app.tools.a2a_recovery import recover_a2a_client_tasks
@@ -74,7 +80,13 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    acquire_runtime_instance_lock()
+    try:
+        acquire_runtime_instance_lock()
+    except RuntimeInstanceLockError as exc:
+        # Fail fast with an actionable message instead of an opaque traceback:
+        # the duplicate instance must never reach recovery or seed side effects.
+        print(f"error: {exc}", file=sys.stderr)
+        raise
     try:
         start_async_jobs()
         init_db()

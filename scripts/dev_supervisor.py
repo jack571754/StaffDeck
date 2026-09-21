@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -19,6 +21,13 @@ from process_utils import pid_alive
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RUN_DIR = ROOT_DIR / ".dev"
 LOG_DIR = RUN_DIR / "logs"
+
+# A service that exits again within FAST_EXIT_SECONDS of a start is treated as
+# a crash loop candidate; FAST_EXIT_LIMIT consecutive fast exits open the
+# circuit breaker so the supervisor stops feeding a failing restart cycle.
+FAST_EXIT_SECONDS = 10.0
+FAST_EXIT_LIMIT = 5
+STABLE_SECONDS = 60.0
 
 
 def env_value(name: str, default: str) -> str:
@@ -60,6 +69,25 @@ def url_host(host: str) -> str:
     return "127.0.0.1" if host == "0.0.0.0" else host
 
 
+def _port_bindable(host: str | None, port: int | None) -> bool:
+    """Check that a service port accepts a bind before spawning the process.
+
+    Without this pre-check, a duplicate instance fails inside uvicorn after
+    startup side effects and the supervisor would feed a restart loop.
+    """
+
+    if host is None or port is None:
+        return True
+    bind_host = "0.0.0.0" if host == "0.0.0.0" else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_host, port))
+            return True
+        except OSError:
+            return False
+
+
 def log(message: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -97,11 +125,16 @@ class Service:
     command: list[str]
     env: dict[str, str] = field(default_factory=dict)
     health_url: str | None = None
+    host: str | None = None
+    port: int | None = None
     process: subprocess.Popen[bytes] | None = None
     unhealthy_count: int = 0
     restart_count: int = 0
     startup_deadline: float = 0.0
     has_been_healthy: bool = False
+    last_start_monotonic: float = 0.0
+    fast_exit_count: int = 0
+    circuit_open: bool = False
 
     @property
     def pid_file(self) -> Path:
@@ -118,6 +151,11 @@ class Service:
     def start(self) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         RUN_DIR.mkdir(parents=True, exist_ok=True)
+        if self.port is not None and not _port_bindable(self.host, self.port):
+            raise RuntimeError(
+                f"Port {self.port} is already in use; {self.name} cannot start. "
+                "Stop the other StaffDeck instance first."
+            )
         merged_env = os.environ.copy()
         merged_env.update(self.env)
         stdout = self.log_file.open("ab", buffering=0)
@@ -138,6 +176,7 @@ class Service:
         self.unhealthy_count = 0
         self.startup_deadline = time.monotonic() + STARTUP_GRACE_SECONDS
         self.has_been_healthy = False
+        self.last_start_monotonic = time.monotonic()
         log(f"started {self.name} pid={self.process.pid}")
 
     def stop(self) -> None:
@@ -193,6 +232,8 @@ class Service:
         return pid_alive(pid)
 
     def poll(self) -> None:
+        if self.circuit_open:
+            return
         if self.process is None:
             self.start()
             return
@@ -200,6 +241,23 @@ class Service:
         if exit_code is not None:
             if not AUTO_RESTART:
                 raise RuntimeError(f"{self.name} exited with code {exit_code}")
+            uptime = time.monotonic() - self.last_start_monotonic
+            if uptime >= STABLE_SECONDS:
+                self.restart_count = 0
+                self.fast_exit_count = 0
+            elif uptime < FAST_EXIT_SECONDS:
+                self.fast_exit_count += 1
+            else:
+                self.fast_exit_count = 0
+            if self.fast_exit_count >= FAST_EXIT_LIMIT:
+                self.circuit_open = True
+                log(
+                    f"{self.name} exited code={exit_code}; crashed repeatedly "
+                    f"({self.fast_exit_count} fast exits); circuit open, "
+                    "manual intervention required"
+                )
+                remove_pid_file(self.pid_file, self.process.pid)
+                return
             self.restart_count += 1
             log(f"{self.name} exited code={exit_code}; restarting count={self.restart_count}")
             remove_pid_file(self.pid_file, self.process.pid)
@@ -208,7 +266,10 @@ class Service:
             return
         if self.health_url:
             if self.healthy():
-                self.has_been_healthy = True
+                if not self.has_been_healthy:
+                    self.has_been_healthy = True
+                    self.restart_count = 0
+                    self.fast_exit_count = 0
                 self.unhealthy_count = 0
                 return
             if not self.has_been_healthy and time.monotonic() < self.startup_deadline:
@@ -258,6 +319,8 @@ def build_services() -> list[Service]:
                 ],
                 env={"CORS_ORIGINS": CORS_ORIGINS, "TOOL_BASE_URL": TOOL_BASE_URL},
                 health_url=f"http://{url_host(APP_HOST)}:{APP_PORT}/api/health",
+                host=APP_HOST,
+                port=int(APP_PORT),
             )
         ]
 
@@ -277,6 +340,8 @@ def build_services() -> list[Service]:
             ],
             env={"CORS_ORIGINS": CORS_ORIGINS, "TOOL_BASE_URL": TOOL_BASE_URL},
             health_url=f"http://{url_host(BACKEND_HOST)}:{BACKEND_PORT}/api/health",
+            host=BACKEND_HOST,
+            port=int(BACKEND_PORT),
         ),
         Service(
             name="enterprise",
@@ -291,6 +356,8 @@ def build_services() -> list[Service]:
             ],
             env={"VITE_API_BASE_URL": API_BASE_URL},
             health_url=f"http://{url_host(ENTERPRISE_HOST)}:{ENTERPRISE_PORT}/enterprise/dashboard",
+            host=ENTERPRISE_HOST,
+            port=int(ENTERPRISE_PORT),
         ),
     ]
 
@@ -316,12 +383,46 @@ def validate_prerequisites() -> None:
         raise RuntimeError("Node.js is not available on PATH")
 
 
-def main() -> int:
+def _ensure_single_supervisor(pid_file: Path, force: bool) -> None:
+    """Refuse to start when another live supervisor owns the run directory.
+
+    Two supervisors targeting the same services would fight over ports and the
+    runtime lock, so a live pid file aborts the second start.
+    """
+
+    try:
+        raw = pid_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    if not raw.isdigit():
+        return
+    pid = int(raw)
+    if pid == os.getpid() or not pid_alive(pid):
+        return
+    if force:
+        log(f"existing supervisor pid={pid} is alive; --force requested, starting anyway")
+        return
+    raise RuntimeError(
+        f"supervisor already running (pid={pid}); stop it first or pass --force"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="start even when another live supervisor is already running",
+    )
+    args, _ = parser.parse_known_args(argv)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     supervisor_pid = os.getpid()
     supervisor_pid_file = RUN_DIR / "supervisor.pid"
     app_port_file = RUN_DIR / "app.port"
+    _ensure_single_supervisor(supervisor_pid_file, args.force)
     supervisor_pid_file.write_text(f"{supervisor_pid}\n", encoding="utf-8")
     if SINGLE_PORT:
         app_port_file.write_text(f"{APP_PORT}\n", encoding="utf-8")

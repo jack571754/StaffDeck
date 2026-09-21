@@ -16,6 +16,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from process_utils import pid_alive
 
 ROOT_DIR = Path(__file__).resolve().parent.parent

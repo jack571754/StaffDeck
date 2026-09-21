@@ -187,3 +187,49 @@ def test_service_dispatches_pipeline_mode(db_session: Session):
     with patch("app.scheduled_tasks.pipeline_runner.execute_pipeline") as mock_exec:
         _execute_prepared_scheduled_task(db_session, task, run, manual=True)
         assert mock_exec.called
+
+
+def test_scheduled_task_migration():
+    from sqlalchemy import inspect, text
+
+    from app.db.database import init_db
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE app_data_migrations (
+                    id VARCHAR PRIMARY KEY
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE scheduled_tasks (
+                    id VARCHAR PRIMARY KEY,
+                    tenant_id VARCHAR,
+                    agent_id VARCHAR,
+                    created_by_user_id VARCHAR,
+                    title VARCHAR,
+                    prompt VARCHAR,
+                    status VARCHAR,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+    with patch("app.db.database.engine", engine):
+        init_db()
+
+    cols = {c["name"] for c in inspect(engine).get_columns("scheduled_tasks")}
+    assert "execution_mode" in cols
+    assert "pipeline_steps_json" in cols
+

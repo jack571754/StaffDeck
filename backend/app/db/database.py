@@ -62,7 +62,7 @@ _CAPABILITY_SCOPE_TABLES = (
 def init_db() -> None:
     # Register all models with SQLModel.metadata before create_all.
     import app.data_query.models
-    import app.db.models
+    import app.db.models  # noqa: F401
 
     _configure_sqlite_runtime()
     SQLModel.metadata.create_all(engine)
@@ -396,6 +396,34 @@ def _migrate_sqlite_skill_schema() -> None:
                     "WHERE idempotency_key IS NOT NULL"
                 )
             )
+
+        if "scheduled_tasks" in tables:
+            scheduled_task_columns = {
+                column["name"] for column in inspector.get_columns("scheduled_tasks")
+            }
+            if "execution_mode" not in scheduled_task_columns:
+                conn.execute(
+                    text(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN execution_mode "
+                        "VARCHAR NOT NULL DEFAULT 'agent'"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_scheduled_tasks_execution_mode "
+                        "ON scheduled_tasks(execution_mode)"
+                    )
+                )
+            if "pipeline_steps_json" not in scheduled_task_columns:
+                conn.execute(
+                    text("ALTER TABLE scheduled_tasks ADD COLUMN pipeline_steps_json JSON")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE scheduled_tasks SET pipeline_steps_json = '[]' "
+                        "WHERE pipeline_steps_json IS NULL"
+                    )
+                )
 
         if "mcp_servers" in tables:
             mcp_server_columns = {

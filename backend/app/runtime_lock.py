@@ -7,6 +7,14 @@ from typing import IO
 from app.config import get_settings
 from app.db.database_path import sqlite_database_path
 
+# Windows LockFile permits locking a range past EOF, so the mutex byte lives at
+# a fixed offset beyond the owner pid. The pid therefore stays readable by a
+# second process even while the lock is held, and locking happens before any
+# read so a duplicate start is rejected cleanly instead of failing inside the
+# pre-lock read (which previously surfaced as an opaque PermissionError crash
+# loop).
+_LOCK_MUTEX_OFFSET = 4096
+
 
 class RuntimeInstanceLockError(RuntimeError):
     """Raised when another StaffDeck process already owns the SQLite runtime."""
@@ -19,12 +27,7 @@ def _try_lock(handle: IO[str]) -> None:
     if os.name == "nt":
         import msvcrt
 
-        handle.seek(0)
-        if not handle.read(1):
-            handle.seek(0)
-            handle.write("0")
-            handle.flush()
-        handle.seek(0)
+        handle.seek(_LOCK_MUTEX_OFFSET)
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         return
 
@@ -37,13 +40,28 @@ def _unlock(handle: IO[str]) -> None:
     if os.name == "nt":
         import msvcrt
 
-        handle.seek(0)
+        handle.seek(_LOCK_MUTEX_OFFSET)
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         return
 
     import fcntl
 
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_owner_pid(handle: IO[str]) -> None:
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+
+
+def _read_owner_pid(handle: IO[str]) -> str:
+    try:
+        handle.seek(0)
+        return handle.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
 
 
 def acquire_runtime_instance_lock() -> Path | None:
@@ -70,21 +88,14 @@ def acquire_runtime_instance_lock() -> Path | None:
     try:
         _try_lock(handle)
     except OSError as exc:
-        owner = "unknown"
-        try:
-            handle.seek(0)
-            owner = handle.read().strip() or "unknown"
-        except OSError:
-            pass
+        owner = _read_owner_pid(handle)
         handle.close()
         raise RuntimeInstanceLockError(
-            f"Another StaffDeck process already owns {database_path} (pid={owner})."
+            f"Another StaffDeck process already owns {database_path} "
+            f"(pid={owner}); runtime lock: {lock_path}"
         ) from exc
 
-    handle.seek(0)
-    handle.truncate()
-    handle.write(str(os.getpid()))
-    handle.flush()
+    _write_owner_pid(handle)
     _lock_handle = handle
     return lock_path
 
