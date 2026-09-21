@@ -50,3 +50,6 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
+.claude/
+backend/_main*.html
+backend/_skill_fix/conversation-logs.json
