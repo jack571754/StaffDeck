@@ -61,7 +61,13 @@ const LEGACY_EVOLUTION_ERRORS: Record<string, string> = {
   'Proposal has no published version to roll back': EVOLUTION_ERROR_MESSAGES.EVOLUTION_ROLLBACK_UNAVAILABLE,
 };
 
-export default function EvolutionPanel({ agentId }: { agentId: string }) {
+export default function EvolutionPanel({
+  agentId,
+  negativeFeedbackCount,
+}: {
+  agentId: string;
+  negativeFeedbackCount?: number;
+}) {
   const { t } = useI18n();
   const [rows, setRows] = useState<EvolutionProposal[]>([]);
   const [instruction, setInstruction] = useState('');
@@ -92,6 +98,10 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
   );
 
   async function analyze() {
+    if (negativeFeedbackCount === 0) {
+      notify.info(t('当前员工暂无点踩反馈。请先在对话中为该员工的回复点踩（👎），产生真实业务反馈后再扫描生成。'));
+      return;
+    }
     setBusyAction('analyze');
     try {
       await api.post(
@@ -102,7 +112,14 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
       notify.success(t('已从真实反馈生成候选草稿'));
       await load();
     } catch (error) {
-      notify.error(localizeEvolutionError(error, '生成自进化候选失败', t));
+      if (
+        error instanceof ApiError &&
+        (error.code === 'EVOLUTION_FEEDBACK_NOT_FOUND' || error.code === 'EVOLUTION_SOP_FEEDBACK_NOT_FOUND')
+      ) {
+        notify.info(localizeEvolutionError(error, '未找到可用于改进的 Skill 或 SOP 反馈', t));
+      } else {
+        notify.error(localizeEvolutionError(error, '生成自进化候选失败', t));
+      }
     } finally {
       setBusyAction('');
     }
@@ -144,6 +161,17 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
                 {activeCount} 个待审核
               </span>
             )}
+            {negativeFeedbackCount !== undefined && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[11px] ${
+                  negativeFeedbackCount > 0
+                    ? 'bg-[#edf9f3] text-[#168760]'
+                    : 'bg-[#f2f4f8] text-[#8c96a8]'
+                }`}
+              >
+                {negativeFeedbackCount} 条点踩反馈
+              </span>
+            )}
           </div>
           <p className="mt-2 mb-0 max-w-[760px] text-[13px] leading-5 text-[#7b8499]">
             从点踩归因和执行轨迹生成最小修改候选。候选不会自动进入运行链路，只有管理员批准后才写入员工私有 Skill/SOP 版本。
@@ -164,7 +192,9 @@ export default function EvolutionPanel({ agentId }: { agentId: string }) {
       <div className="mt-4 grid gap-3">
         {!loading && rows.length === 0 && (
           <div className="rounded-xl border border-dashed border-[#dfe4ec] px-4 py-5 text-center text-[13px] text-[#8b94a8]">
-            暂无候选。产生真实反馈后可扫描生成；上方补充目标用于约束本次修改范围。
+            {negativeFeedbackCount === 0
+              ? '当前员工暂无点踩反馈。在「对话」中对不符合预期的回复点踩（👎）后，即可在此扫描生成自进化候选。'
+              : '暂无候选。产生真实反馈后可扫描生成；上方补充目标用于约束本次修改范围。'}
           </div>
         )}
         {rows.map((proposal) => {

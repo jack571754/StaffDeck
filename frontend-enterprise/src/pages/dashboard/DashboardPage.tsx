@@ -386,7 +386,12 @@ export default function DashboardPage({
             positiveRate={dashboardMetrics.positiveRate}
             negativeRate={dashboardMetrics.negativeRate}
           />
-          {canEditSelectedAgent && <EvolutionPanel agentId={selectedAgent.id} />}
+          {canEditSelectedAgent && (
+            <EvolutionPanel
+              agentId={selectedAgent.id}
+              negativeFeedbackCount={feedbackSummary?.down_count}
+            />
+          )}
         </>
       )}
       {profileTab === 'scheduled' && <ScheduledTasksTab />}
