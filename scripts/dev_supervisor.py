@@ -399,7 +399,10 @@ def _ensure_single_supervisor(pid_file: Path, force: bool) -> None:
     if not raw.isdigit():
         return
     pid = int(raw)
-    if pid == os.getpid() or not pid_alive(pid):
+    # main() calls this before writing its own pid file, so our own pid in the
+    # file is stale residue, not a legitimate self-reference — refuse like any
+    # other live supervisor (--force overrides).
+    if not pid_alive(pid):
         return
     if force:
         log(f"existing supervisor pid={pid} is alive; --force requested, starting anyway")

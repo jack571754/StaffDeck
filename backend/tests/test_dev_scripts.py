@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -181,6 +182,110 @@ def test_supervisor_does_not_restart_during_startup_grace(monkeypatch) -> None:
 
     assert service.unhealthy_count == 0
     assert service.restart_count == 0
+
+
+def test_supervisor_opens_circuit_after_repeated_fast_exits(monkeypatch) -> None:
+    supervisor = _load_script("dev_supervisor")
+    starts: list[int] = []
+
+    class ExitedProcess:
+        def __init__(self) -> None:
+            self.pid = 4242
+
+        def poll(self):
+            return 1
+
+    service = supervisor.Service(name="app", cwd=ROOT_DIR, command=["unused"])
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(supervisor, "remove_pid_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "start", lambda: starts.append(1))
+
+    for _ in range(supervisor.FAST_EXIT_LIMIT):
+        service.process = ExitedProcess()
+        service.last_start_monotonic = 0.0
+        service.poll()
+
+    assert service.circuit_open is True
+    assert service.fast_exit_count == supervisor.FAST_EXIT_LIMIT
+    assert service.restart_count == supervisor.FAST_EXIT_LIMIT - 1
+    assert len(starts) == supervisor.FAST_EXIT_LIMIT - 1
+
+    # Once the circuit is open, poll is a no-op and no further restart happens.
+    service.process = ExitedProcess()
+    service.poll()
+    assert len(starts) == supervisor.FAST_EXIT_LIMIT - 1
+
+
+def test_supervisor_resets_counters_after_stable_uptime(monkeypatch) -> None:
+    supervisor = _load_script("dev_supervisor")
+    starts: list[int] = []
+
+    class ExitedProcess:
+        def __init__(self) -> None:
+            self.pid = 4242
+
+        def poll(self):
+            return 1
+
+    service = supervisor.Service(name="app", cwd=ROOT_DIR, command=["unused"])
+    service.restart_count = 3
+    service.fast_exit_count = 2
+    # The previous run was stable well beyond FAST_EXIT_SECONDS, so the
+    # counters reset instead of accumulating towards the circuit breaker.
+    clock = {"now": supervisor.STABLE_SECONDS + 5.0}
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(supervisor, "remove_pid_file", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "start", lambda: starts.append(1))
+
+    service.process = ExitedProcess()
+    service.last_start_monotonic = 0.0
+    service.poll()
+
+    assert service.restart_count == 1
+    assert service.fast_exit_count == 0
+    assert service.circuit_open is False
+
+
+def test_supervisor_refuses_to_start_over_live_supervisor_pid(tmp_path, monkeypatch) -> None:
+    supervisor = _load_script("dev_supervisor")
+    monkeypatch.setattr(supervisor, "log", lambda _message: None)
+    pid_file = tmp_path / "supervisor.pid"
+    pid_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    try:
+        with pytest.raises(RuntimeError, match="supervisor already running"):
+            supervisor._ensure_single_supervisor(pid_file, force=False)
+        # force explicitly overrides the guard.
+        supervisor._ensure_single_supervisor(pid_file, force=True)
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
+def test_supervisor_accepts_stale_supervisor_pid(tmp_path) -> None:
+    supervisor = _load_script("dev_supervisor")
+    pid_file = tmp_path / "supervisor.pid"
+    pid_file.write_text("999999999\n", encoding="utf-8")
+
+    supervisor._ensure_single_supervisor(pid_file, force=False)
+
+    pid_file.unlink(missing_ok=True)
+
+
+def test_supervisor_port_precheck_blocks_start(monkeypatch, tmp_path) -> None:
+    supervisor = _load_script("dev_supervisor")
+    service = supervisor.Service(
+        name="app",
+        cwd=tmp_path,
+        command=["unused"],
+        host="127.0.0.1",
+        port=59999,
+    )
+    monkeypatch.setattr(supervisor, "_port_bindable", lambda _host, _port: False)
+
+    with pytest.raises(RuntimeError, match="already in use"):
+        service.start()
 
 
 def test_shell_wrappers_delegate_to_cross_platform_cli() -> None:
