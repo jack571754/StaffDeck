@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app import paths
+from app.security.managed_subprocess import no_window_options
 
 _MAX_OUTPUT_CHARS = 120_000
 _SAFE_KEY_PATTERN = re.compile(r"[^A-Za-z0-9_.-]")
@@ -119,6 +120,7 @@ def run_lark_cli(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=(os.name == "posix"),
+        **no_window_options(),
     )
     try:
         stdout, stderr = process.communicate(input=stdin_text, timeout=timeout_seconds)

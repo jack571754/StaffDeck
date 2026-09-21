@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     general_skill_pip_index_url: str = ""
     general_skill_pip_timeout_seconds: int = 180
     general_skill_network_install: bool = True
+    # 允许注入到技能子进程（run_skill_script / general_skills runner）的额外环境变量，
+    # 逗号分隔精确键名。仅决定这些键能否穿透沙箱环境白名单；值本身仍从
+    # 进程环境或 .env 读取，且绝不导出到 os.environ。
+    general_skill_env_passthrough: str = ""
     channel_secret: str = ""
     staffdeck_role: str = "all"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
@@ -88,6 +92,12 @@ class Settings(BaseSettings):
     @property
     def general_skill_runtime_package_list(self) -> list[str]:
         return [item.strip() for item in self.general_skill_runtime_packages.split(",") if item.strip()]
+
+    @property
+    def general_skill_env_passthrough_keys(self) -> frozenset[str]:
+        return frozenset(
+            item.strip() for item in self.general_skill_env_passthrough.split(",") if item.strip()
+        )
 
 
 @lru_cache

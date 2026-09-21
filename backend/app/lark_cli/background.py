@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.lark_cli.runner import configured_app_ids, process_environment
+from app.security.managed_subprocess import no_window_options
 
 _URL_PATTERN = re.compile(r"https://[^\s\"'<>]+")
 _WAIT_FOR_URL_SECONDS = 20.0
@@ -121,6 +122,7 @@ def _spawn(binary: Path, home: Path) -> _InitProcess:
         stderr=subprocess.STDOUT,
         text=True,
         start_new_session=(os.name == "posix"),
+        **no_window_options(),
     )
     _write_pidfile(home, process.pid)
     entry = _InitProcess(process=process, started_at=time.monotonic())

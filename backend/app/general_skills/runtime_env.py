@@ -14,6 +14,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import InvalidVersion, Version
 
 from app.config import get_settings
+from app.security.managed_subprocess import no_window_options
 
 IMPORT_NAMES = {
     "beautifulsoup4": "bs4",
@@ -132,6 +133,7 @@ def _ensure_packages(python_path: Path, packages: list[str]) -> None:
         timeout=settings.general_skill_pip_timeout_seconds,
         check=False,
         env=env,
+        **no_window_options(),
     )
     if result.returncode != 0:
         raise GeneralSkillRuntimeError(
@@ -154,6 +156,7 @@ def _can_import(python_path: Path, import_name: str) -> bool:
         capture_output=True,
         timeout=20,
         check=False,
+        **no_window_options(),
     )
     return result.returncode == 0
 
@@ -172,6 +175,7 @@ def _requirement_satisfied(python_path: Path, requirement: Requirement) -> bool:
         capture_output=True,
         timeout=20,
         check=False,
+        **no_window_options(),
     )
     if result.returncode != 0:
         return False

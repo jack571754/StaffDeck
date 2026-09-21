@@ -33,6 +33,7 @@ from typing import BinaryIO
 
 from app import paths
 from app.config import get_settings
+from app.security.managed_subprocess import no_window_options
 
 PINNED_VERSION = "1.0.89"
 _INSTALL_TIMEOUT_SECONDS = 600.0
@@ -120,6 +121,7 @@ def _run_step(argv: list[str], *, cwd: Path, step: str) -> None:
             text=True,
             timeout=_INSTALL_TIMEOUT_SECONDS,
             check=False,
+            **no_window_options(),
         )
     except subprocess.TimeoutExpired as exc:
         raise LarkCliProvisionError(f"lark-cli {step} 超时。") from exc

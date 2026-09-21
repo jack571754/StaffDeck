@@ -70,8 +70,12 @@ def acquire_runtime_instance_lock() -> Path | None:
     try:
         _try_lock(handle)
     except OSError as exc:
-        handle.seek(0)
-        owner = handle.read().strip() or "unknown"
+        owner = "unknown"
+        try:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown"
+        except OSError:
+            pass
         handle.close()
         raise RuntimeInstanceLockError(
             f"Another StaffDeck process already owns {database_path} (pid={owner})."

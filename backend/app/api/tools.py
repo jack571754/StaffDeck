@@ -14,6 +14,7 @@ from app.agents.branching import (
     hide_open_gallery_binding,
     is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
+    is_tool_visible_for_agent,
     require_overall_agent,
     resource_binding_metadata,
     user_creator_metadata,
@@ -474,6 +475,11 @@ def update_tool(
     row = _get_tool(db, request.tenant_id, tool_id)
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     _ensure_tool_visible(db, request.tenant_id, row, agent_id)
+    if (row.tool_type or "http") == "data_query":
+        raise HTTPException(
+            status_code=400,
+            detail="数据查询工具由数据查询中心管理，请在数据查询中心配置对应模板或数据源",
+        )
     if agent and not agent.is_overall:
         source_tool_id = row.id
         source_was_open_gallery = is_open_gallery_resource(db, request.tenant_id, "tool", row)
@@ -553,6 +559,11 @@ def delete_tool(
     row = _get_tool(db, tenant_id, tool_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
+        if (row.tool_type or "http") == "data_query":
+            raise HTTPException(
+                status_code=400,
+                detail="数据查询工具权限由数据源授权决定，请在员工设置中调整数据源绑定",
+            )
         binding = _tool_binding(db, tenant_id, agent.id, row.id)
         if binding:
             binding.status = "deleted"
@@ -646,13 +657,9 @@ def _ensure_tool_visible(db: Session, tenant_id: str, row: Tool, agent_id: str |
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    if agent and not agent.is_overall:
-        binding = _tool_binding(db, tenant_id, agent.id, row.id)
-        if not binding or not is_bound_resource_visible_for_agent(
-            db, tenant_id, "tool", row, binding
-        ):
+    if not is_tool_visible_for_agent(db, tenant_id, row, agent_id, include_inactive=True):
+        if agent and not agent.is_overall:
             raise HTTPException(status_code=404, detail="Tool not visible to this agent")
-    if (not agent or agent.is_overall) and not is_open_gallery_resource(db, tenant_id, "tool", row):
         raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
 
 

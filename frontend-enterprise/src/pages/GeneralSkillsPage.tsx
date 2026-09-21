@@ -12,7 +12,7 @@ import {
 import type { ChangeEvent, DragEvent, HTMLAttributes, ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Ban, ChevronRight, CircleCheck, Copy, Eye, EyeOff, FilePlus2, FolderPlus, Users } from 'lucide-react';
+import { Ban, ChevronRight, CircleCheck, Copy, Eye, EyeOff, FilePlus2, FolderPlus, Store, Users } from 'lucide-react';
 import { ContextMenu } from 'radix-ui';
 
 import { api, streamPost, TENANT_ID } from '../api/client';
@@ -60,6 +60,7 @@ import { StatCard } from '@/components/StatCard';
 import { ResourceImportDialog } from '@/components/ResourceImportDialog';
 import CodeBlock, { renderCodeTokens } from '../components/CodeBlock';
 import { renderMarkdownBlocks } from './chat/chatHelpers';
+import { SkillMarketDialog } from './general-skills/SkillMarketDialog';
 import IconAdd from '../assets/icons/add.svg?react';
 import IconArrowRight from '../assets/icons/arrow-right.svg?react';
 import IconFolder from '../assets/icons/cap-folder.svg?react';
@@ -352,6 +353,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [clawhubSource, setClawhubSource] = useState('');
   const [clawhubLoading, setClawhubLoading] = useState(false);
   const clawhubAbortRef = useRef<AbortController | null>(null);
+  const [marketOpen, setMarketOpen] = useState(false);
   const [agentImportOpen, setAgentImportOpen] = useState(false);
   const [agentImportMode, setAgentImportMode] = useState<GeneralSkillImportMode>('plaza');
   const [agentImportLoading, setAgentImportLoading] = useState(false);
@@ -801,6 +803,10 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                       从广场复制
                     </DropdownMenuItem>
                   )}
+                  <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => setMarketOpen(true)}>
+                    <Store />
+                    技能市场（SkillHub）
+                  </DropdownMenuItem>
                   <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => requestClawHubImport()}>
                     <GithubOutlined />
                     从开源平台导入
@@ -946,6 +952,14 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         onSubmit={() => void submitAgentImportSkills()}
       />
 
+      <SkillMarketDialog
+        open={marketOpen}
+        onOpenChange={setMarketOpen}
+        tenantId={TENANT_ID}
+        agentId={!isOverallAgent && agentId ? agentId : undefined}
+        onInstalled={() => void load()}
+      />
+
       <ConfirmDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
@@ -1067,6 +1081,15 @@ function languageFromFilePath(path?: string): string {
 
 function normalizeSkillFilePath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/').trim();
+}
+
+function skillFilesFromSkillRow(
+  row: Pick<GeneralSkillRead, 'skill_files' | 'skill_markdown'>,
+): GeneralSkillFile[] {
+  const files = row.skill_files?.length
+    ? row.skill_files
+    : [{ path: 'SKILL.md', content: row.skill_markdown }];
+  return files.map((file) => ({ ...file, path: normalizeSkillFilePath(file.path) }));
 }
 
 function isValidSkillFilePath(path: string): boolean {
@@ -1484,7 +1507,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   );
   const activeResult = runResult || liveResult;
   const selectedFile = useMemo(
-    () => skillFiles.find((file) => file.path === selectedFilePath) || skillFiles[0],
+    () => skillFiles.find((file) => file.path === selectedFilePath)
+      || skillFiles.find((file) => normalizeSkillFilePath(file.path) === normalizeSkillFilePath(selectedFilePath))
+      || skillFiles[0],
     [skillFiles, selectedFilePath],
   );
   const folderPaths = useMemo(
@@ -1517,12 +1542,20 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentSuffix}`)
       .then((items) => {
         setRows(items);
-        if (mode === 'edit') {
+        if (mode === 'edit' && routeSlug) {
           const target = items.find((item) => item.slug === routeSlug);
           if (target) {
             editSkill(target);
-          } else if (routeSlug) {
-            notify.error('未找到要编辑的技能');
+          } else {
+            api
+              .get<GeneralSkillRead>(`/api/enterprise/general-skills/${encodeURIComponent(routeSlug)}?tenant_id=${TENANT_ID}`)
+              .then((directSkill) => {
+                setRows((curr) => [directSkill, ...curr.filter((x) => x.id !== directSkill.id)]);
+                editSkill(directSkill);
+              })
+              .catch(() => {
+                notify.error('未找到要编辑的技能');
+              });
           }
         }
       })
@@ -1594,7 +1627,8 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
 
   useEffect(() => {
     if (!skillFiles.length) return;
-    if (!skillFiles.some((file) => file.path === selectedFilePath)) {
+    const normalizedSelection = normalizeSkillFilePath(selectedFilePath);
+    if (!skillFiles.some((file) => normalizeSkillFilePath(file.path) === normalizedSelection)) {
       const skillFile = skillFiles.find((file) => file.path.split('/').pop()?.toLowerCase() === 'skill.md');
       setSelectedFilePath(skillFile?.path || skillFiles[0].path);
     }
@@ -1682,9 +1716,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setSkillDescription(row.description || '');
       setSkillHomepage(row.homepage || '');
       setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
-      setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
+      setSkillFiles(skillFilesFromSkillRow(row));
       setSkillDirectories(row.skill_directories || []);
-      setSelectedFilePath((row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md' }])[0].path);
+      setSelectedFilePath(skillFilesFromSkillRow(row)[0].path);
       setSelectedFolderPath(null);
       setRows((current) => {
         const withoutSaved = current.filter((item) => item.id !== row.id && item.slug !== row.slug);
@@ -1728,9 +1762,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     setSkillDescription(row.description || '');
     setSkillHomepage(row.homepage || '');
     setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
-    setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
+    setSkillFiles(skillFilesFromSkillRow(row));
     setSkillDirectories(row.skill_directories || []);
-    setSelectedFilePath((row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md' }])[0].path);
+    setSelectedFilePath(skillFilesFromSkillRow(row)[0].path);
     setSelectedFolderPath(null);
     setSelectedSlug(row.slug);
     setEditingSlug(row.slug);
@@ -1749,9 +1783,9 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setSkillHomepage(row.homepage || '');
       setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
       setMarkdown(row.skill_markdown);
-      setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
+      setSkillFiles(skillFilesFromSkillRow(row));
       setSkillDirectories(row.skill_directories || []);
-      setSelectedFilePath((row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md' }])[0].path);
+      setSelectedFilePath(skillFilesFromSkillRow(row)[0].path);
       setSelectedFolderPath(null);
     }
   }

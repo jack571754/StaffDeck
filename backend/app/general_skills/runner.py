@@ -35,6 +35,7 @@ from app.llm import LLMClient, LLMError
 from app.llm.model_config_resolver import snapshot_model_config
 from app.llm.stage_protocol import stage_payload, unified_system_prompt
 from app.observability.spans import llm_operation
+from app.security.skill_env import skill_secret_environment
 
 PROMPT_DIR = paths.resource_dir() / "app" / "llm" / "prompts"
 SELECTOR_PROMPT = PROMPT_DIR / "general_skill_selector_prompt.md"
@@ -670,6 +671,14 @@ class GeneralSkillRunner:
         _materialize_skill_package(skill, skill_dir)
         artifact_dir = run_dir / "artifacts"
         artifact_dir.mkdir()
+        tenant_id = getattr(skill, "tenant_id", "default") or "default"
+        state_dir = (
+            paths.user_data_dir()
+            / "general_skill_state"
+            / tenant_id
+            / skill.slug
+        ).resolve()
+        state_dir.mkdir(parents=True, exist_ok=True)
         runtime = _plan_runtime(plan)
         runner_path = run_dir / ("runner.sh" if runtime == "bash" else "runner.py")
         runner_path.write_text(plan.code, encoding="utf-8")
@@ -680,6 +689,7 @@ class GeneralSkillRunner:
             "user_id": user_id,
             "skill_workspace": str(skill_dir),
             "artifact_dir": str(artifact_dir),
+            "skill_state_dir": str(state_dir),
             "skill_files": [file["path"] for file in _skill_files(skill)],
         }
         _emit(
@@ -721,12 +731,15 @@ class GeneralSkillRunner:
                 "QUERY": query,
                 "SKILL_WORKSPACE": str(skill_dir),
                 "ARTIFACT_DIR": str(artifact_dir),
+                "SKILL_STATE_DIR": str(state_dir),
                 "SKILL_SLUG": skill.slug,
                 "SKILL_NAME": skill.name,
                 "USER_ID": user_id,
                 "SKILL_FILES_JSON": json.dumps([file["path"] for file in _skill_files(skill)], ensure_ascii=False),
             }
         )
+        secret_env = skill_secret_environment()
+        env.update(secret_env)
         if runtime == "bash" and not _bash_supported():
             structured = {
                 "success": False,
@@ -748,12 +761,14 @@ class GeneralSkillRunner:
                 workspace=run_dir,
                 argv=command,
                 stdin_json=stdin_payload,
-                stdin_path_keys=("skill_workspace", "artifact_dir"),
+                stdin_path_keys=("skill_workspace", "artifact_dir", "skill_state_dir"),
                 cwd=Path(cwd),
                 timeout_seconds=_run_timeout_seconds(skill),
                 output_limit=MAX_OUTPUT_CHARS * 4,
                 env=env,
-                env_path_keys=("SKILL_WORKSPACE", "ARTIFACT_DIR"),
+                env_path_keys=("SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_STATE_DIR"),
+                env_allowed_extra=frozenset(secret_env),
+                extra_writable_paths=(state_dir,),
                 network_mode=sandbox_network_mode,
                 allowed_domains=sandbox_allowed_domains,
                 sandbox_enabled=sandbox_enabled,

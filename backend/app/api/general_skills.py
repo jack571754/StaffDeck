@@ -5,11 +5,13 @@ import binascii
 import json
 import queue
 import re
+import sys
 import threading
 import time
 import uuid
 import zipfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from io import BytesIO
 from urllib.error import HTTPError, URLError
@@ -18,12 +20,13 @@ from urllib.request import Request, urlopen
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from app.agents.branching import (
     ensure_open_gallery_binding,
     ensure_private_resource_binding,
     get_agent,
+    get_overall_agent,
     hide_open_gallery_binding,
     is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
@@ -58,6 +61,7 @@ from app.general_skills import (
     GeneralSkillRead,
     GeneralSkillRunRequest,
     GeneralSkillRunResponse,
+    SkillMarketInstallRequest,
 )
 from app.general_skills.runner import GeneralSkillReader, GeneralSkillRunner
 from app.general_skills.schema import GeneralSkillFile
@@ -89,11 +93,44 @@ CLAWHUB_HOSTS = {"clawhub.ai", "www.clawhub.ai"}
 SKILLHUB_HOSTS = {"skillhub.ai", "www.skillhub.ai"}
 REMOTE_SKILLHUB_HOSTS = CLAWHUB_HOSTS | SKILLHUB_HOSTS
 CLAWHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
+# ---- 开源技能市场（skills.sh 注册表：搜索 API + 下载代理） ----
+SKILLS_SH_BASE_URL = "https://skills.sh"
+SKILLS_SH_HOST = "skills.sh"
+# skills.sh 无全量目录接口且搜索最少 2 字符：空关键字用预设词并行搜索合成热门榜
+SKILLS_SH_PRESET_QUERIES = ("docx", "pdf", "excel", "agent", "code", "web")
+SKILLS_SH_SEARCH_LIMIT = 20
+SKILLS_SH_CATALOG_LIMIT = 60
+MARKET_DATASET_HOSTS = {SKILLS_SH_HOST}
+SKILLHUB_MARKET_TIMEOUT_SECONDS = 10
+# raw.githubusercontent.com 在高并发下易瞬态失败（连接被拒/传输截断），降并发并加一次重试
+RAW_DOWNLOAD_CONCURRENCY = 4
+RAW_DOWNLOAD_MAX_ATTEMPTS = 2
+RAW_DOWNLOAD_RETRY_DELAY_SECONDS = 0.5
+MARKET_CACHE_TTL = 300
+_market_cache: dict[str, tuple[float, object]] = {}
+# 市场来源 -> all=skills.sh 热门榜/搜索 / installed=已安装
+MARKET_SOURCES = ("all", "installed")
 LOCAL_REFERENCE_PATTERN = re.compile(r"(?<![\w./-])(?:\./)?references/[^\s`'\"<>|]+")
 
 
 def _agent_id_or_none(agent_id: object | None) -> str | None:
     return agent_id if isinstance(agent_id, str) and agent_id else None
+
+
+def _legacy_stored_package_path(path: str) -> str:
+    """读取时兼容历史数据：净化旧版本写入的包内路径（前导 /、反斜杠、重复分隔符）。"""
+    cleaned = str(path or "").replace("\\", "/").strip().strip("/")
+    return "/".join(part for part in cleaned.split("/") if part and part != ".")
+
+
+def _sanitized_skill_files(row: GeneralSkill) -> list[GeneralSkillFile]:
+    sanitized: list[GeneralSkillFile] = []
+    for item in _skill_files_or_markdown(row):
+        file = GeneralSkillFile.model_validate(item)
+        path = _legacy_stored_package_path(file.path)
+        if path:
+            sanitized.append(file.model_copy(update={"path": path}))
+    return sanitized
 
 
 def general_skill_read(row: GeneralSkill, status_override: str | None = None) -> GeneralSkillRead:
@@ -105,9 +142,7 @@ def general_skill_read(row: GeneralSkill, status_override: str | None = None) ->
         description=row.description,
         homepage=row.homepage,
         skill_markdown=row.skill_markdown,
-        skill_files=[
-            GeneralSkillFile.model_validate(item) for item in _skill_files_or_markdown(row)
-        ],
+        skill_files=_sanitized_skill_files(row),
         skill_directories=_skill_directories(row),
         metadata=dict(row.metadata_json or {}),
         status=status_override or row.status,
@@ -390,6 +425,227 @@ def import_general_skill_package(
         description=request.description,
         homepage=request.homepage,
         capability_scope=request.capability_scope,
+        current_user=current_user,
+    )
+
+
+# =====================================================================
+# SkillHub 技能市场端点：浏览榜单/搜索、预览、一键安装
+# =====================================================================
+
+
+def _is_skill_visible_for_market(
+    db: Session,
+    tenant_id: str,
+    row: GeneralSkill,
+    agent_id: str | None = None,
+) -> bool:
+    agent = get_agent(db, tenant_id, _agent_id_or_none(agent_id))
+    metadata = row.metadata_json or {}
+    owner_agent_id = metadata.get("owner_agent_id")
+    is_private = metadata.get("scope") == "agent_private" or bool(owner_agent_id)
+
+    if agent and not agent.is_overall:
+        binding = db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.tenant_id == tenant_id,
+                AgentResourceBinding.agent_id == agent.id,
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == row.id,
+            )
+        ).first()
+        if binding:
+            return binding.status != "deleted"
+        if is_private and owner_agent_id != agent.id:
+            return False
+        overall = get_overall_agent(db, tenant_id)
+        if overall:
+            ov_binding = db.exec(
+                select(AgentResourceBinding).where(
+                    AgentResourceBinding.tenant_id == tenant_id,
+                    AgentResourceBinding.agent_id == overall.id,
+                    AgentResourceBinding.resource_type == "general_skill",
+                    AgentResourceBinding.resource_id == row.id,
+                )
+            ).first()
+            if ov_binding and ov_binding.status == "deleted":
+                return False
+        return True
+    else:
+        if is_private:
+            return False
+        overall = get_overall_agent(db, tenant_id)
+        if overall:
+            ov_binding = db.exec(
+                select(AgentResourceBinding).where(
+                    AgentResourceBinding.tenant_id == tenant_id,
+                    AgentResourceBinding.agent_id == overall.id,
+                    AgentResourceBinding.resource_type == "general_skill",
+                    AgentResourceBinding.resource_id == row.id,
+                )
+            ).first()
+            if ov_binding and ov_binding.status == "deleted":
+                return False
+        return True
+
+
+def _market_tenant_installed_slugs(
+    db: Session, tenant_id: str, agent_id: str | None = None
+) -> set[str]:
+    rows = db.exec(
+        select(GeneralSkill).where(GeneralSkill.tenant_id == tenant_id)
+    ).all()
+    return {
+        r.slug
+        for r in rows
+        if r.slug and _is_skill_visible_for_market(db, tenant_id, r, agent_id)
+    }
+
+
+@router.get("/market/items")
+def skill_market_items(
+    source: str = Query(default="all"),
+    q: str = Query(default=""),
+    tenant_id: str = Query(default=""),
+    agent_id: str | None = Query(None),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    """浏览开源技能市场：source 为 all（skills.sh 热门榜/搜索）或 installed（已安装技能）。"""
+    source_str = (source if isinstance(source, str) else "all").strip().lower()
+    query_text = (q if isinstance(q, str) else "").strip()
+    tenant_str = (tenant_id if isinstance(tenant_id, str) else "").strip()
+    res_tenant = tenant_str or str(current_user.tenant_id)
+    ensure_tenant(db, res_tenant)
+    resolved_agent_id = _agent_id_or_none(agent_id)
+
+    if source_str == "installed":
+        stmt = select(GeneralSkill).where(GeneralSkill.tenant_id == res_tenant)
+        if query_text:
+            pattern = f"%{query_text}%"
+            stmt = stmt.where(
+                or_(
+                    GeneralSkill.name.ilike(pattern),
+                    GeneralSkill.slug.ilike(pattern),
+                    GeneralSkill.description.ilike(pattern),
+                )
+            )
+        records = db.exec(stmt.order_by(GeneralSkill.updated_at.desc())).all()
+        installed_items: list[dict] = []
+        seen_installed: set[str] = set()
+        for row in records:
+            if not row.slug or row.slug in seen_installed:
+                continue
+            if not _is_skill_visible_for_market(db, res_tenant, row, resolved_agent_id):
+                continue
+            seen_installed.add(row.slug)
+            meta = _parse_skill_metadata(row.skill_markdown) if row.skill_markdown else {}
+            version = _metadata_text(meta, "version") or ""
+            files = row.skill_files_json or []
+            meta_json = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+            installed_items.append(
+                {
+                    "slug": row.slug,
+                    "name": row.name,
+                    "description": row.description
+                    or _metadata_text(meta, "description", "summary")
+                    or "",
+                    "category": str(meta_json.get("category") or ""),
+                    "stars": meta_json.get("stars") or 0,
+                    "installs": meta_json.get("installs") or 0,
+                    "version": version,
+                    "icon_url": str(meta_json.get("icon_url") or ""),
+                    "installed": True,
+                    "status": row.status,
+                    "capability_scope": row.capability_scope,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+                    "files_count": len(files) if files else 1,
+                }
+            )
+        return {"source": "installed", "total": len(installed_items), "items": installed_items}
+    installed = _market_tenant_installed_slugs(db, res_tenant, resolved_agent_id)
+
+    if source_str == "all":
+        # q（≥2 字符）走 skills.sh 服务端搜索；空/过短关键字用预设词合成热门榜
+        visible_items = _skills_sh_catalog(query_text)
+    else:
+        raise HTTPException(status_code=400, detail=f"未知的市场来源: {source_str}")
+
+    items: list[dict] = []
+    seen_slugs: set[str] = set()
+    for raw in visible_items:
+        item = _skill_market_item(raw, installed)
+        slug = item.get("slug")
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        items.append(item)
+    return {"source": source_str, "total": len(items), "items": items}
+
+
+@router.get("/market/skills/{slug}/preview")
+def skill_market_preview(
+    slug: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    """获取某个市场技能包的 SKILL.md 预览与文件清单（优先读本地已安装，未安装则从市场下载解析）。"""
+    tenant_str = (tenant_id if isinstance(tenant_id, str) else "").strip()
+    res_tenant = tenant_str or (str(current_user.tenant_id) if current_user and hasattr(current_user, "tenant_id") else "")
+    if res_tenant:
+        local_skill = db.exec(
+            select(GeneralSkill).where(
+                GeneralSkill.tenant_id == res_tenant, GeneralSkill.slug == slug
+            )
+        ).first()
+        if local_skill:
+            files = _skill_files_or_markdown(local_skill)
+            markdown = local_skill.skill_markdown
+            meta = _parse_skill_metadata(markdown)
+            return {
+                "slug": slug,
+                "name": local_skill.name or _metadata_text(meta, "name", "title") or slug,
+                "description": local_skill.description
+                or _metadata_text(meta, "description", "summary")
+                or "",
+                "markdown": markdown[:8192],
+                "files": [str(f.get("path", "")) for f in files if isinstance(f, dict)],
+            }
+
+    files = _load_market_package(slug)
+    markdown = _skill_markdown_from_files(files)
+    meta = _parse_skill_metadata(markdown)
+    return {
+        "slug": slug,
+        "name": _metadata_text(meta, "name", "title") or slug,
+        "description": _metadata_text(meta, "description", "summary") or "",
+        "markdown": markdown[:8192],
+        "files": [f.path for f in files],
+    }
+
+
+@router.post("/market/install", response_model=GeneralSkillRead)
+def skill_market_install(
+    request: SkillMarketInstallRequest,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> GeneralSkillRead:
+    """从开源技能市场一键下载并装载技能：缺省进企业技能广场；传 agent_id 绑定为私有技能。"""
+    ensure_tenant(db, request.tenant_id)
+    slug = _valid_clawhub_slug(request.slug)
+    if not slug:
+        raise HTTPException(status_code=400, detail=f"非法的技能 slug: {request.slug}")
+    files = _load_market_package(slug)
+    return _create_imported_general_skill(
+        db,
+        tenant_id=request.tenant_id,
+        files=files,
+        import_source=f"skills-sh:{slug}",
+        agent_id=request.agent_id,
+        status="published",
+        slug=slug,
+        capability_scope="general",
         current_user=current_user,
     )
 
@@ -1249,7 +1505,7 @@ def _skill_directories(row: GeneralSkill) -> list[str]:
     values = metadata.get("skill_directories")
     if not isinstance(values, list):
         return []
-    files = [GeneralSkillFile.model_validate(item) for item in _skill_files_or_markdown(row)]
+    files = _sanitized_skill_files(row)
     valid_values = [str(value) for value in values if isinstance(value, str) and value.strip()]
     try:
         return _skill_directories_from_values(valid_values, files)
@@ -1573,6 +1829,23 @@ def _download_github_directory(
 def _download_github_directory_contents(
     owner: str, repo: str, branch: str, subtree: str = ""
 ) -> list[GeneralSkillFile]:
+    """列举并下载 GitHub 目录：优先走 tree 网页内嵌 JSON（api.github.com 常被 403/墙），失败回退 API 列举。"""
+    try:
+        file_paths = _list_github_tree_via_html(owner, repo, branch, subtree)
+    except HTTPException:
+        file_paths = None
+    if file_paths is not None:
+        files = _download_files_via_raw(owner, repo, branch, file_paths, subtree)
+    else:
+        files = _download_github_directory_contents_via_api(owner, repo, branch, subtree)
+    if not _find_skill_file(files):
+        raise HTTPException(status_code=400, detail="GitHub directory does not contain SKILL.md")
+    return files
+
+
+def _download_github_directory_contents_via_api(
+    owner: str, repo: str, branch: str, subtree: str = ""
+) -> list[GeneralSkillFile]:
     normalized_subtree = subtree.strip("/")
     files: list[GeneralSkillFile] = []
     visited_dirs: set[str] = set()
@@ -1626,8 +1899,137 @@ def _download_github_directory_contents(
             )
 
     walk(normalized_subtree)
-    if not _find_skill_file(files):
-        raise HTTPException(status_code=400, detail="GitHub directory does not contain SKILL.md")
+    return files
+
+
+GITHUB_TREE_EMBEDDED_DATA_PATTERN = re.compile(
+    r'<script[^>]*data-target="react-app\.embeddedData"[^>]*>(.*?)</script>',
+    re.DOTALL,
+)
+
+
+def _find_tree_items(payload: object) -> list[object] | None:
+    """在 tree 网页内嵌 payload 中定位 items 列表（目录页结构为 payload.tree.items）。"""
+    if isinstance(payload, dict):
+        tree = payload.get("tree")
+        if isinstance(tree, dict) and isinstance(tree.get("items"), list):
+            return list(tree["items"])
+        for value in payload.values():
+            found = _find_tree_items(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_tree_items(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _list_github_tree_via_html(
+    owner: str, repo: str, branch: str, subtree: str = ""
+) -> list[str]:
+    """通过 GitHub tree 网页内嵌 JSON 递归列举目录文件，返回仓库内绝对文件路径列表。
+
+    页面无法解析时抛 HTTPException，由上层回退 api.github.com 列举。
+    """
+    files: list[str] = []
+    visited: set[str] = set()
+
+    def fetch_page(path: str) -> None:
+        clean = path.strip("/")
+        if clean in visited or len(files) >= MAX_CLAWHUB_FILES:
+            return
+        visited.add(clean)
+        page_url = (
+            f"https://github.com/{quote(owner)}/{quote(repo)}"
+            f"/tree/{quote(branch, safe='')}"
+        )
+        if clean:
+            page_url = f"{page_url}/{quote(clean, safe='/')}"
+        data, _ = _download_url(page_url)
+        match = GITHUB_TREE_EMBEDDED_DATA_PATTERN.search(_decode_text(data))
+        if not match:
+            raise HTTPException(status_code=400, detail="GitHub tree page has no embedded data")
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail="GitHub tree page payload is invalid"
+            ) from exc
+        items = _find_tree_items(payload)
+        if items is None:
+            raise HTTPException(status_code=400, detail="GitHub tree page payload has no items")
+        for item in items:
+            if len(files) >= MAX_CLAWHUB_FILES:
+                return
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("contentType") or "")
+            item_path = str(item.get("path") or "").strip("/")
+            if not item_path or _skip_package_path(item_path):
+                continue
+            if item_type == "directory":
+                fetch_page(item_path)
+            elif item_type == "file":
+                files.append(item_path)
+
+    fetch_page(subtree)
+    return files
+
+
+def _download_file_bytes_with_retry(url: str) -> tuple[bytes, str]:
+    """下载单个文件，瞬态失败（连接被拒、传输截断、超时）重试一次；HTTP 4xx 视为永久失败。"""
+    last_exc: BaseException | None = None
+    for attempt in range(RAW_DOWNLOAD_MAX_ATTEMPTS):
+        if attempt:
+            time.sleep(RAW_DOWNLOAD_RETRY_DELAY_SECONDS)
+        try:
+            return _download_url(url)
+        except HTTPException as exc:
+            if str(exc.detail).startswith("Download failed with HTTP"):
+                raise  # HTTPError 明确的永久失败，不重试
+            last_exc = exc
+        except Exception as exc:  # noqa: BLE001 - IncompleteRead 等传输层错误未被 _download_url 包装
+            last_exc = exc
+    assert last_exc is not None
+    if isinstance(last_exc, HTTPException):
+        raise last_exc
+    raise HTTPException(status_code=400, detail=f"Download failed: {last_exc}") from last_exc
+
+
+def _download_files_via_raw(
+    owner: str, repo: str, branch: str, file_paths: list[str], subtree: str = ""
+) -> list[GeneralSkillFile]:
+    normalized_subtree = subtree.strip("/")
+
+    def fetch(item_path: str) -> GeneralSkillFile | None:
+        relative = item_path
+        if normalized_subtree and item_path.startswith(f"{normalized_subtree}/"):
+            relative = item_path[len(normalized_subtree) + 1 :]
+        raw_url = (
+            f"https://raw.githubusercontent.com/{quote(owner)}/{quote(repo)}"
+            f"/{quote(branch, safe='')}/{quote(item_path, safe='/')}"
+        )
+        data, content_type = _download_file_bytes_with_retry(raw_url)
+        if len(data) > MAX_CLAWHUB_FILE_BYTES:
+            return None
+        return GeneralSkillFile(
+            path=_clean_package_path(relative),
+            content=_decode_text(data),
+            size=len(data),
+            mime_type=content_type or _guess_mime_type(relative),
+        )
+
+    files: list[GeneralSkillFile] = []
+    workers = max(1, min(RAW_DOWNLOAD_CONCURRENCY, len(file_paths)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # executor.map 保持输入顺序，输出顺序确定
+        for file in pool.map(fetch, file_paths):
+            if len(files) >= MAX_CLAWHUB_FILES:
+                break
+            if file is not None:
+                files.append(file)
     return files
 
 
@@ -1822,3 +2224,211 @@ def _validate_slug(value: str) -> None:
 def _sse(event: object, data: object) -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+# =====================================================================
+# 开源技能市场网络层与目录归一（数据源 anbeime/skill 仓库，带 5 分钟缓存）
+# =====================================================================
+
+
+def _market_cache_get(key: str) -> object | None:
+    entry = _market_cache.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if time.monotonic() - ts > MARKET_CACHE_TTL:
+        _market_cache.pop(key, None)
+        return None
+    return value
+
+
+def _market_cache_set(key: str, value: object) -> None:
+    _market_cache[key] = (time.monotonic(), value)
+
+
+def _market_json(url: str) -> object:
+    """拉取市场目录数据集（仅放行白名单域名，带 5 分钟缓存；失败返回 None）。"""
+    parsed = urlparse(url)
+    if parsed.netloc not in MARKET_DATASET_HOSTS:
+        _log_market("拦截非白名单市场域名:", parsed.netloc)
+        return None
+    cached = _market_cache_get(url)
+    if cached is not None:
+        return cached
+    try:
+        req = Request(url, headers={"User-Agent": "StaffDeck/1.0", "Accept": "application/json"})
+        with urlopen(req, timeout=SKILLHUB_MARKET_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (HTTPError, URLError, OSError, ValueError) as exc:
+        _log_market("市场请求失败:", exc)
+        return None
+    _market_cache_set(url, data)
+    return data
+
+
+def _format_install_count(count: object) -> str:
+    """安装量展示文本：>=1 万折算为「x.x万次安装」，其余为「N次安装」。"""
+    try:
+        total = int(count)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if total >= 10000:
+        text = f"{total / 10000:.1f}".rstrip("0").rstrip(".")
+        return f"{text}万次安装"
+    return f"{total}次安装" if total > 0 else ""
+
+
+def _skills_sh_search(query: str) -> list[dict]:
+    """调用 skills.sh 搜索 API 并归一为市场条目；失败返回空列表。
+
+    slug 取 id（owner/repo/path）末段，撞名时加 owner 前缀，仍冲突追加数字后缀。
+    """
+    url = f"{SKILLS_SH_BASE_URL}/api/search?q={quote(query)}&limit={SKILLS_SH_SEARCH_LIMIT}"
+    dataset = _market_json(url)
+    skills = dataset.get("skills") if isinstance(dataset, dict) else None
+    if not isinstance(skills, list):
+        return []
+    entries: list[dict] = []
+    used_slugs: set[str] = set()
+    for raw in skills:
+        if not isinstance(raw, dict):
+            continue
+        skill_id = str(raw.get("id") or "").strip().strip("/")
+        segments = skill_id.split("/")
+        if len(segments) < 3 or not all(
+            seg not in {".", ".."} and re.fullmatch(r"[A-Za-z0-9._-]+", seg)
+            for seg in segments
+        ):
+            continue
+        leaf = re.sub(r"[^A-Za-z0-9_.-]", "-", segments[-1]).strip("-.")
+        if not leaf:
+            continue
+        slug = leaf
+        if slug in used_slugs:
+            owner_prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", segments[0]).strip("-.")
+            slug = f"{owner_prefix}-{leaf}" if owner_prefix else f"{leaf}-2"
+        suffix = 2
+        while slug in used_slugs:
+            slug = f"{leaf}-{suffix}"
+            suffix += 1
+        used_slugs.add(slug)
+        source = str(raw.get("source") or "").strip()
+        entries.append(
+            {
+                "slug": slug,
+                "name": str(raw.get("name") or raw.get("skillId") or slug),
+                "description": f"GitHub: {source}" if source else "",
+                "category": _format_install_count(raw.get("installs")),
+                "origin": "skills_sh",
+                "install_url": (
+                    f"{SKILLS_SH_BASE_URL}/api/download/"
+                    + "/".join(quote(seg, safe="") for seg in segments)
+                ),
+                "installs": raw.get("installs") or 0,
+            }
+        )
+    return entries
+
+
+def _skills_sh_catalog(query: str = "") -> list[dict]:
+    """skills.sh 市场目录：关键字（≥2 字符）走服务端搜索，否则用预设词合成热门榜。
+
+    结果含 5 分钟缓存；每个条目同时写入 slug -> install_url 缓存，供预览/安装解析。
+    """
+    keyword = (query or "").strip()
+    cache_key = f"catalog:{keyword.lower()}" if len(keyword) >= 2 else "catalog:preset"
+    cached = _market_cache_get(cache_key)
+    if isinstance(cached, list):
+        return cached
+    queries = [keyword] if len(keyword) >= 2 else list(SKILLS_SH_PRESET_QUERIES)
+    merged: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(queries))) as pool:
+        for result in pool.map(_skills_sh_search, queries):
+            for entry in result:
+                merged.setdefault(entry["slug"], entry)
+    items = sorted(
+        merged.values(), key=lambda entry: int(entry.get("installs") or 0), reverse=True
+    )[:SKILLS_SH_CATALOG_LIMIT]
+    for entry in items:
+        _market_cache_set(f"slug:{entry['slug']}", entry["install_url"])
+    _market_cache_set(cache_key, items)
+    return items
+
+
+def _market_install_url_for(slug: str) -> str:
+    """解析技能安装地址：优先命中搜索/目录阶段写入的 slug 缓存，其次扫热门榜；不存在则 404。"""
+    cached = _market_cache_get(f"slug:{slug}")
+    if isinstance(cached, str) and cached:
+        return cached
+    for entry in _skills_sh_catalog():
+        if entry["slug"] == slug:
+            return str(entry["install_url"] or "")
+    raise HTTPException(status_code=404, detail=f"市场暂无该技能: {slug}")
+
+
+def _load_skills_sh_package(url: str) -> list[GeneralSkillFile]:
+    """从 skills.sh 下载代理拉取整包 JSON（files 内联全部内容）并转为技能文件列表。"""
+    data, _ = _download_url(url)
+    try:
+        payload = json.loads(_decode_text(data))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="技能包数据解析失败") from exc
+    raw_files = payload.get("files") if isinstance(payload, dict) else None
+    files: list[GeneralSkillFile] = []
+    for raw in raw_files or []:
+        if not isinstance(raw, dict) or len(files) >= MAX_CLAWHUB_FILES:
+            continue
+        raw_path = str(raw.get("path") or "")
+        if not raw_path.strip():
+            continue
+        path = _clean_package_path(raw_path)
+        if _skip_package_path(path):
+            continue
+        content = str(raw.get("contents") or "")
+        size = len(content.encode("utf-8"))
+        if size > MAX_CLAWHUB_FILE_BYTES:
+            continue
+        files.append(
+            GeneralSkillFile(
+                path=path,
+                content=content,
+                size=size,
+                mime_type=_guess_mime_type(path),
+            )
+        )
+    if not _find_skill_file(files):
+        raise HTTPException(status_code=400, detail="技能包缺少 SKILL.md")
+    return files
+
+
+def _load_market_package(slug: str) -> list[GeneralSkillFile]:
+    """下载市场技能包：仅放行 skills.sh 官方下载代理域名，防 SSRF。"""
+    url = _market_install_url_for(slug)
+    if urlparse(url).netloc != SKILLS_SH_HOST:
+        raise HTTPException(
+            status_code=400, detail=f"技能安装地址不在白名单内: {url or '(空)'}"
+        )
+    cached = _market_cache_get(f"package:{url}")
+    if isinstance(cached, list):
+        return cached
+    files = _load_skills_sh_package(url)
+    # 缓存完整包（含 TTL），预览后再安装、重复打开详情不重复下载
+    _market_cache_set(f"package:{url}", files)
+    return files
+
+
+def _skill_market_item(raw: dict, installed: set[str]) -> dict:
+    """把市场目录条目归一为前端统一的 SkillMarketItem。"""
+    slug = str(raw.get("slug") or "").strip()
+    return {
+        "slug": slug,
+        "name": str(raw.get("name") or slug),
+        "description": str(raw.get("description") or ""),
+        "category": str(raw.get("category") or ""),
+        "origin": str(raw.get("origin") or ""),
+        "installed": slug in installed,
+    }
+
+
+def _log_market(*args) -> None:
+    sys.stderr.write("[market] " + " ".join(str(a) for a in args) + "\n")

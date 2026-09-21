@@ -16,6 +16,7 @@ from app.agents.branching import ensure_open_gallery_binding
 from app.api.general_skills import (
     archive_general_skill,
     delete_general_skill,
+    general_skill_read,
     get_general_skill,
     import_clawhub_skill,
     import_general_skill,
@@ -748,6 +749,35 @@ def test_import_general_skill_package_upload_treats_single_markdown_as_skill_md(
 
         assert row.slug == "single-file-skill"
         assert [file.path for file in row.skill_files] == ["SKILL.md"]
+
+
+def test_general_skill_read_sanitizes_legacy_leading_slash_paths() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        row = GeneralSkill(
+            tenant_id="tenant_demo",
+            slug="legacy-path-skill",
+            name="历史路径技能",
+            skill_markdown="# legacy",
+            skill_files_json=[
+                {"path": "/SKILL.md", "content": "# legacy", "size": 8},
+                {"path": "\\tools\\run.py", "content": "print('ok')\n", "size": 12},
+                {"path": "/data//cities.json", "content": "{}", "size": 2},
+            ],
+            metadata_json={"skill_directories": ["/data"]},
+            status="published",
+        )
+        db.add(row)
+        db.commit()
+
+        read = general_skill_read(row)
+
+        assert [file.path for file in read.skill_files] == [
+            "SKILL.md",
+            "tools/run.py",
+            "data/cities.json",
+        ]
+        assert read.skill_directories == ["data"]
 
 
 def test_import_clawhub_skill_reads_github_directory_package(monkeypatch) -> None:
@@ -1734,3 +1764,85 @@ def _test_session():
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def test_general_skill_runner_injects_skill_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.general_skills.schema import GeneralSkillExecutionPlan
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_run_sandboxed_process(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(stdout=b'{"success": true}', stderr=b"", timed_out=False, returncode=0)
+
+    monkeypatch.setattr("app.general_skills.runner.run_sandboxed_process", fake_run_sandboxed_process)
+    monkeypatch.setattr("app.general_skills.runner.ensure_runtime_python", lambda: sys.executable)
+    monkeypatch.setattr("app.general_skills.runner.runtime_environment", lambda env, **k: env)
+
+    skill = GeneralSkill(
+        tenant_id="tenant_alpha",
+        slug="test-state-skill",
+        name="Stateful Skill",
+        skill_markdown="test",
+        skill_files_json=[],
+    )
+    plan = GeneralSkillExecutionPlan(
+        skill_slug=skill.slug,
+        intent="test",
+        runtime="python",
+        code="print('ok')",
+    )
+    runner = GeneralSkillRunner()
+    runner._execute_plan(skill, "test query", plan, "user_1", [])
+
+    env = captured_kwargs.get("env") or {}
+    assert "SKILL_STATE_DIR" in env
+    state_dir = Path(env["SKILL_STATE_DIR"])
+    assert state_dir.is_dir()
+    assert "tenant_alpha" in state_dir.parts
+    assert "test-state-skill" in state_dir.parts
+
+    stdin_json = captured_kwargs.get("stdin_json") or {}
+    assert stdin_json.get("skill_state_dir") == str(state_dir)
+
+    extra_writable_paths = captured_kwargs.get("extra_writable_paths") or ()
+    assert any(str(p) == str(state_dir) for p in extra_writable_paths)
+
+
+def test_general_skill_runner_injects_secret_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.general_skills.schema import GeneralSkillExecutionPlan
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_run_sandboxed_process(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(stdout=b'{"success": true}', stderr=b"", timed_out=False, returncode=0)
+
+    monkeypatch.setattr("app.general_skills.runner.run_sandboxed_process", fake_run_sandboxed_process)
+    monkeypatch.setattr("app.general_skills.runner.ensure_runtime_python", lambda: sys.executable)
+    monkeypatch.setattr("app.general_skills.runner.runtime_environment", lambda env, **k: env)
+    monkeypatch.setattr(
+        "app.general_skills.runner.skill_secret_environment",
+        lambda: {"FEISHU_X": "https://example.com/hook"},
+    )
+
+    skill = GeneralSkill(
+        tenant_id="tenant_alpha",
+        slug="test-secret-skill",
+        name="Secret Skill",
+        skill_markdown="test",
+        skill_files_json=[],
+    )
+    plan = GeneralSkillExecutionPlan(
+        skill_slug=skill.slug,
+        intent="test",
+        runtime="python",
+        code="print('ok')",
+    )
+    runner = GeneralSkillRunner()
+    runner._execute_plan(skill, "test query", plan, "user_1", [])
+
+    env = captured_kwargs.get("env") or {}
+    assert env.get("FEISHU_X") == "https://example.com/hook"
+    assert captured_kwargs.get("env_allowed_extra") == frozenset({"FEISHU_X"})
+

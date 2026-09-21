@@ -54,6 +54,13 @@ class GeneralSkillPackageUploadRequest(BaseModel):
     capability_scope: CapabilityScope = "general"
 
 
+class SkillMarketInstallRequest(BaseModel):
+    """从 SkillHub 市场一键安装技能。默认存企业技能广场；传 agent_id 则绑定为私有技能。"""
+    tenant_id: str
+    slug: str
+    agent_id: Optional[str] = None
+
+
 class GeneralSkillRead(BaseModel):
     id: str
     tenant_id: str

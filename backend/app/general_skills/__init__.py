@@ -6,6 +6,7 @@ from app.general_skills.schema import (
     GeneralSkillRead,
     GeneralSkillRunRequest,
     GeneralSkillRunResponse,
+    SkillMarketInstallRequest,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "GeneralSkillRunner",
     "GeneralSkillReader",
     "GeneralSkillSelector",
+    "SkillMarketInstallRequest",
 ]

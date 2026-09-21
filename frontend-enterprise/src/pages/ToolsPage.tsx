@@ -1271,11 +1271,17 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
         {tool && (
           <UIButton
             variant="outline"
-            onClick={() => navigate(`/enterprise/tools/${tool.id}/edit`)}
+            onClick={() => {
+              if (tool.tool_type === 'data_query') {
+                navigate('/enterprise/data-query');
+              } else {
+                navigate(`/enterprise/tools/${tool.id}/edit`);
+              }
+            }}
             className={RETURN_BUTTON_CLASS}
           >
             <IconEdit className="size-3.5" />
-            编辑工具
+            {tool.tool_type === 'data_query' ? '数据查询中心' : '编辑工具'}
           </UIButton>
         )}
       </div>
@@ -1296,7 +1302,7 @@ export function ToolTestPage({ currentUser, onLogout }: ToolPageProps = {}) {
                     {tool.description || '暂无描述'}
                   </p>
                   <div className="flex flex-wrap items-center gap-[6px]">
-                    <StatusBadge tone={tool.tool_type === 'mcp' || tool.tool_type === 'a2a' ? 'blue' : 'gray'}>{toolTypeLabel(tool)}</StatusBadge>
+                    <StatusBadge tone={tool.tool_type === 'mcp' || tool.tool_type === 'a2a' || tool.tool_type === 'data_query' ? 'blue' : 'gray'}>{toolTypeLabel(tool)}</StatusBadge>
                     <CapabilityScopeBadge value={tool.capability_scope} />
                     <StatusBadge tone={tool.enabled ? 'green' : 'gray'}>{tool.enabled ? '已启用' : '已停用'}</StatusBadge>
                     <StatusBadge tone="gray">{tool.method}</StatusBadge>
@@ -2483,7 +2489,7 @@ function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; stand
           调用已保存的「{tool.display_name || tool.name}」，用于验证员工实际可用的工具返回。
         </span>
         <span className="shrink-0">
-          <StatusBadge tone="gray">{toolTypeLabel(tool)}</StatusBadge>
+          <StatusBadge tone={tool.tool_type === 'data_query' ? 'blue' : 'gray'}>{toolTypeLabel(tool)}</StatusBadge>
         </span>
       </div>
       <div className="flex flex-col gap-[10px]">
@@ -2643,6 +2649,7 @@ function schemaPropertyCount(schema: Record<string, unknown>): string {
 }
 
 function toolTypeLabel(tool: ToolRead): string {
+  if (tool.tool_type === 'data_query') return '数据查询';
   return tool.tool_type === 'mcp' ? 'MCP 服务' : tool.tool_type === 'a2a' ? 'A2A Agent' : 'HTTP 接口';
 }
 
