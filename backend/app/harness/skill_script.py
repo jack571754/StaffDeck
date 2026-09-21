@@ -11,6 +11,7 @@ from app.harness.command import run_sandboxed_process
 from app.harness.contracts import HarnessToolContext
 from app.harness.errors import HarnessExecutionError
 from app.harness.registry import HarnessRegistry
+from app.security.skill_env import skill_secret_allowlist, skill_secret_environment
 
 _PACKAGE_ROOT = Path(".harness/skill-packages")
 
@@ -64,6 +65,10 @@ def run_skill_script(
     if script.is_symlink() or not script.is_file():
         raise HarnessExecutionError("SKILL_SCRIPT_NOT_FOUND", "Skill script is not a regular file.")
 
+    # 白名单凭证注入（与旧 general_skills/runner.py 管线一致）：os.environ 优先、.env 兜底。
+    # env_allowed_extra 必需——白名单键不在 command.py 的静态环境变量白名单内，否则会被过滤掉。
+    secret_env = skill_secret_environment()
+    missing_env_keys = sorted(skill_secret_allowlist() - secret_env.keys())
     command = _script_argv(script, arguments.argv)
     process = run_sandboxed_process(
         workspace=workspace,
@@ -78,6 +83,8 @@ def run_skill_script(
         network_mode=context.sandbox_network_mode,
         allowed_domains=context.sandbox_allowed_domains,
         sandbox_enabled=context.sandbox_enabled,
+        env=secret_env,
+        env_allowed_extra=frozenset(secret_env),
     )
     return {
         "ok": process.returncode == 0 and not process.timed_out,
@@ -97,6 +104,9 @@ def run_skill_script(
         "duration_ms": process.duration_ms,
         "script_path": script.relative_to(workspace).as_posix(),
         "isolation_mode": process.isolation_mode,
+        # 预检诊断：passthrough 白名单里配置了但未解析到值的键（.env/环境均缺失），
+        # 让 AgentLoop 在脚本 exit 2 之前就能看到缺哪个凭证。
+        "missing_env_keys": missing_env_keys,
     }
 
 
