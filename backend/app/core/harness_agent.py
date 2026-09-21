@@ -20,6 +20,7 @@ from app.core.task_request_compiler import (
     TaskRequirement,
 )
 from app.db.models import ModelConfig
+from app.harness.errors import HarnessExecutionError
 from app.llm import LLMClient, LLMError
 from app.observability.spans import llm_operation
 from app.session.slot_policy import strip_router_generated_message_slots
@@ -29,6 +30,19 @@ MAX_SUCCESSFUL_KNOWLEDGE_SEARCHES_PER_TASK = 2
 ToolInvoker = Callable[[str, dict[str, Any]], dict[str, Any]]
 TraceSink = Callable[[str, dict[str, Any]], None]
 CancellationCheck = Callable[[], bool]
+
+NON_RETRYABLE_ERROR_CODES = {
+    "COMMAND_DENIED",
+    "SKILL_SCRIPT_NOT_FOUND",
+    "SKILL_SCRIPT_NOT_ALLOWED",
+    "SKILL_PACKAGE_NOT_LOADED",
+    "UNSUPPORTED_SKILL_SCRIPT",
+    "RUNTIME_NOT_FOUND",
+    "INVALID_ARGUMENTS",
+    "FILE_NOT_FOUND",
+    "PATH_OUTSIDE_WORKSPACE",
+}
+CONSECUTIVE_FAILURE_BUDGET = 4
 
 
 class HarnessExecutionCancelled(RuntimeError):
@@ -125,6 +139,7 @@ class HarnessTaskAgent:
         # checkpoint made a later user turn inherit an obsolete failure even
         # after its inputs or external state had changed.
         non_retryable_action_signatures: set[str] = set()
+        consecutive_non_retryable_failures = 0
         # 强制能力从未尝试就 finish(failed) 只拦一次，避免与固执模型互相死锁。
         failed_finish_without_attempt_blocked = False
         allowed_names = requirement.capability_manifest.allowed_names()
@@ -527,6 +542,11 @@ class HarnessTaskAgent:
                         _raise_if_cancelled(is_cancelled)
                     except (HarnessExecutionCancelled, HarnessExecutionFenced):
                         raise
+                    except HarnessExecutionError as exc:
+                        result = {
+                            "success": False,
+                            "error": exc.error.model_dump(),
+                        }
                     except Exception as exc:
                         result = {
                             "success": False,
@@ -537,7 +557,49 @@ class HarnessTaskAgent:
                         }
                     if _is_non_retryable_failure(result):
                         non_retryable_action_signatures.add(action_signature)
+                        consecutive_non_retryable_failures += 1
+                    elif result.get("success") is False:
+                        consecutive_non_retryable_failures = max(
+                            0, consecutive_non_retryable_failures - 1
+                        )
+                    else:
+                        consecutive_non_retryable_failures = 0
             bounded_result = _bounded_capability_result(tool_name, result)
+            if (
+                consecutive_non_retryable_failures >= CONSECUTIVE_FAILURE_BUDGET
+                and result.get("success") is False
+            ):
+                error = result.get("error") or {}
+                diagnostic = (
+                    f"连续 {CONSECUTIVE_FAILURE_BUDGET} 次工具调用均因不可重试错误失败，"
+                    f"AgentLoop 已停止继续尝试。最后一次错误：[{error.get('code', 'UNKNOWN')}] "
+                    f"{error.get('message', '')}"
+                )
+                if trace_sink:
+                    trace_sink(
+                        "harness_consecutive_failure_circuit_break",
+                        {
+                            "iteration": iteration,
+                            "failure_count": consecutive_non_retryable_failures,
+                            "last_error_code": error.get("code"),
+                            "last_tool": tool_name,
+                            "budget": CONSECUTIVE_FAILURE_BUDGET,
+                        },
+                    )
+                return finish(TaskExecutionResult(
+                    task_frame_id=requirement.task_frame_id,
+                    status="failed",
+                    reply_fragment=diagnostic,
+                    capability_results=capability_results,
+                    action_count=iteration,
+                    task_summary="连续不可重试错误触发熔断，请检查工具配置或权限后重试。",
+                    structured_result={
+                        "error": "CONSECUTIVE_NON_RETRYABLE_FAILURES",
+                        "failure_count": consecutive_non_retryable_failures,
+                        "last_error_code": error.get("code"),
+                        "last_error_message": error.get("message"),
+                    },
+                ))
             result_data = result.get("data")
             if (
                 result.get("success") is True

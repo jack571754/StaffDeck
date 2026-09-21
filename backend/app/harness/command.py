@@ -36,6 +36,18 @@ from app.security.managed_subprocess import ManagedProcess, ManagedProcessError
 
 _BASH_PATH = "/bin/bash"
 _WINDOWS_POWERSHELL = "powershell.exe"
+# 沙箱子进程环境白名单：业务/技能键经 _managed_process_environment 过滤后放行，
+# bwrap 额外通过 --setenv 显式注入（有 --clearenv）。
+_MANAGED_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "PWD", "TMPDIR", "LANG", "LC_ALL",
+    "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG",
+    "SKILL_NAME", "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
+    "SKILL_STATE_DIR",
+})
+_BUBBLEWRAP_ENV_ALLOWLIST = frozenset({
+    "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG", "SKILL_NAME",
+    "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT", "SKILL_STATE_DIR",
+})
 _WINDOWS_PROFILE_EXPANSION = re.compile(
     r"(?i)(?:\$env:(?:userprofile|homedrive|homepath|appdata|localappdata|programdata)\b"
     r"|\$(?:userprofile|home|profile|pshome|psscriptroot)\b"
@@ -305,6 +317,8 @@ def run_sandboxed_process(
     sandbox_enabled: bool = True,
     env: dict[str, str] | None = None,
     env_path_keys: tuple[str, ...] = (),
+    env_allowed_extra: frozenset[str] = frozenset(),
+    extra_writable_paths: Sequence[Path] = (),
     is_cancelled: Callable[[], bool] | None = None,
 ) -> _BoundedProcessResult:
     """Run a fixed argv through the same OS sandbox as ``exec_command``."""
@@ -372,6 +386,7 @@ def run_sandboxed_process(
                 network_mode=network_mode,
                 allowed_domains=allowed_domains,
                 sandbox_temp=sandbox_temp_path,
+                extra_writable_paths=extra_writable_paths,
             )
             sandbox_argv = _srt_argv(settings_path=settings_path, command=command)
         else:
@@ -398,8 +413,10 @@ def run_sandboxed_process(
                 backend=backend,
                 env=process_env,
                 extra_readonly_paths=runtime_roots,
+                extra_writable_paths=extra_writable_paths,
                 network_mode=network_mode,
                 sandbox_cwd=execution.sandbox_cwd(cwd),
+                env_allowed_extra=env_allowed_extra,
             )
         process_kwargs: dict[str, Any] = {
             "cwd": host_cwd,
@@ -407,6 +424,7 @@ def run_sandboxed_process(
             "output_limit": output_limit,
             "stdin_bytes": stdin_bytes,
             "env": process_env,
+            "env_allowed_extra": env_allowed_extra,
         }
         if is_cancelled is not None:
             process_kwargs["is_cancelled"] = is_cancelled
@@ -529,6 +547,7 @@ def _write_srt_settings(
     network_mode: str = "all",
     allowed_domains: tuple[str, ...] = (),
     sandbox_temp: Path | None = None,
+    extra_writable_paths: Sequence[Path] = (),
 ) -> Path:
     if network_mode not in {"all", "allowlist", "deny"}:
         raise HarnessExecutionError("SANDBOX_POLICY_INVALID", "Unknown sandbox network policy.")
@@ -586,6 +605,12 @@ def _write_srt_settings(
         resolved_temp = str(sandbox_temp.resolve(strict=True))
         allow_read.append(resolved_temp)
         allow_write.append(resolved_temp)
+    for extra_path in extra_writable_paths:
+        resolved_extra = str(extra_path.resolve())
+        if resolved_extra not in allow_read:
+            allow_read.append(resolved_extra)
+        if resolved_extra not in allow_write:
+            allow_write.append(resolved_extra)
     settings = json.dumps(
         {
             "filesystem": {
@@ -699,8 +724,10 @@ def _bubblewrap_argv(
     backend: str = "bubblewrap",
     env: dict[str, str] | None = None,
     extra_readonly_paths: Sequence[Path] = (),
+    extra_writable_paths: Sequence[Path] = (),
     network_mode: str = "deny",
     sandbox_cwd: str = SANDBOX_WORKSPACE,
+    env_allowed_extra: frozenset[str] = frozenset(),
 ) -> list[str]:
     if network_mode not in {"all", "allowlist", "deny"}:
         raise HarnessExecutionError("SANDBOX_POLICY_INVALID", "Unknown sandbox network policy.")
@@ -727,6 +754,10 @@ def _bubblewrap_argv(
             path = Path(raw_path)
             if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
                 profile += f' (allow file-read* (subpath "{raw_path}"))'
+        for raw_path in dict.fromkeys(str(path.resolve()) for path in extra_writable_paths):
+            path = Path(raw_path)
+            if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
+                profile += f' (allow file-read* (subpath "{raw_path}")) (allow file-write* (subpath "{raw_path}"))'
         return [
             _seatbelt_executable(),
             "-p",
@@ -767,6 +798,10 @@ def _bubblewrap_argv(
         path = Path(raw_path)
         if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
             argv.extend(("--ro-bind", raw_path, raw_path))
+    for raw_path in dict.fromkeys(str(path.resolve()) for path in extra_writable_paths):
+        path = Path(raw_path)
+        if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
+            argv.extend(("--bind", raw_path, raw_path))
     argv.extend(
         (
             "--proc",
@@ -807,10 +842,7 @@ def _bubblewrap_argv(
     allowed_env = {
         key: value
         for key, value in (env or {}).items()
-        if key in {
-            "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG", "SKILL_NAME",
-            "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
-        }
+        if key in (_BUBBLEWRAP_ENV_ALLOWLIST | env_allowed_extra)
     }
     for key, value in allowed_env.items():
         if len(value) <= 16 * 1024:
@@ -819,7 +851,10 @@ def _bubblewrap_argv(
     return argv
 
 
-def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
+def _managed_process_environment(
+    env: dict[str, str] | None,
+    allowed_extra: frozenset[str] = frozenset(),
+) -> dict[str, str]:
     if sys.platform == "win32":
         system_keys = {
             "APPDATA",
@@ -837,6 +872,11 @@ def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
             "WINDIR",
         }
         baseline = {key: os.environ[key] for key in system_keys if key in os.environ}
+        # Windows 默认 ANSI 代码页（如 cp1252）会让 Python 子进程在
+        # 输出非 ASCII 时崩溃；沙箱拉起的解释器必须与 locale 无关地固定 UTF-8，
+        # 否则中文 stdout 会触发 UnicodeEncodeError 而静默无输出。
+        baseline["PYTHONUTF8"] = "1"
+        baseline["PYTHONIOENCODING"] = "utf-8"
     else:
         baseline = {
             "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
@@ -846,11 +886,7 @@ def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
     allowed = {
         key: value
         for key, value in (env or {}).items()
-        if key in {
-            "PATH", "HOME", "PWD", "TMPDIR", "LANG", "LC_ALL",
-            "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG",
-            "SKILL_NAME", "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
-        }
+        if key in (_MANAGED_ENV_ALLOWLIST | allowed_extra)
     }
     return {**baseline, **allowed}
 
@@ -863,6 +899,7 @@ def _run_bounded_process(
     output_limit: int,
     stdin_bytes: bytes = b"",
     env: dict[str, str] | None = None,
+    env_allowed_extra: frozenset[str] = frozenset(),
     is_cancelled: Callable[[], bool] | None = None,
 ) -> _BoundedProcessResult:
     started = time.monotonic()
@@ -870,7 +907,7 @@ def _run_bounded_process(
         managed_process = ManagedProcess.start(
             argv,
             cwd=str(cwd),
-            env=_managed_process_environment(env),
+            env=_managed_process_environment(env, allowed_extra=env_allowed_extra),
             stdin=subprocess.PIPE if stdin_bytes else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1028,10 +1065,14 @@ def _validate_windows_command(command: str) -> None:
         raise _command_denied("Command contains an unsupported control character.")
     if len(command) > _MAX_COMMAND_CHARS:
         raise _command_denied("Command exceeds the maximum length.")
-    if re.search(r"(?m)(?:^|\n)\s*<<\s*['\"]?", command):
+    if "<<" in command:
+        # `<<` 在 PowerShell 中是保留操作符（行内 heredoc 也会在解析阶段报
+        # CLIXML ParserError），因此对任意位置统一拒绝，避免只拦行首漏检
+        # `python3 - <<'PYEOF'` 这类写法。
         raise _command_denied(
-            "Bash heredoc syntax is not supported on Windows PowerShell. "
-            "Use write_file/General Skill for Python files, or a PowerShell here-string."
+            "Bash heredoc syntax (<<) is not supported on Windows PowerShell. "
+            "Write the script with write_file, then execute the file; "
+            "or use a PowerShell here-string (@'...'@)."
         )
     if "&&" in command:
         raise _command_denied(

@@ -263,10 +263,9 @@ class HarnessCapabilityInvoker:
             result = _failure("HARNESS_TOOL_ERROR", str(exc))
         if result.get("success") is True:
             invocation.status = "completed"
-        elif _failure_was_not_sent(result):
-            # Configuration/authorization failures are known to occur before
-            # the external side effect. Release the stable claim so a later
-            # turn can retry after the configuration is repaired.
+        elif _failure_was_not_sent(result) or logical_action_key is None:
+            # Configuration/authorization failures or tools without a logical_action_key
+            # (e.g. read-only data queries) do not hold a write claim. Release the claim so retries can proceed.
             invocation.status = "failed"
             invocation.logical_action_key = None
         else:
@@ -348,6 +347,8 @@ class HarnessCapabilityInvoker:
             tool.input_schema if isinstance(tool.input_schema, dict) else {},
         )
         if configured is False:
+            return None
+        if (tool.tool_type or "http") == "data_query" and configured is not True:
             return None
         if configured is not True and not ToolReplayPolicy.default_replay_enabled(
             str(tool.method or "")

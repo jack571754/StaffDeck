@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from app.harness.errors import HarnessExecutionError
+from app.security.managed_subprocess import no_window_options
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,7 @@ def _windows_srt_ready(node: Path, cli: Path) -> bool:
                 capture_output=True,
                 timeout=20,
                 check=False,
+                **no_window_options(),
             )
             return completed.returncode == 0
     except (OSError, subprocess.SubprocessError):

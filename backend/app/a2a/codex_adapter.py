@@ -20,7 +20,7 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import engine
 from app.db.models import A2ATaskEvent, A2ATaskRun, utc_now
-
+from app.security.managed_subprocess import no_window_options
 
 router = APIRouter(tags=["a2a-codex"])
 _processes: dict[str, subprocess.Popen[str]] = {}
@@ -320,6 +320,7 @@ def _run_codex_task(task_id: str, *, recovery: bool = False) -> None:
             errors="replace",
             bufsize=1,
             env=os.environ.copy(),
+            **no_window_options(),
         )
         with _process_lock:
             _processes[task_id] = process

@@ -8,14 +8,13 @@ import os
 import time
 from typing import Any
 
-from fastapi import Depends, HTTPException, Query
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlmodel import Session
 
 from app.config import get_settings
 from app.db import get_session
 from app.db.models import User
-
 
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 14
 security = HTTPBearer(auto_error=False)
@@ -56,6 +55,29 @@ def get_current_user(
     if not credentials:
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = _decode_token(credentials.credentials)
+    user = db.get(User, payload.get("user_id", ""))
+    if not user or user.tenant_id != payload.get("tenant_id"):
+        raise HTTPException(status_code=401, detail="Invalid user token")
+    return user
+
+
+def get_current_user_optional(
+    request: Request,
+    db: Session = Depends(get_session),
+) -> User | None:
+    """Resolve the current user, or None when no credentials were sent.
+
+    Unlike `HTTPBearer(auto_error=False)`, which collapses both "no header" and
+    "malformed header" into None, this reads the raw request header so that a
+    present-but-invalid Authorization header raises 401 instead of silently
+    downgrading the caller to anonymous. Downgrading would be an authorization
+    bypass for endpoints that tighten access when a user is known.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return None
+    token = auth_header.removeprefix("Bearer ").strip()
+    payload = _decode_token(token)
     user = db.get(User, payload.get("user_id", ""))
     if not user or user.tenant_id != payload.get("tenant_id"):
         raise HTTPException(status_code=401, detail="Invalid user token")

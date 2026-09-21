@@ -3533,6 +3533,77 @@ def test_harness_agent_blocks_repeated_non_retryable_action(
     ]
 
 
+def test_harness_agent_circuit_breaks_on_consecutive_non_retryable_failures(
+    monkeypatch,
+) -> None:
+    """连续 4 次不同的不可重试失败应触发熔断，直接 failed 终止而不是继续耗光预算。"""
+    failing_actions = [
+        {"action": "tool", "tool_name": "exec_command", "arguments": {"command": "cmd1"}},
+        {"action": "tool", "tool_name": "read_file", "arguments": {"path": "a.txt"}},
+        {"action": "tool", "tool_name": "exec_command", "arguments": {"command": "cmd2"}},
+        {"action": "tool", "tool_name": "run_skill_script", "arguments": {"script_path": "x.py"}},
+        {"action": "tool", "tool_name": "exec_command", "arguments": {"command": "cmd3"}},
+    ]
+    actions = iter(failing_actions)
+
+    class FakeLLMClient:
+        def __init__(self, _model_config: ModelConfig):
+            pass
+
+        def generate_json(self, _system_prompt, _payload):
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    invoked: list[tuple[str, dict[str, object]]] = []
+
+    def invoke_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        invoked.append((name, arguments))
+        return {
+            "success": False,
+            "error": {
+                "code": "COMMAND_DENIED",
+                "message": f"{name} 被拒绝。",
+                "retryable": False,
+            },
+        }
+
+    result = HarnessTaskAgent().run(
+        TaskRequirement(
+            task_frame_id="task-circuit-break",
+            kind="conversation",
+            goal="测试连续失败熔断",
+            capability_manifest=CapabilityManifest(
+                available=[
+                    CapabilityDescriptor(
+                        capability_id="builtin.exec-command",
+                        name="exec_command",
+                        kind="internal",
+                    ),
+                    CapabilityDescriptor(
+                        capability_id="builtin.read-file",
+                        name="read_file",
+                        kind="internal",
+                    ),
+                    CapabilityDescriptor(
+                        capability_id="builtin.run-skill-script",
+                        name="run_skill_script",
+                        kind="internal",
+                    ),
+                ]
+            ),
+        ),
+        _model_config(),
+        invoke_tool,
+        max_actions=10,
+    )
+
+    assert result.status == "failed"
+    assert result.structured_result and result.structured_result.get("error") == "CONSECUTIVE_NON_RETRYABLE_FAILURES"
+    assert result.structured_result.get("failure_count") == 4
+    # 只执行了 4 次就熔断了，没有耗光 10 次预算
+    assert len(invoked) == 4
+
+
 def test_harness_agent_does_not_restore_non_retryable_failures_from_checkpoint(
     monkeypatch,
 ) -> None:

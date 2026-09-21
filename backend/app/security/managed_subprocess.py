@@ -179,6 +179,17 @@ def _popen_platform_options(platform_name: str) -> dict[str, Any]:
     return {"start_new_session": True}
 
 
+def no_window_options(platform_name: str | None = None) -> dict[str, Any]:
+    """subprocess.run/Popen 的附加选项：Windows 下隐藏子进程控制台窗口。
+
+    后端常以 CREATE_NO_WINDOW 启动（无控制台），此时再创建任何控制台子系统
+    子进程而不带该标志，Windows 会为其分配新的可见控制台窗口（cmd 闪现）。
+    """
+    if (platform_name or os.name) == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
 @dataclass
 class ManagedProcess:
     process: subprocess.Popen[Any]

@@ -557,6 +557,7 @@ def test_windows_validator_allows_parent_directory_paths() -> None:
     [
         "python3 heart_png.py && python3 - <<'PY'\nprint('x')\nPY",
         "py -3 heart_png.py",
+        "python3 - <<'PYEOF'\nprint('x')\nPYEOF",
     ],
 )
 def test_windows_validator_explains_bash_and_python_runtime_mismatch(
@@ -567,6 +568,15 @@ def test_windows_validator_explains_bash_and_python_runtime_mismatch(
 
     assert denied.value.error.code == "COMMAND_DENIED"
     assert "General Skill" in denied.value.error.message or "PowerShell" in denied.value.error.message
+
+
+def test_windows_validator_rejects_inline_heredoc_without_chaining() -> None:
+    with pytest.raises(HarnessExecutionError) as denied:
+        command_module._validate_windows_command("Get-Content a.txt << x")
+
+    assert denied.value.error.code == "COMMAND_DENIED"
+    assert "PowerShell" in denied.value.error.message
+    assert "write_file" in denied.value.error.message
 
 
 def test_packaged_windows_shell_aliases_bundled_python(tmp_path: Path, monkeypatch) -> None:
@@ -710,6 +720,9 @@ def test_windows_broker_environment_keeps_system_paths_without_secrets(
     assert result["PATH"] == r"C:\Windows\System32"
     assert result["ARGUMENTS"] == "safe"
     assert "OPENAI_API_KEY" not in result
+    # 沙箱拉起的 Python 子进程必须固定 UTF-8，否则 cp1252 locale 下中文输出崩溃
+    assert result["PYTHONUTF8"] == "1"
+    assert result["PYTHONIOENCODING"] == "utf-8"
 
 
 def test_sandboxed_process_maps_structured_paths_and_cwd_for_bubblewrap(
@@ -725,7 +738,16 @@ def test_sandboxed_process_maps_structured_paths_and_cwd_for_bubblewrap(
     monkeypatch.setattr(command_module, "available_backend", lambda: "bubblewrap")
     monkeypatch.setattr(command_module, "_bubblewrap_executable", lambda: "/usr/bin/bwrap")
 
-    def fake_run(argv, *, cwd, timeout_seconds, output_limit, stdin_bytes, env):
+    def fake_run(
+        argv,
+        *,
+        cwd,
+        timeout_seconds,
+        output_limit,
+        stdin_bytes,
+        env,
+        env_allowed_extra,
+    ):
         captured.update(argv=list(argv), cwd=cwd, stdin=stdin_bytes, env=env)
         return command_module._BoundedProcessResult(
             returncode=0,
@@ -888,3 +910,128 @@ def _option_values(argv: list[str], option: str) -> list[str]:
     if option == "--bind":
         return argv[index + 1 : index + 3]
     return argv[index + 1 : index + 2]
+
+
+def test_managed_process_environment_allows_skill_state_dir() -> None:
+    env = command_module._managed_process_environment(
+        {"SKILL_STATE_DIR": "C:/StaffDeck/state", "UNWANTED_VAR": "secret"}
+    )
+    assert env.get("SKILL_STATE_DIR") == "C:/StaffDeck/state"
+    assert "UNWANTED_VAR" not in env
+
+
+def test_bubblewrap_argv_allows_skill_state_dir(tmp_path: Path) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    state_dir = (tmp_path / "state").resolve()
+    state_dir.mkdir()
+    argv = command_module._bubblewrap_argv(
+        sandbox_executable="/usr/bin/bwrap",
+        workspace=workspace,
+        command="echo hi",
+        env={"SKILL_STATE_DIR": str(state_dir)},
+        extra_writable_paths=[state_dir],
+    )
+    assert "--setenv" in argv
+    setenv_indices = [i for i, x in enumerate(argv) if x == "--setenv"]
+    setenv_pairs = {argv[i + 1]: argv[i + 2] for i in setenv_indices}
+    assert setenv_pairs.get("SKILL_STATE_DIR") == str(state_dir)
+    bind_indices = [i for i, x in enumerate(argv) if x == "--bind"]
+    bind_pairs = [(argv[i + 1], argv[i + 2]) for i in bind_indices]
+    assert (str(state_dir), str(state_dir)) in bind_pairs
+
+
+def test_managed_process_environment_allows_extra_passthrough_keys() -> None:
+    env = {"FEISHU_X": "https://example.com/hook", "OTHER_SECRET": "no"}
+
+    default_env = command_module._managed_process_environment(env)
+    assert "FEISHU_X" not in default_env
+    assert "OTHER_SECRET" not in default_env
+
+    extra_env = command_module._managed_process_environment(
+        env, allowed_extra=frozenset({"FEISHU_X"})
+    )
+    assert extra_env["FEISHU_X"] == "https://example.com/hook"
+    assert "OTHER_SECRET" not in extra_env
+
+
+def test_bubblewrap_argv_allows_extra_passthrough_keys(tmp_path: Path) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    argv = command_module._bubblewrap_argv(
+        sandbox_executable="/usr/bin/bwrap",
+        workspace=workspace,
+        command="echo hi",
+        env={"FEISHU_X": "https://example.com/hook", "SECRET": "no"},
+        env_allowed_extra=frozenset({"FEISHU_X"}),
+    )
+    setenv_indices = [i for i, x in enumerate(argv) if x == "--setenv"]
+    setenv_pairs = {argv[i + 1]: argv[i + 2] for i in setenv_indices}
+    assert setenv_pairs.get("FEISHU_X") == "https://example.com/hook"
+    assert "SECRET" not in setenv_pairs
+
+
+def test_run_sandboxed_process_threads_env_allowed_extra(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = (tmp_path / "task").resolve()
+    workspace.mkdir()
+    runner = workspace / "runner.py"
+    runner.write_text("print('ok')", encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(command_module, "available_backend", lambda: "bubblewrap")
+    monkeypatch.setattr(command_module, "_bubblewrap_executable", lambda: "/usr/bin/bwrap")
+
+    original_bwrap_argv = command_module._bubblewrap_argv
+
+    def spy_bwrap_argv(**kwargs: object) -> list[str]:
+        captured["bwrap_env_allowed_extra"] = kwargs.get("env_allowed_extra")
+        return original_bwrap_argv(**kwargs)
+
+    monkeypatch.setattr(command_module, "_bubblewrap_argv", spy_bwrap_argv)
+
+    def fake_run(argv, **kwargs):
+        captured["bounded_env_allowed_extra"] = kwargs.get("env_allowed_extra")
+        return command_module._BoundedProcessResult(
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+            stdout_bytes=2,
+            stderr_bytes=0,
+            timed_out=False,
+            output_truncated=False,
+            duration_ms=1,
+        )
+
+    monkeypatch.setattr(command_module, "_run_bounded_process", fake_run)
+    command_module.run_sandboxed_process(
+        workspace=workspace,
+        argv=[sys.executable, str(runner)],
+        env={"FEISHU_X": "https://example.com/hook"},
+        env_allowed_extra=frozenset({"FEISHU_X"}),
+    )
+
+    assert captured["bwrap_env_allowed_extra"] == frozenset({"FEISHU_X"})
+    assert captured["bounded_env_allowed_extra"] == frozenset({"FEISHU_X"})
+
+
+def test_write_srt_settings_includes_extra_writable_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(command_module, "_srt_supports_allow_all", lambda: True)
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    state_dir = (tmp_path / "state").resolve()
+    state_dir.mkdir()
+    settings_path = command_module._write_srt_settings(
+        workspace, network_mode="all", extra_writable_paths=[state_dir]
+    )
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        filesystem = data["filesystem"]
+        assert str(state_dir) in filesystem["allowRead"]
+        assert str(state_dir) in filesystem["allowWrite"]
+    finally:
+        settings_path.unlink(missing_ok=True)
+
