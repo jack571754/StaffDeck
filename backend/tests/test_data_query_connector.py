@@ -283,7 +283,9 @@ class TestMySQLConnector:
 
         kwargs = mock_pymysql.connect.call_args.kwargs
         assert kwargs["connect_timeout"] == 10  # capped at 10s
-        assert kwargs["read_timeout"] == 25
+        # 读超时给 2 倍余量：接近名义预算的慢查询尖峰不应被客户端读计时器
+        # 杀死（MySQL 2013 Lost connection，真实事故根因 C）。
+        assert kwargs["read_timeout"] == 50
         assert kwargs["write_timeout"] == 25
 
     def test_execute_small_timeout_not_capped_upwards(self):
@@ -306,7 +308,7 @@ class TestMySQLConnector:
 
         kwargs = mock_pymysql.connect.call_args.kwargs
         assert kwargs["connect_timeout"] == 5
-        assert kwargs["read_timeout"] == 5
+        assert kwargs["read_timeout"] == 10
         assert kwargs["write_timeout"] == 5
 
 

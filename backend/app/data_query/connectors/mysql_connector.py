@@ -107,8 +107,10 @@ class MySQLConnector(BaseConnector):
         """Open a pymysql connection (lazy, idempotent).
 
         Args:
-            timeout: Seconds allowed for connect/read/write. The connect
-                phase is capped at 10s; read/write follow the full timeout.
+            timeout: Nominal query budget in seconds. The connect phase is
+                capped at 10s; the socket read timeout gets 2x headroom so a
+                legitimately slow query near the nominal budget is not killed
+                by pymysql's client-side read timer (MySQL 2013).
         """
         if self._conn is not None:
             return
@@ -140,7 +142,7 @@ class MySQLConnector(BaseConnector):
             charset=charset,
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=min(timeout, 10),
-            read_timeout=timeout,
+            read_timeout=timeout * 2,
             write_timeout=timeout,
         )
         self._connected = True
