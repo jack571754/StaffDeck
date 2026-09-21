@@ -7,6 +7,7 @@ import mimetypes
 import re
 import time
 from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,10 @@ _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
 _GENERAL_SKILL_PACKAGE_DIRECTORY = ".harness/skill-packages"
 _SANDBOX_JSON_FILE_KIND = "sandbox_json_file"
+# 副作用写认领（outcome_unknown/started 的 logical_action_key）的最长持有时间。
+# 超过该时长后允许新调用：单次超时失败若永久拦截重试，会把偶发故障放大成
+# 永久失败（真实事故根因 D）。取值与 detached 异步任务的默认跟踪时长一致。
+INVOCATION_CLAIM_TTL_SECONDS = 24 * 60 * 60
 
 
 class HarnessCapabilityInvoker:
@@ -387,12 +392,29 @@ class HarnessCapabilityInvoker:
             and prior.response_cache_json.get("success") is True
         ):
             return _replayed_result(prior)
+        if self._claim_expired(prior):
+            # 写认领超时释放：外部系统状态已有足够时间收敛，之后仍应允许
+            # 新调用，否则一次超时失败会永久拦截同一调用的所有重试。
+            prior.status = "claim_expired"
+            prior.logical_action_key = None
+            prior.updated_at = utc_now()
+            self.db.add(prior)
+            self.db.commit()
+            return None
         return _failure(
             "TOOL_CALL_OUTCOME_UNKNOWN",
             (
                 "相同副作用调用已有未完成的持久化记录；为避免重复提交，"
                 "Harness 不会自动重试，请先核对外部系统状态。"
             ),
+        )
+
+    def _claim_expired(self, prior: HarnessInvocationRecord) -> bool:
+        last_activity = prior.updated_at or prior.finished_at or prior.started_at
+        if last_activity is None:
+            return False
+        return utc_now() - last_activity > timedelta(
+            seconds=INVOCATION_CLAIM_TTL_SECONDS
         )
 
     def _raise_if_cancelled(self) -> None:
