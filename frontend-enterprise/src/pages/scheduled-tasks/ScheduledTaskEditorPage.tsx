@@ -47,7 +47,7 @@ export function ScheduledTaskEditPage(props: ScheduledTaskPageProps = {}) {
   return <ScheduledTaskEditorPage mode="edit" {...props} />;
 }
 
-type FormErrors = Partial<Record<'title' | 'prompt' | 'run_at' | 'time' | 'weekdays', string>>;
+type FormErrors = Partial<Record<'title' | 'prompt' | 'run_at' | 'time' | 'weekdays' | 'interval_minutes', string>>;
 
 const CARD_CLASS =
   'rounded-[14px] border border-[#eceef1] bg-white p-[20px]';
@@ -131,6 +131,10 @@ function ScheduledTaskEditorPage({
     if (!values.prompt.trim()) nextErrors.prompt = '请填写任务描述';
     if (values.schedule_type === 'once') {
       if (!values.run_at) nextErrors.run_at = '请选择执行时间';
+    } else if (values.schedule_type === 'interval') {
+      if (!values.interval_minutes || values.interval_minutes < 1) {
+        nextErrors.interval_minutes = '执行间隔至少为 1 分钟';
+      }
     } else if (!values.time) {
       nextErrors.time = '请填写执行时间';
     }
@@ -386,6 +390,7 @@ function ScheduledTaskEditorPage({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="interval">间隔循环（按分钟）</SelectItem>
                   <SelectItem value="daily">每天</SelectItem>
                   <SelectItem value="weekly">每周</SelectItem>
                   <SelectItem value="monthly">每月</SelectItem>
@@ -394,7 +399,33 @@ function ScheduledTaskEditorPage({
               </Select>
             </div>
 
-            {scheduleType === 'once' ? (
+            {scheduleType === 'interval' ? (
+              <div className="flex flex-col gap-[6px]">
+                <Label htmlFor="task-interval-minutes" className={FIELD_LABEL_CLASS}>
+                  执行间隔（分钟）
+                </Label>
+                <div className="flex items-center gap-[8px]">
+                  <Input
+                    id="task-interval-minutes"
+                    type="number"
+                    min={1}
+                    max={1440}
+                    className={cn('w-[140px]', errors.interval_minutes && 'border-destructive')}
+                    value={values.interval_minutes ?? 1}
+                    onChange={(event) =>
+                      update('interval_minutes', Math.max(1, Number(event.target.value) || 1))
+                    }
+                  />
+                  <span className="text-[13px] text-[#858b9c]">分钟执行一次</span>
+                </div>
+                {errors.interval_minutes && (
+                  <p className={FIELD_ERROR_CLASS}>{errors.interval_minutes}</p>
+                )}
+                <p className="text-[12px] leading-[18px] text-[#858b9c]">
+                  设置后，数字员工将在启用后每隔指定分钟数自动唤醒执行一次任务。
+                </p>
+              </div>
+            ) : scheduleType === 'once' ? (
               <div className="flex flex-col gap-[6px]">
                 <Label htmlFor="task-run-at" className={FIELD_LABEL_CLASS}>
                   执行时间

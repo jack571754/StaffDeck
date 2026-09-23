@@ -12,8 +12,8 @@ from app.agents.branching import (
     ensure_private_resource_binding,
     get_agent,
     hide_open_gallery_binding,
-    is_bound_resource_visible_for_agent,
     is_open_gallery_resource,
+    is_tool_visible_for_agent,
     require_overall_agent,
     resource_binding_metadata,
     user_creator_metadata,
@@ -76,6 +76,7 @@ from app.tools.tool_schema import (
     ToolTestRequest,
     ToolUpdateRequest,
 )
+from app.data_query.models import DataSource, QueryTemplate, QueryTemplateRead
 
 router = APIRouter(prefix="/api/enterprise/tools", tags=["enterprise:tools"])
 mcp_router = APIRouter(prefix="/api/enterprise/mcp-servers", tags=["enterprise:mcp-servers"])
@@ -139,6 +140,7 @@ def tool_read(row: Tool, metadata: dict[str, Any] | None = None) -> ToolRead:
         output_schema=row.output_schema or {},
         allowed_skills=row.allowed_skills_json or [],
         mcp_server_id=row.mcp_server_id,
+        data_source_id=row.data_source_id or config.get("data_source_id"),
         capability_scope=normalize_capability_scope(row.capability_scope),
         enabled=row.enabled,
         metadata=dict(metadata or {}),
@@ -200,7 +202,24 @@ def create_tool(
     ).first()
     if existing:
         raise HTTPException(status_code=409, detail="Tool name already exists for this tenant")
+    if request.tool_type == "data_query_source":
+        if not request.data_source_id:
+            raise HTTPException(status_code=400, detail="数据源查询工具必须指定绑定的数据源 (data_source_id)")
+        ds = db.get(DataSource, request.data_source_id)
+        if not ds or ds.tenant_id != request.tenant_id:
+            raise HTTPException(status_code=404, detail="绑定的数据源不存在")
+        if not ds.read_only:
+            raise HTTPException(
+                status_code=400,
+                detail="数据源查询工具绑定的数据源必须为只读模式 (read_only=true)",
+            )
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
+    cfg = _tool_config(request.mcp_config, request.execution_policy)
+    if request.data_source_id:
+        cfg["data_source_id"] = request.data_source_id
+    url = request.url
+    if request.tool_type == "data_query_source" and not url:
+        url = f"data_query_source://{request.data_source_id}"
     row = Tool(
         tenant_id=request.tenant_id,
         name=request.name,
@@ -208,11 +227,12 @@ def create_tool(
         description=request.description,
         bucket=_normalize_bucket(request.bucket),
         tool_type=request.tool_type,
-        method=request.method,
-        url=request.url,
+        data_source_id=request.data_source_id,
+        method=request.method or "POST",
+        url=url,
         headers_json=request.headers,
         auth_json=request.auth,
-        config_json=_tool_config(request.mcp_config, request.execution_policy),
+        config_json=cfg,
         input_schema=request.input_schema,
         output_schema=request.output_schema,
         allowed_skills_json=request.allowed_skills,
@@ -474,6 +494,11 @@ def update_tool(
     row = _get_tool(db, request.tenant_id, tool_id)
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     _ensure_tool_visible(db, request.tenant_id, row, agent_id)
+    if (row.tool_type or "http") in ("data_query", "data_query_source"):
+        raise HTTPException(
+            status_code=400,
+            detail="数据查询工具由数据查询中心/工具详情页管理，请在对应页面配置对应模板或数据源",
+        )
     if agent and not agent.is_overall:
         source_tool_id = row.id
         source_was_open_gallery = is_open_gallery_resource(db, request.tenant_id, "tool", row)
@@ -553,6 +578,11 @@ def delete_tool(
     row = _get_tool(db, tenant_id, tool_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
+        if (row.tool_type or "http") in ("data_query", "data_query_source"):
+            raise HTTPException(
+                status_code=400,
+                detail="数据查询/数据源工具权限由数据源授权决定，请在员工设置中调整数据源绑定",
+            )
         binding = _tool_binding(db, tenant_id, agent.id, row.id)
         if binding:
             binding.status = "deleted"
@@ -570,9 +600,49 @@ def delete_tool(
         return {"status": "hidden"}
     require_overall_agent(db, tenant_id, agent_id)
     ensure_open_gallery_admin(tenant_id, current_user)
+    if (row.tool_type or "http") == "data_query_source":
+        stmt = select(QueryTemplate).where(
+            QueryTemplate.tenant_id == tenant_id,
+            QueryTemplate.tool_id == row.id,
+        )
+        for tmpl in db.exec(stmt).all():
+            tmpl.tool_id = None
+            db.add(tmpl)
+        db.flush()
     db.delete(row)
     db.commit()
     return {"status": "deleted"}
+
+
+@router.get("/{tool_id}/skills", response_model=list[QueryTemplateRead])
+def list_tool_skills(
+    tool_id: str,
+    tenant_id: str = Query(...),
+    status: str | None = None,
+    agent_id: str | None = None,
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[QueryTemplateRead]:
+    ensure_tenant(db, tenant_id)
+    row = _get_tool(db, tenant_id, tool_id)
+    _ensure_tool_visible(db, tenant_id, row, agent_id)
+
+    stmt = select(QueryTemplate).where(
+        QueryTemplate.tenant_id == tenant_id,
+    )
+    data_source_id = row.data_source_id or (row.config_json or {}).get("data_source_id")
+    if (row.tool_type or "http") == "data_query_source" and data_source_id:
+        stmt = stmt.where(
+            (QueryTemplate.tool_id == tool_id) | (QueryTemplate.data_source_id == data_source_id)
+        )
+    else:
+        stmt = stmt.where(QueryTemplate.tool_id == tool_id)
+
+    if status:
+        stmt = stmt.where(QueryTemplate.status == status)
+    stmt = stmt.order_by(QueryTemplate.updated_at.desc())
+    templates = db.exec(stmt).all()
+    return [QueryTemplateRead.model_validate(t) for t in templates]
 
 
 @router.post("/{tool_id}/test", response_model=ToolResult)
@@ -648,13 +718,9 @@ def _ensure_tool_visible(db: Session, tenant_id: str, row: Tool, agent_id: str |
     agent = get_agent(db, tenant_id, agent_id)
     if agent_id and not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    if agent and not agent.is_overall:
-        binding = _tool_binding(db, tenant_id, agent.id, row.id)
-        if not binding or not is_bound_resource_visible_for_agent(
-            db, tenant_id, "tool", row, binding
-        ):
+    if not is_tool_visible_for_agent(db, tenant_id, row, agent_id, include_inactive=True):
+        if agent and not agent.is_overall:
             raise HTTPException(status_code=404, detail="Tool not visible to this agent")
-    if (not agent or agent.is_overall) and not is_open_gallery_resource(db, tenant_id, "tool", row):
         raise HTTPException(status_code=404, detail="Tool not visible in open gallery")
 
 

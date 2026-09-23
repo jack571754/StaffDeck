@@ -52,4 +52,26 @@ describe('ScheduledDraftCard actions', () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(onConfirm).not.toHaveBeenCalled();
   });
+
+  it('confirms the interval draft', async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    const intervalDraft: ScheduledTaskDraftRead = {
+      ...draft,
+      title: 'Interval 15m check',
+      schedule_type: 'interval',
+      schedule: { interval_minutes: 15 },
+    };
+    render(
+      <ScheduledDraftCard draft={intervalDraft} onConfirm={onConfirm} onDismiss={vi.fn()} />,
+    );
+
+    expect(screen.getByText('Interval 15m check')).toBeTruthy();
+    expect(screen.getByText('每 15 分钟执行一次')).toBeTruthy();
+    expect(screen.getByText('间隔循环')).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: '确认创建' }));
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm).toHaveBeenCalledWith(intervalDraft);
+  });
 });

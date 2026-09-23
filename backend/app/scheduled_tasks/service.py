@@ -54,7 +54,7 @@ LEASE_SECONDS = 15 * 60
 WORKER_SLEEP_SECONDS = 5
 MISFIRE_GRACE_SECONDS = max(30, WORKER_SLEEP_SECONDS * 2)
 CONFLICT_RETRY_SECONDS = 15
-SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly"}
+SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly", "interval"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
 
@@ -77,17 +77,15 @@ class _LLMScheduledTaskDraft(BaseModel):
 
 
 SCHEDULE_DRAFT_PROMPT = """
-你是 StaffDeck 数字员工的自动任务配置解析器。
-用户已经在对话框中选择了“创建定时任务”模式。请把用户输入整理成一个可编辑的自动任务草案。
-如果用户没有写清时间计划，默认每天 09:00 执行；如果用户没有写清任务目标，用原始输入作为执行内容。
-
-返回一个 JSON object，字段如下：
+你负责把用户在会话中表达的“定时/定期/自动执行”意图，提取为待确认的自动任务草案。
+严格只返回一个 JSON 对象，字段如下：
 - should_create: boolean
 - title: 12 到 32 个中文字符，概括自动任务名称
 - prompt: 每次到点后交给数字员工的新会话任务描述，不要包含“帮我设个定时任务”等配置话术
 - description: 可选，解释为什么这样拆解
-- schedule_type: one of "once", "daily", "weekly", "monthly"
+- schedule_type: one of "once", "daily", "weekly", "monthly", "interval"
 - schedule:
+  - interval: {"interval_minutes": 1-1440}
   - once: {"run_at": "YYYY-MM-DDTHH:mm:ss±HH:MM"}
   - daily: {"time": "HH:mm"}
   - weekly: {"time": "HH:mm", "weekdays": [0-6]}，0=周一，6=周日
@@ -97,8 +95,9 @@ SCHEDULE_DRAFT_PROMPT = """
 - confidence: 0 到 1
 - reason: 简短说明
 
-时间不完整时可以合理补齐：只说“每天”默认 09:00；只说“每周一”默认 09:00。
+时间不完整时可以合理补齐：只说“每天”默认 09:00；只说“每周一”默认 09:00；只说“每分钟”默认 interval_minutes=1。
 调度类型判断规则：
+- 用户明确说“每分钟/每N分钟/每隔X分钟/持续轮询”等间隔要求时，生成 interval。
 - 用户只给出一个具体时间点，例如“下午2点10分”“14:10”“今晚8点”，且没有明确“每天/每日/每周/每月/定期/重复”等周期要求时，生成 once。
 - once.run_at 使用 now 所在日期和用户给出的时间；如果该时间已经过去，则顺延到下一天。
 - 只有用户明确说“每天/每日/每晚/每早/每周/每月/工作日/定期/重复”等周期要求时，才生成 daily/weekly/monthly。
@@ -934,6 +933,9 @@ def compute_next_run_at(task: ScheduledTask, after: datetime | None = None) -> d
         return run_at if run_at and run_at > (after or utc_now()) else None
     after_local = _to_local(after or utc_now(), task.timezone)
     schedule = task.schedule_json or {}
+    if task.schedule_type == "interval":
+        seconds = int((task.schedule_json or {}).get("interval_seconds") or 60)
+        return _to_utc_naive(after_local + timedelta(seconds=seconds))
     if task.schedule_type == "daily":
         candidate = datetime.combine(after_local.date(), _parse_time(str(schedule.get("time") or DEFAULT_TASK_TIME)))
         candidate = candidate.replace(tzinfo=_tz(task.timezone))
@@ -975,6 +977,19 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
     schedule_type = _normalize_schedule_type(schedule_type)
     _tz(timezone)
     raw = schedule or {}
+    if schedule_type == "interval":
+        raw_seconds = raw.get("interval_seconds")
+        raw_minutes = raw.get("interval_minutes")
+        if raw_seconds is not None:
+            seconds = max(10, int(raw_seconds))
+            minutes = max(1, seconds // 60) if seconds >= 60 else None
+        else:
+            minutes = max(1, int(raw_minutes or 1))
+            seconds = minutes * 60
+        return {
+            "interval_minutes": minutes,
+            "interval_seconds": seconds,
+        }
     if schedule_type == "once":
         run_at = raw.get("run_at") or raw.get("datetime") or raw.get("start_at")
         parsed = parse_user_datetime(str(run_at or ""), timezone)
@@ -997,6 +1012,11 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
 
 
 def build_rrule(schedule_type: str, schedule: dict[str, Any]) -> str | None:
+    if schedule_type == "interval":
+        seconds = int(schedule.get("interval_seconds") or 60)
+        if seconds % 60 == 0:
+            return f"FREQ=MINUTELY;INTERVAL={max(1, seconds // 60)}"
+        return f"FREQ=SECONDLY;INTERVAL={seconds}"
     time_text = str(schedule.get("time") or DEFAULT_TASK_TIME)
     hour, minute = time_text.split(":", 1)
     if schedule_type == "once":

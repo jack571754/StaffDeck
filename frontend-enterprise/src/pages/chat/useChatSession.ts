@@ -191,7 +191,7 @@ function queuedTurnPreview(turn: PreparedChatTurn): ChatMessage {
   };
 }
 
-type DraftScheduleType = 'once' | 'daily' | 'weekly' | 'monthly';
+type DraftScheduleType = 'once' | 'daily' | 'weekly' | 'monthly' | 'interval';
 type DraftScheduleFormatter = (schedule: Record<string, unknown>) => string;
 
 const DRAFT_SCHEDULE_FORMATTERS: Record<DraftScheduleType, DraftScheduleFormatter> = {
@@ -199,6 +199,7 @@ const DRAFT_SCHEDULE_FORMATTERS: Record<DraftScheduleType, DraftScheduleFormatte
   weekly: (schedule) => `每周 ${formatScheduleWeekdays(schedule.weekdays)} ${scheduleTime(schedule)}`,
   monthly: (schedule) => `每月 ${schedule.day_of_month || 1} 号 ${scheduleTime(schedule)}`,
   daily: (schedule) => `每天 ${scheduleTime(schedule)}`,
+  interval: (schedule) => `每 ${schedule.interval_minutes || 30} 分钟执行一次`,
 };
 
 function scheduleTime(schedule: Record<string, unknown>): string {
@@ -393,6 +394,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     context_allowed_roles: ['user', 'assistant'],
     context_long_summary_prefix: '历史的信息可以被总结为：',
     context_medium_summary_prefix: '近期的历史信息总结为：',
+    data_query_grant_all: true,
     sandbox_enabled: false,
     harness_storage_path: '',
     effective_harness_storage_path: '',

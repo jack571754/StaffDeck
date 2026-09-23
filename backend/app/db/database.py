@@ -60,6 +60,7 @@ _CAPABILITY_SCOPE_TABLES = (
 
 
 def init_db() -> None:
+    import app.data_query.models  # noqa: F401
     import app.db.models  # noqa: F401
 
     _configure_sqlite_runtime()
@@ -136,6 +137,8 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_wechat_kf_accounts(conn, tables)
         _migrate_capability_scope_schema(conn, inspector, tables)
         _migrate_harness_v2_schema(conn, inspector, tables)
+        _migrate_ui_configs_data_query_grant_all(conn, tables)
+        _migrate_data_query_integration_schema(conn, inspector, tables)
 
         if "api_jobs" in tables:
             job_columns = {column["name"] for column in inspector.get_columns("api_jobs")}
@@ -722,6 +725,65 @@ def _migrate_default_model_output_limit(conn, tables: set[str]) -> None:
         text("INSERT INTO app_data_migrations (id) VALUES (:id)"),
         {"id": _DEFAULT_MODEL_OUTPUT_LIMIT_MIGRATION_ID},
     )
+
+
+def _migrate_data_query_integration_schema(conn, inspector, tables: set[str]) -> None:
+    if "tools" in tables:
+        tool_columns = {column["name"] for column in inspector.get_columns("tools")}
+        if "data_source_id" not in tool_columns:
+            conn.execute(text("ALTER TABLE tools ADD COLUMN data_source_id VARCHAR"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_tools_data_source_id ON tools (data_source_id)")
+            )
+
+    if "data_sources" in tables:
+        ds_columns = {column["name"] for column in inspector.get_columns("data_sources")}
+        if "allowed_tables_json" not in ds_columns:
+            conn.execute(text("ALTER TABLE data_sources ADD COLUMN allowed_tables_json JSON"))
+            conn.execute(text("UPDATE data_sources SET allowed_tables_json = '[]' WHERE allowed_tables_json IS NULL"))
+        if "schema_cache_json" not in ds_columns:
+            conn.execute(text("ALTER TABLE data_sources ADD COLUMN schema_cache_json JSON"))
+            conn.execute(text("UPDATE data_sources SET schema_cache_json = '{}' WHERE schema_cache_json IS NULL"))
+        if "schema_refreshed_at" not in ds_columns:
+            conn.execute(text("ALTER TABLE data_sources ADD COLUMN schema_refreshed_at DATETIME"))
+
+    if "query_templates" in tables:
+        qt_columns = {column["name"] for column in inspector.get_columns("query_templates")}
+        if "tool_id" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN tool_id VARCHAR"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_query_templates_tool_id ON query_templates (tool_id)")
+            )
+        if "origin_nl" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN origin_nl VARCHAR"))
+        if "business_notes" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN business_notes TEXT NOT NULL DEFAULT ''"))
+        if "dimensions_json" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN dimensions_json JSON"))
+            conn.execute(text("UPDATE query_templates SET dimensions_json = '[]' WHERE dimensions_json IS NULL"))
+        if "metrics_json" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN metrics_json JSON"))
+            conn.execute(text("UPDATE query_templates SET metrics_json = '[]' WHERE metrics_json IS NULL"))
+        if "example_questions_json" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN example_questions_json JSON"))
+            conn.execute(text("UPDATE query_templates SET example_questions_json = '[]' WHERE example_questions_json IS NULL"))
+        if "evolution_version" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN evolution_version INTEGER NOT NULL DEFAULT 1"))
+        if "generated_by" not in qt_columns:
+            conn.execute(text("ALTER TABLE query_templates ADD COLUMN generated_by VARCHAR NOT NULL DEFAULT 'manual'"))
+
+
+def _migrate_ui_configs_data_query_grant_all(conn, tables: set[str]) -> None:
+    if "ui_configs" not in tables:
+        return
+
+    from sqlalchemy import inspect
+    inspector = inspect(conn)
+    ui_columns = {column["name"] for column in inspector.get_columns("ui_configs")}
+    if "data_query_grant_all" not in ui_columns:
+        conn.execute(
+            text("ALTER TABLE ui_configs ADD COLUMN data_query_grant_all BOOLEAN NOT NULL DEFAULT 0")
+        )
 
 
 def _migrate_channel_binding_agents_backfill(conn, tables: set[str]) -> None:

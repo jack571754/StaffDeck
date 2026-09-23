@@ -52,6 +52,7 @@ import IconViewMasonry from '../assets/icons/view-masonry.svg?react';
 import IconChatBubble from '../assets/icons/chat.svg?react';
 import IconEdit from '../assets/icons/edit.svg?react';
 import IconTrash from '../assets/icons/trash.svg?react';
+import { Database } from 'lucide-react';
 
 type IconComponent = ComponentType<SVGProps<SVGSVGElement>>;
 
@@ -86,6 +87,7 @@ const SYSTEM_NAV: NavItem[] = [
   { route: EnterpriseRoute.Accounts, label: '账号管理', Icon: IconAccounts },
   { route: EnterpriseRoute.Models, label: '模型配置', Icon: IconModels },
   { route: EnterpriseRoute.RuntimeSettings, label: '运行设置', Icon: IconSettings },
+  { route: EnterpriseRoute.DataQuery, label: '数据查询', Icon: Database },
 ];
 
 function primaryNavItems(isAdmin: boolean): NavItem[] {

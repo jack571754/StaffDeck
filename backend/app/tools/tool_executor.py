@@ -75,7 +75,7 @@ class ToolExecutor:
             return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
         if not tool.enabled:
             return self._error(tool.name, "DISABLED", "工具当前未启用。")
-        if agent_id and tool.id not in {
+        if agent_id and (tool.tool_type or "http") not in ("data_query", "data_query_source") and tool.id not in {
             row.id
             for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
         }:
@@ -116,6 +116,24 @@ class ToolExecutor:
                 agent_id=agent_id,
                 session_id=session_id,
                 invocation_id=invocation_id,
+                timeout_seconds_override=timeout_seconds_override,
+            )
+        if (tool.tool_type or "http") == "data_query":
+            return self._execute_data_query_tool(
+                tool,
+                tool_call.arguments,
+                agent_id=agent_id,
+                session_id=session_id,
+                active_skill_id=active_skill_id,
+                timeout_seconds_override=timeout_seconds_override,
+            )
+        if (tool.tool_type or "http") == "data_query_source":
+            return self._execute_data_query_source_tool(
+                tool,
+                tool_call.arguments,
+                agent_id=agent_id,
+                session_id=session_id,
+                active_skill_id=active_skill_id,
                 timeout_seconds_override=timeout_seconds_override,
             )
         if (tool.tool_type or "http") != "http":
@@ -660,6 +678,213 @@ class ToolExecutor:
             error=ToolError(code=code, message=message),
         )
 
+    def _agent_bound_data_source_ids(self, tenant_id: str, agent_id: str) -> set[str]:
+        """员工可用的数据源 ID 集合（白名单/默认全量由租户开关决定）。"""
+        from app.data_query.authorization import authorized_data_source_ids
+
+        return authorized_data_source_ids(self.db, tenant_id, agent_id)
+
+    def _execute_data_query_tool(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        active_skill_id: str | None = None,
+        timeout_seconds_override: float | None = None,
+    ) -> ToolResult:
+        from app.data_query.models import QueryTemplate
+        from app.data_query.service import execute_query_by_id
+
+        config = tool.config_json if isinstance(tool.config_json, dict) else {}
+        template_id = config.get("template_id")
+        if not template_id:
+            return self._error(
+                tool.name, "MISCONFIGURATION", "工具缺少 template_id 配置。"
+            )
+
+        if agent_id:
+            template = self.db.get(QueryTemplate, template_id)
+            if not template or template.tenant_id != tool.tenant_id:
+                return self._error(tool.name, "QUERY_ERROR", "查询模板不存在或已被删除。")
+            bound_source_ids = self._agent_bound_data_source_ids(tool.tenant_id, agent_id)
+            if template.data_source_id not in bound_source_ids:
+                return self._error(
+                    tool.name,
+                    "NOT_ALLOWED",
+                    "当前员工未授权该查询模板所属的数据源，请在员工配置中绑定对应数据源。",
+                )
+
+        params = arguments.get("params", {}) if isinstance(arguments, dict) else {}
+        output_format = config.get("output_format", "table")
+
+        try:
+            result = execute_query_by_id(self.db, template_id, tool.tenant_id, params)
+        except ValueError as exc:
+            return self._error(tool.name, "QUERY_ERROR", str(exc))
+        except Exception as exc:
+            return self._error(tool.name, "EXECUTION_FAILED", f"查询执行失败: {exc}")
+
+        text = _format_query_result_text(result, output_format)
+        return ToolResult(
+            tool_name=tool.name,
+            success=True,
+            data={
+                "text": text,
+                "columns": result.columns,
+                "rows": result.rows,
+                "row_count": result.row_count,
+                "execution_time_ms": result.execution_time_ms,
+                "cached": result.cached,
+            },
+            error=None,
+        )
+
+    def _execute_data_query_source_tool(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        active_skill_id: str | None = None,
+        timeout_seconds_override: float | None = None,
+    ) -> ToolResult:
+        from app.data_query.models import QueryTemplate
+        from app.data_query.service import execute_query_by_id
+
+        config = tool.config_json if isinstance(tool.config_json, dict) else {}
+        data_source_id = tool.data_source_id or config.get("data_source_id")
+        if not data_source_id:
+            return self._error(
+                tool.name, "MISCONFIGURATION", "数据源工具缺少 data_source_id 配置。"
+            )
+
+        if agent_id:
+            bound_source_ids = self._agent_bound_data_source_ids(tool.tenant_id, agent_id)
+            if data_source_id not in bound_source_ids:
+                return self._error(
+                    tool.name,
+                    "NOT_ALLOWED",
+                    "当前员工未授权该工具所属的数据源，请在员工配置中绑定对应数据源。",
+                )
+
+        skill_query = arguments.get("skill") if isinstance(arguments, dict) else None
+        if isinstance(skill_query, str):
+            skill_query = skill_query.strip()
+        else:
+            skill_query = None
+
+        stmt = select(QueryTemplate).where(
+            QueryTemplate.tenant_id == tool.tenant_id,
+            QueryTemplate.data_source_id == data_source_id,
+            QueryTemplate.status == "active",
+        )
+        active_templates = list(self.db.exec(stmt).all())
+
+        if not skill_query:
+            available_skills = [
+                f"{t.name} ({t.description})" if t.description else t.name
+                for t in active_templates
+            ]
+            return self._error(
+                tool.name,
+                "MISSING_SKILL",
+                f"请指定要调用的技能参数 'skill'。当前数据源可用技能: {', '.join(available_skills) if available_skills else '暂无可用活跃技能'}",
+            )
+
+        target_template = None
+        for t in active_templates:
+            if t.name == skill_query or t.id == skill_query:
+                target_template = t
+                break
+
+        if not target_template:
+            sq_lower = skill_query.lower()
+            for t in active_templates:
+                if t.name.lower() == sq_lower:
+                    target_template = t
+                    break
+
+        if not target_template:
+            candidates = []
+            for t in active_templates:
+                if skill_query in t.name or t.name in skill_query:
+                    candidates.append(t)
+            if len(candidates) == 1:
+                target_template = candidates[0]
+
+        if not target_template:
+            available_skills = [
+                f"{t.name} ({t.description})" if t.description else t.name
+                for t in active_templates
+            ]
+            return self._error(
+                tool.name,
+                "SKILL_NOT_FOUND",
+                f"未找到名为 '{skill_query}' 的技能。可用技能清单: {', '.join(available_skills) if available_skills else '暂无可用活跃技能'}",
+            )
+
+        params = arguments.get("params", {}) if isinstance(arguments, dict) else {}
+        output_format = config.get("output_format", "table")
+
+        try:
+            result = execute_query_by_id(self.db, target_template.id, tool.tenant_id, params)
+        except ValueError as exc:
+            return self._error(tool.name, "QUERY_ERROR", str(exc))
+        except Exception as exc:
+            return self._error(tool.name, "EXECUTION_FAILED", f"查询执行失败: {exc}")
+
+        text = _format_query_result_text(result, output_format)
+        return ToolResult(
+            tool_name=tool.name,
+            success=True,
+            data={
+                "text": text,
+                "columns": result.columns,
+                "rows": result.rows,
+                "row_count": result.row_count,
+                "execution_time_ms": result.execution_time_ms,
+                "cached": result.cached,
+                "skill": target_template.name,
+                "template_id": target_template.id,
+            },
+            error=None,
+        )
+
 
 def _default_port(scheme: str) -> int | None:
     return 443 if scheme.lower() == "https" else 80 if scheme.lower() == "http" else None
+
+
+def _format_query_result_text(result: Any, fmt: str = "table") -> str:
+    """Format a QueryExecuteResult as human-readable text."""
+    if result.row_count == 0:
+        return "查询结果：无数据"
+    if fmt == "json":
+        import json
+        return json.dumps(
+            {
+                "columns": result.columns,
+                "rows": result.rows,
+                "row_count": result.row_count,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    # Markdown table format
+    lines = []
+    header = "| " + " | ".join(result.columns) + " |"
+    separator = "| " + " | ".join("---" for _ in result.columns) + " |"
+    lines.append(header)
+    lines.append(separator)
+    for row in result.rows:
+        lines.append(
+            "| " + " | ".join(str(row.get(c, "")) for c in result.columns) + " |"
+        )
+    lines.append(
+        f"\n共 {result.row_count} 行，耗时 {result.execution_time_ms:.0f}ms"
+        + ("（缓存命中）" if result.cached else "")
+    )
+    return "\n".join(lines)

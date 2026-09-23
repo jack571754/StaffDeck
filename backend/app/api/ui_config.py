@@ -42,6 +42,7 @@ class UIConfigRead(BaseModel):
     context_allowed_roles: list[Literal["user", "assistant"]]
     context_long_summary_prefix: str
     context_medium_summary_prefix: str
+    data_query_grant_all: bool = False
     sandbox_enabled: bool = False
     harness_storage_path: str = ""
     effective_harness_storage_path: str = ""
@@ -88,6 +89,7 @@ class UIConfigUpdateRequest(BaseModel):
         max_length=200,
     )
     sandbox_enabled: bool = False
+    data_query_grant_all: bool | None = None
     harness_storage_path: str = Field(default="", max_length=1024)
     sandbox_network_mode: Literal["all", "allowlist", "deny"] = "all"
     sandbox_allowed_domains: list[str] = Field(default_factory=list, max_length=200)
@@ -142,6 +144,7 @@ def ui_config_read(row: UIConfig, *, restart_scheduled: bool = False) -> UIConfi
             str(row.context_medium_summary_prefix or "").strip()
             or "近期的历史信息总结为："
         ),
+        data_query_grant_all=bool(row.data_query_grant_all),
         sandbox_enabled=bool(row.sandbox_enabled),
         harness_storage_path=str(row.harness_storage_path or ""),
         effective_harness_storage_path=_effective_storage_path(row),
@@ -222,6 +225,8 @@ def update_enterprise_ui_config(
     row.context_long_summary_prefix = request.context_long_summary_prefix
     row.context_medium_summary_prefix = request.context_medium_summary_prefix
     row.sandbox_enabled = request.sandbox_enabled
+    if request.data_query_grant_all is not None:
+        row.data_query_grant_all = request.data_query_grant_all
     row.harness_storage_path = storage_path
     row.sandbox_network_mode = request.sandbox_network_mode
     row.sandbox_allowed_domains = request.sandbox_allowed_domains

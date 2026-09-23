@@ -8,11 +8,16 @@ import {
   STREAM_TERMINAL_EVENTS,
   MarkdownMessage,
   canRateMessage,
+  draftScheduleForType,
+  formatDraftSchedule,
   harnessEventTraceLine,
   harnessWorkspaceArtifacts,
   knowledgeCitations,
   messageAttachments,
   renderInlineMarkdown,
+  scheduleEditValue,
+  scheduleFromEditValue,
+  scheduleTypeLabel,
   scheduledDraftForMessage,
   shouldDeferPersistedEventToLiveStream,
   stripTrailingCitationSummary,
@@ -241,6 +246,26 @@ describe('chat history consumer contract', () => {
 
     expect(scheduledDraftForMessage(item)).toEqual(draft);
     expect(messageAttachments(item)).toEqual([attachment]);
+  });
+
+  it('formats and manipulates interval schedule draft correctly', () => {
+    const intervalDraft = {
+      should_create: true,
+      tenant_id: 'tenant-demo',
+      agent_id: 'agent-demo',
+      title: 'Sales interval check',
+      prompt: 'Check sales every 15 minutes',
+      schedule_type: 'interval' as const,
+      schedule: { interval_minutes: 15 },
+      timezone: 'Asia/Shanghai',
+      confidence: 1,
+    };
+
+    expect(formatDraftSchedule(intervalDraft)).toBe('每 15 分钟执行一次');
+    expect(scheduleTypeLabel('interval')).toBe('间隔循环');
+    expect(scheduleEditValue(intervalDraft)).toBe('15');
+    expect(scheduleFromEditValue(intervalDraft, '45')).toEqual({ interval_minutes: 45 });
+    expect(draftScheduleForType({ interval_minutes: 20 }, 'interval')).toEqual({ interval_minutes: 20 });
   });
 
   it('keeps only valid, unique workspace artifacts from persisted metadata', () => {

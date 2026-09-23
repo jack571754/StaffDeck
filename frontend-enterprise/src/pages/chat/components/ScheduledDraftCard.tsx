@@ -105,6 +105,13 @@ export default function ScheduledDraftCard({
       notify.warning('请输入执行计划');
       return false;
     }
+    if (nextDraft.schedule_type === 'interval') {
+      const minutes = Number((nextDraft.schedule || {}).interval_minutes);
+      if (!Number.isFinite(minutes) || minutes <= 0) {
+        notify.warning('执行间隔必须为正整数（分钟）');
+        return false;
+      }
+    }
     return true;
   };
   const updateScheduleType = (value: ScheduledTaskDraftRead['schedule_type']) => {
@@ -191,6 +198,7 @@ export default function ScheduledDraftCard({
                 <SelectItem value="daily">每天</SelectItem>
                 <SelectItem value="weekly">每周</SelectItem>
                 <SelectItem value="monthly">每月</SelectItem>
+                <SelectItem value="interval">间隔循环</SelectItem>
               </SelectContent>
             </Select>
           </label>
@@ -199,7 +207,13 @@ export default function ScheduledDraftCard({
             <Input
               className="h-[32px]"
               value={scheduleValue}
-              placeholder={editableDraft.schedule_type === 'once' ? 'YYYY-MM-DDTHH:mm:ss+08:00' : 'HH:mm'}
+              placeholder={
+                editableDraft.schedule_type === 'once'
+                  ? 'YYYY-MM-DDTHH:mm:ss+08:00'
+                  : editableDraft.schedule_type === 'interval'
+                    ? '间隔分钟数（如 30）'
+                    : 'HH:mm'
+              }
               onChange={(event) => updateScheduleValue(event.target.value)}
             />
           </label>

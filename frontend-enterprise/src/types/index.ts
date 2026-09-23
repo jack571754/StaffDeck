@@ -181,7 +181,7 @@ export type KnowledgeSearchResponse = {
   evidence_pack: KnowledgeSearchEvidence[];
 };
 
-export type AgentResourceType = 'skill' | 'general_skill' | 'knowledge_base' | 'tool';
+export type AgentResourceType = 'skill' | 'general_skill' | 'knowledge_base' | 'tool' | 'data_source';
 
 export type AgentResourceBindingRead = {
   id: string;
@@ -367,6 +367,7 @@ export type UIConfigRead = {
   context_allowed_roles: Array<'user' | 'assistant'>;
   context_long_summary_prefix: string;
   context_medium_summary_prefix: string;
+  data_query_grant_all?: boolean;
   sandbox_enabled: boolean;
   harness_storage_path: string;
   effective_harness_storage_path: string;
@@ -405,11 +406,12 @@ export type ToolRead = {
   description?: string;
   capability_scope?: CapabilityScope;
   bucket: string;
-  tool_type: 'http' | 'a2a' | 'mcp' | string;
+  tool_type: 'http' | 'a2a' | 'mcp' | 'data_query' | 'data_query_source' | string;
   method: string;
   url: string;
   headers: Record<string, unknown>;
   auth: Record<string, unknown>;
+  config?: Record<string, unknown>;
   mcp_config: Record<string, unknown>;
   execution_policy?: {
     timeout_seconds: number;
@@ -427,6 +429,7 @@ export type ToolRead = {
   output_schema: Record<string, unknown>;
   allowed_skills: string[];
   mcp_server_id?: string | null;
+  data_source_id?: string | null;
   enabled: boolean;
   metadata?: Record<string, unknown>;
   created_at: string;

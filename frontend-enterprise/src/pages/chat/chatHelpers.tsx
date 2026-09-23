@@ -49,12 +49,13 @@ export const CHAT_STREAM_HEARTBEAT_GRACE_MS = 20 * 1000;
 export const CHAT_TRACE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 export const STREAM_TERMINAL_EVENTS = new Set(['complete', 'done', 'stream_end', 'stream_cancelled', 'stream_interrupted', 'error', 'error_occurred']);
 export const HIDDEN_GENERAL_SKILL_TRACE_PHASES = new Set(['replying']);
-const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly']);
+const DRAFT_SCHEDULE_TYPES = new Set<DraftScheduleType>(['once', 'daily', 'weekly', 'monthly', 'interval']);
 const DRAFT_SCHEDULE_TYPE_LABELS: Record<DraftScheduleType, string> = {
   once: '一次性',
   daily: '每天',
   weekly: '每周',
   monthly: '每月',
+  interval: '间隔循环',
 };
 const DRAFT_WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 
@@ -2168,6 +2169,9 @@ function formatAttachmentSize(size: number): string {
 export function formatDraftSchedule(draft: ScheduledTaskDraftRead): string {
   const schedule = draft.schedule || {};
   const scheduleType = normalizeDraftScheduleType(draft.schedule_type);
+  if (scheduleType === 'interval') {
+    return `每 ${schedule.interval_minutes || 30} 分钟执行一次`;
+  }
   if (scheduleType === 'weekly') {
     const weekdays = Array.isArray(schedule.weekdays)
       ? schedule.weekdays.map((item) => DRAFT_WEEKDAY_LABELS[Number(item)]).filter(Boolean).join('、')
@@ -2194,12 +2198,17 @@ export function scheduleTypeLabel(type: ScheduledTaskDraftRead['schedule_type'])
 export function scheduleEditValue(draft: ScheduledTaskDraftRead): string {
   const schedule = draft.schedule || {};
   if (normalizeDraftScheduleType(draft.schedule_type) === 'once') return String(schedule.run_at || '');
+  if (normalizeDraftScheduleType(draft.schedule_type) === 'interval') return String(schedule.interval_minutes || 30);
   return String(schedule.time || '09:00');
 }
 
 export function scheduleFromEditValue(draft: ScheduledTaskDraftRead, value: string): Record<string, unknown> {
   if (normalizeDraftScheduleType(draft.schedule_type) === 'once') {
     return { ...(draft.schedule || {}), run_at: value };
+  }
+  if (normalizeDraftScheduleType(draft.schedule_type) === 'interval') {
+    const parsed = parseInt(value, 10);
+    return { ...(draft.schedule || {}), interval_minutes: Number.isFinite(parsed) && parsed > 0 ? parsed : 30 };
   }
   return { ...(draft.schedule || {}), time: value };
 }
@@ -2208,6 +2217,11 @@ export function draftScheduleForType(schedule: Record<string, unknown>, type: Dr
   const time = String(schedule.time || '09:00');
   if (type === 'once') {
     return { run_at: String(schedule.run_at || '') };
+  }
+  if (type === 'interval') {
+    return {
+      interval_minutes: Number(schedule.interval_minutes) || 30,
+    };
   }
   if (type === 'weekly') {
     return {

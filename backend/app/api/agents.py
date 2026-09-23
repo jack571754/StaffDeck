@@ -42,6 +42,7 @@ from app.agents.branching import (
     sync_branch_from_overall,
     visible_skill_rows,
 )
+from app.data_query.models import DataSource
 from app.db import get_session
 from app.db.models import (
     APIClient,
@@ -1724,6 +1725,8 @@ def _resource_display_id(resource_type: str, resolved: AgentResource) -> str:
         return resolved.slug
     if resource_type == "tool" and isinstance(resolved, Tool):
         return resolved.name
+    if resource_type == "data_source" and isinstance(resolved, DataSource):
+        return resolved.name
     return resolved.id
 
 
@@ -1850,6 +1853,8 @@ def _resolve_resource(
                 select(Tool).where(Tool.tenant_id == tenant_id, Tool.name == identifier)
             ).first()
         )
+    if resource_type == "data_source":
+        return db.get(DataSource, identifier)
     return None
 
 
@@ -1901,6 +1906,7 @@ def _resource_binding_visible_in_agent_summary(
         "general_skill": GeneralSkill,
         "knowledge_base": KnowledgeBase,
         "tool": Tool,
+        "data_source": DataSource,
     }
     model = model_by_type.get(binding.resource_type)
     if model is None:
@@ -1986,6 +1992,7 @@ def _ensure_resource_exists(db: Session, tenant_id: str, item: AgentResourceBind
         "general_skill": GeneralSkill,
         "knowledge_base": KnowledgeBase,
         "tool": Tool,
+        "data_source": DataSource,
     }[item.resource_type]
     row = db.get(model, item.resource_id)
     if not row or row.tenant_id != tenant_id:

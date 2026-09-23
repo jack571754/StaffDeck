@@ -36,9 +36,10 @@ class ToolCreateRequest(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     bucket: str = "未分桶"
-    tool_type: Literal["http", "a2a", "mcp"] = "http"
+    tool_type: Literal["http", "a2a", "mcp", "data_query_source"] = "http"
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "POST"
-    url: str
+    url: str = ""
+    data_source_id: Optional[str] = None
     headers: dict[str, str] = Field(default_factory=dict)
     auth: dict[str, Any] = Field(default_factory=dict)
     mcp_config: dict[str, Any] = Field(default_factory=dict)
@@ -72,6 +73,7 @@ class ToolRead(BaseModel):
     output_schema: dict[str, Any]
     allowed_skills: list[str]
     mcp_server_id: Optional[str] = None
+    data_source_id: Optional[str] = None
     capability_scope: CapabilityScope
     enabled: bool
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -134,9 +136,10 @@ class ToolProbeRequest(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     bucket: str = "技能自发现工具"
-    tool_type: Literal["http", "a2a", "mcp"] = "http"
+    tool_type: Literal["http", "a2a", "mcp", "data_query_source"] = "http"
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "POST"
-    url: str
+    url: str = ""
+    data_source_id: Optional[str] = None
     headers: dict[str, str] = Field(default_factory=dict)
     auth: dict[str, Any] = Field(default_factory=dict)
     mcp_config: dict[str, Any] = Field(default_factory=dict)

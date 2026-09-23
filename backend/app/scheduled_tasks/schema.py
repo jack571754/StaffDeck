@@ -5,7 +5,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
-ScheduleType = Literal["once", "daily", "weekly", "monthly"]
+ScheduleType = Literal["once", "daily", "weekly", "monthly", "interval"]
 ScheduledTaskStatus = Literal["active", "paused", "completed", "archived"]
 ConcurrencyPolicy = Literal["forbid", "allow"]
 MisfirePolicy = Literal["coalesce", "skip"]

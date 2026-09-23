@@ -5,7 +5,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-AgentResourceType = Literal["skill", "general_skill", "knowledge_base", "tool"]
+AgentResourceType = Literal["skill", "general_skill", "knowledge_base", "tool", "data_source"]
 AgentWorkRecordEventKind = Literal["chat", "task", "sop", "tool", "knowledge", "skill"]
 AgentWorkRecordEventPhase = Literal["reply", "last_run", "next_run", "assigned"]
 
