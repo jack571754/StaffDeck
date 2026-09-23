@@ -277,11 +277,14 @@ def register_command_tools(registry: HarnessRegistry) -> HarnessRegistry:
             "Linux and macOS use Bash; Windows uses PowerShell. The selected OS "
             "sandbox makes only this workspace writable and applies the tenant's "
             "configured network policy. On Windows do not use Bash syntax (heredoc, "
-            "python3, py -3, or bash chaining); use PowerShell statements. In a "
+            "for/do loops, $() assignment, /dev/null, ||, python3, py -3, or other "
+            "Bash chaining); use PowerShell statements. In a "
             "packaged Windows build, python/python3 resolve to the bundled runtime; "
             "in source deployments, use the General Skill Python runtime. Relative "
             "paths start in the TaskFrame workspace; absolute paths are accepted and "
-            "remain subject to OS permissions and the configured sandbox policy."
+            "remain subject to OS permissions and the configured sandbox policy. "
+            "Do not use exec_command to run scripts from a GeneralSkill package; "
+            "use run_skill_script with the materialized package file path."
         ),
         argument_model=ExecCommandArguments,
         handler=exec_command,
@@ -1037,6 +1040,26 @@ def _validate_windows_command(command: str) -> None:
         raise _command_denied(
             "Bash command chaining (&&) is not supported by this Windows PowerShell. "
             "Use newline-separated PowerShell statements or ';'."
+        )
+    if "||" in command:
+        raise _command_denied(
+            "Bash command chaining (||) is not supported by this Windows PowerShell. "
+            "Use PowerShell if/else or separate statements."
+        )
+    if re.search(r"(?im)(?:^|[;&|\n])\s*for\s+.+;\s*do\b", command):
+        raise _command_denied(
+            "Bash for/do loops are not supported by this Windows PowerShell. "
+            "Use a PowerShell foreach statement."
+        )
+    if re.search(r"(?i)\b[A-Za-z_]\w*\s*=\s*\$\(", command):
+        raise _command_denied(
+            "Bash command substitution is not supported by this Windows PowerShell. "
+            "Use a PowerShell assignment with a command expression."
+        )
+    if re.search(r"(?i)(?:^|\s)\d*>\s*/dev/null\b", command):
+        raise _command_denied(
+            "The /dev/null redirection is not supported by this Windows PowerShell. "
+            "Use PowerShell error handling or Out-Null."
         )
     if re.search(r"(?im)(?:^|[;&|\n])\s*py(?:\.exe)?(?:\s|$)", command):
         raise _command_denied(

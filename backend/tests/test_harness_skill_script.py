@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.harness import HarnessExecutor, HarnessToolCall, HarnessToolContext, HarnessRegistry
+from app.harness import HarnessExecutor, HarnessRegistry, HarnessToolCall, HarnessToolContext
 from app.harness import skill_script as skill_script_module
 from app.harness.skill_script import register_skill_script_tools
 
@@ -114,3 +114,48 @@ def test_run_skill_script_reports_nonzero_exit_as_failed_status(
     assert result.data["ok"] is False
     assert result.data["status"] == "failed"
     assert result.data["exit_code"] == 2
+
+
+def test_run_skill_script_propagates_structured_business_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / ".harness" / "skill-packages" / "demo-digest"
+    package.mkdir(parents=True)
+    script = package / "runner.py"
+    script.write_text("print('ignored')", encoding="utf-8")
+
+    monkeypatch.setattr(
+        skill_script_module,
+        "run_sandboxed_process",
+        lambda **_kwargs: SimpleNamespace(
+            returncode=0,
+            timed_out=False,
+            stdout=b'{\n  "status": "success",\n  "push_status": "failed"\n}\n',
+            stderr=b"",
+            stdout_bytes=53,
+            stderr_bytes=0,
+            output_truncated=False,
+            duration_ms=4,
+            isolation_mode="test",
+        ),
+    )
+    registry = register_skill_script_tools(HarnessRegistry())
+    result = HarnessExecutor(registry).execute(
+        HarnessToolContext(
+            run_id="run-test-business-failed",
+            workspace_root=tmp_path.resolve(),
+            sandbox_enabled=False,
+        ),
+        HarnessToolCall(
+            call_id="call-test-business-failed",
+            name="run_skill_script",
+            arguments={"script_path": script.relative_to(tmp_path).as_posix()},
+        ),
+    )
+
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["ok"] is False
+    assert result.data["status"] == "failed"
+    assert result.data["structured_result"]["push_status"] == "failed"

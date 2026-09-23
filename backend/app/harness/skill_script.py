@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -79,24 +80,59 @@ def run_skill_script(
         allowed_domains=context.sandbox_allowed_domains,
         sandbox_enabled=context.sandbox_enabled,
     )
+    stdout = process.stdout.decode("utf-8", errors="replace")
+    stderr = process.stderr.decode("utf-8", errors="replace")
+    structured_result = _parse_structured_result(stdout)
+    business_failed = _structured_result_failed(structured_result)
     return {
-        "ok": process.returncode == 0 and not process.timed_out,
+        "ok": process.returncode == 0 and not process.timed_out and not business_failed,
         "status": (
             "timed_out"
             if process.timed_out
-            else "completed"
-            if process.returncode == 0
             else "failed"
+            if process.returncode != 0 or business_failed
+            else "completed"
         ),
         "exit_code": process.returncode,
-        "stdout": process.stdout.decode("utf-8", errors="replace"),
-        "stderr": process.stderr.decode("utf-8", errors="replace"),
+        "stdout": stdout,
+        "stderr": stderr,
+        "structured_result": structured_result,
         "stdout_bytes": process.stdout_bytes,
         "stderr_bytes": process.stderr_bytes,
         "output_truncated": process.output_truncated,
         "duration_ms": process.duration_ms,
         "script_path": script.relative_to(workspace).as_posix(),
         "isolation_mode": process.isolation_mode,
+    }
+
+
+def _parse_structured_result(stdout: str) -> dict[str, Any] | None:
+    """Read a JSON object emitted by a skill, including pretty-printed output."""
+
+    candidates = [stdout.strip()]
+    decoder = json.JSONDecoder()
+    candidates.extend(stdout[index:] for index, char in enumerate(stdout) if char == "{")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            value, _ = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _structured_result_failed(result: dict[str, Any] | None) -> bool:
+    if not result:
+        return False
+    if str(result.get("status") or "").strip().lower() in {"error", "failed", "failure"}:
+        return True
+    return str(result.get("push_status") or "").strip().lower() in {
+        "error",
+        "failed",
+        "failure",
     }
 
 

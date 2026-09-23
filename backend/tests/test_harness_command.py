@@ -27,6 +27,11 @@ def test_command_registry_exposes_typed_exec_command() -> None:
     registered = registry.get("exec_command")
     assert registered is not None
     assert registered.spec.side_effect == "write"
+    assert (
+        "Do not use exec_command to run scripts from a GeneralSkill package"
+        in registered.spec.description
+    )
+    assert "run_skill_script" in registered.spec.description
     schema = registered.spec.input_schema
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["command"]
@@ -566,7 +571,29 @@ def test_windows_validator_explains_bash_and_python_runtime_mismatch(
         command_module._validate_windows_command(command)
 
     assert denied.value.error.code == "COMMAND_DENIED"
-    assert "General Skill" in denied.value.error.message or "PowerShell" in denied.value.error.message
+    assert (
+        "General Skill" in denied.value.error.message
+        or "PowerShell" in denied.value.error.message
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Get-ChildItem .harness 2>/dev/null",
+        "for f in *.py; do Write-Output $f; done",
+        "base=$(Get-ChildItem -Directory)",
+        "Get-ChildItem . || Write-Output fallback",
+    ],
+)
+def test_windows_validator_rejects_common_bash_diagnostics(
+    command: str,
+) -> None:
+    with pytest.raises(HarnessExecutionError) as denied:
+        command_module._validate_windows_command(command)
+
+    assert denied.value.error.code == "COMMAND_DENIED"
+    assert "PowerShell" in denied.value.error.message
 
 
 def test_packaged_windows_shell_aliases_bundled_python(tmp_path: Path, monkeypatch) -> None:

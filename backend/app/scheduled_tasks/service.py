@@ -655,6 +655,7 @@ def _scheduled_harness_outcome(
     )
 
     frame_payloads = [_scheduled_frame_payload(frame) for frame in frames]
+    business_failures = _scheduled_business_failures(invocations)
     effective_statuses = [str(item["effective_status"]) for item in frame_payloads]
     if all(status == "completed" for status in effective_statuses):
         status = "succeeded"
@@ -671,6 +672,10 @@ def _scheduled_harness_outcome(
     else:
         status = "incomplete"
         error = "TaskFrame 尚未全部完成，请查看执行记录后继续或重试。"
+
+    if status == "succeeded" and business_failures:
+        status = "failed"
+        error = "技能脚本报告业务失败，未视为定时任务成功。"
 
     authorized_specific = _scheduled_sop_specific_capabilities(harness_runs)
     authorized_names = {
@@ -729,6 +734,7 @@ def _scheduled_harness_outcome(
         "session_state": result.session_state.model_dump(mode="json"),
         "task_frames": frame_payloads,
         "harness_run_ids": [item.id for item in harness_runs],
+        "business_failures": business_failures,
         "sop_scope": {
             "includes_sop": bool(sop_skill_ids),
             "skill_ids": sop_skill_ids,
@@ -737,6 +743,43 @@ def _scheduled_harness_outcome(
         },
     }
     return {"status": status, "error": error, "trace": trace}
+
+
+def _scheduled_business_failures(
+    invocations: list[HarnessInvocationRecord],
+) -> list[dict[str, str]]:
+    """Turn structured skill-script failures into scheduled-task failures."""
+
+    failures: list[dict[str, str]] = []
+    for invocation in invocations:
+        if invocation.tool_name != "run_skill_script":
+            continue
+        raw = invocation.result_json if isinstance(invocation.result_json, dict) else {}
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+        structured = (
+            data.get("structured_result")
+            if isinstance(data.get("structured_result"), dict)
+            else {}
+        )
+        failed = (
+            data.get("ok") is False
+            or str(data.get("status") or "").lower() in {"failed", "error", "failure"}
+            or str(structured.get("status") or "").lower() in {"failed", "error", "failure"}
+            or str(structured.get("push_status") or "").lower()
+            in {"failed", "error", "failure"}
+        )
+        if failed:
+            failures.append(
+                {
+                    "tool": invocation.tool_name,
+                    "message": (
+                        str(structured.get("message") or "")
+                        or str(data.get("stderr") or "")
+                        or "技能脚本返回业务失败"
+                    )[:500],
+                }
+            )
+    return failures
 
 
 def _scheduled_frame_payload(frame: HarnessTaskFrameRecord) -> dict[str, Any]:
