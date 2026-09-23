@@ -97,6 +97,7 @@ class TestCardElementsConversion:
         assert [c["display_name"] for c in table["columns"]] == ["部门", "平台", "达播净销", "运营净销", "合计净销"]
         assert table["columns"][0]["horizontal_align"] == "left"
         assert table["columns"][2]["horizontal_align"] == "right"
+        assert all(c["width"] == "auto" for c in table["columns"])
 
         rows = table["rows"]
         assert len(rows) == 3
