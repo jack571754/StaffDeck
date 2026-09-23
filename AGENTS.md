@@ -54,3 +54,7 @@ Issue triage labels are not used. See `docs/agents/triage-labels.md`.
 ### Domain docs
 
 Use the single-context documentation layout. See `docs/agents/domain.md`.
+
+### Fixed-flow scheduled tasks
+
+For scheduled tasks following the "Fetch -> Process -> Deduplicate -> Feishu Push" fixed workflow, follow the standardized deterministic pattern. See code-level specification in `backend/app/scheduled_tasks/fixed_process_workflow.md` and `skills/fixed-etl-scheduled-task/SKILL.md`.

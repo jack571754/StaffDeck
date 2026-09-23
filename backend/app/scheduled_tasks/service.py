@@ -101,6 +101,12 @@ SCHEDULE_DRAFT_PROMPT = """
 - 用户只给出一个具体时间点，例如“下午2点10分”“14:10”“今晚8点”，且没有明确“每天/每日/每周/每月/定期/重复”等周期要求时，生成 once。
 - once.run_at 使用 now 所在日期和用户给出的时间；如果该时间已经过去，则顺延到下一天。
 - 只有用户明确说“每天/每日/每晚/每早/每周/每月/工作日/定期/重复”等周期要求时，才生成 daily/weekly/monthly。
+固定流程类任务（取数-比对/处理-推送飞书群/机器人/播报等）的 prompt 提取规则：
+- 当用户需求属于周期性“取数/巡检/报表”并“比对/分析/去重”后“推送到群/机器人/飞书”等固定自动化流程时，生成的 prompt 必须采用确定性三步执行模板，严禁生成含糊散漫的话术或要求模型编写代码：
+  “你是{业务领域}员工。请严格按以下步骤确定性执行，禁止自行发挥或调用 exec_command：
+  1. 调用对应业务能力的技能包（operation='read'），获取执行脚本 run.py 的文件路径；
+  2. 调用工具 run_skill_script 执行脚本（设置 timeout_seconds=60-120）；
+  3. 读取 run_skill_script 返回的 JSON 结构并如实简报（包含巡检总数、发现数、推送状态），汇报后立即结束任务。”
 不要输出 Markdown，不要输出解释文本，只输出 JSON。
 """
 
@@ -748,7 +754,10 @@ def _scheduled_harness_outcome(
 def _scheduled_business_failures(
     invocations: list[HarnessInvocationRecord],
 ) -> list[dict[str, str]]:
-    """Turn structured skill-script failures into scheduled-task failures."""
+    """Turn structured skill-script failures into scheduled-task failures.
+
+    规范文档参见同目录下的 fixed_process_workflow.md。
+    """
 
     failures: list[dict[str, str]] = []
     for invocation in invocations:
