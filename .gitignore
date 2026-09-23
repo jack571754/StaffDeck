@@ -51,5 +51,6 @@ yarn-error.log*
 pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
 .claude/
+.kilo/
 backend/_main*.html
 backend/_skill_fix/conversation-logs.json
