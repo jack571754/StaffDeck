@@ -542,3 +542,33 @@ def _upsert_dynamic_order(
 
 def _now_iso() -> str:
     return datetime.now(UTC).replace(tzinfo=None).isoformat()
+
+
+@router.post("/data-query/{template_id}")
+def mock_data_query_execute(
+    template_id: str,
+    payload: dict[str, Any] | None = None,
+    tenant_id: str = "tenant_demo",
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Execute a data query template via internal mock HTTP route."""
+    from app.data_query.service import execute_query_by_id
+
+    params = {}
+    if payload:
+        if "params" in payload and isinstance(payload["params"], dict):
+            params = payload["params"]
+        else:
+            params = payload
+        if "tenant_id" in payload and payload["tenant_id"]:
+            tenant_id = payload["tenant_id"]
+
+    result = execute_query_by_id(db, template_id, tenant_id, params)
+    return {
+        "template_id": template_id,
+        "columns": result.columns,
+        "rows": result.rows,
+        "row_count": result.row_count,
+        "execution_time_ms": result.execution_time_ms,
+        "cached": result.cached,
+    }

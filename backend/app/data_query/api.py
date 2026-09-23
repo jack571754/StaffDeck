@@ -505,6 +505,28 @@ def execute_query(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/query-templates/{qt_id}/execute", response_model=QueryExecuteResult)
+def execute_query_template_by_path(
+    qt_id: str,
+    request: dict[str, Any] | None = None,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> QueryExecuteResult:
+    """Execute an active query template by URL path parameter."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    params = {}
+    if request:
+        if "params" in request and isinstance(request["params"], dict):
+            params = request["params"]
+        else:
+            params = request
+    try:
+        return service.execute_query_by_id(db, qt_id, tid, params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ===================================================================
 # Agent data-source authorization
 # ===================================================================

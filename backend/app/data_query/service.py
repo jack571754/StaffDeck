@@ -589,6 +589,13 @@ def execute_query_by_id(
     """
     qt = get_query_template(db, template_id, tenant_id)
     if not qt:
+        qt = db.exec(
+            select(QueryTemplate).where(
+                QueryTemplate.tenant_id == tenant_id,
+                (QueryTemplate.name == template_id) | (QueryTemplate.tool_id == template_id),
+            )
+        ).first()
+    if not qt:
         raise ValueError("Query template not found")
     if qt.status != "active":
         raise ValueError("Query template is not active")
