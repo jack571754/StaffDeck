@@ -500,6 +500,78 @@ class FeishuAdapter:
                 return open_id
         return None
 
+    def resolve_open_ids_by_mobiles(
+        self,
+        binding: ChannelBinding,
+        mobiles: list[str],
+    ) -> dict[str, str]:
+        """批量通过手机号反查飞书用户的 open_id，返回映射字典 {mobile: open_id}。"""
+        clean_mobiles = [str(m).strip() for m in mobiles if str(m).strip()]
+        if not clean_mobiles:
+            return {}
+        try:
+            data = self._request(
+                binding,
+                "POST",
+                f"{FEISHU_API_BASE}/contact/v3/users/batch_get_id",
+                params={"user_id_type": "open_id"},
+                body={"mobiles": clean_mobiles},
+            )
+        except Exception:  # noqa: BLE001
+            return {}
+        result: dict[str, str] = {}
+        user_list = (data.get("data") or {}).get("user_list") or []
+        for item in user_list:
+            m = str(item.get("mobile") or "").strip()
+            uid = str(item.get("user_id") or "").strip()
+            if m and uid:
+                result[m] = uid
+        return result
+
+    def list_chats(
+        self,
+        binding: ChannelBinding,
+        *,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """获取应用机器人所加入/拥有的群聊列表：GET /im/v1/chats。"""
+        chats: list[dict[str, Any]] = []
+        page_token = None
+        while True:
+            params: dict[str, str] = {"page_size": str(page_size)}
+            if page_token:
+                params["page_token"] = page_token
+            try:
+                data = self._request(
+                    binding,
+                    "GET",
+                    f"{FEISHU_API_BASE}/im/v1/chats",
+                    params=params,
+                    body=None,
+                )
+            except Exception:  # noqa: BLE001
+                break
+            payload = data.get("data") or {}
+            items = payload.get("items") or []
+            for item in items:
+                chat_id = str(item.get("chat_id") or "").strip()
+                name = str(item.get("name") or "").strip()
+                avatar = str(item.get("avatar") or "").strip()
+                description = str(item.get("description") or "").strip()
+                if chat_id:
+                    chats.append({
+                        "chat_id": chat_id,
+                        "name": name or "未命名群聊",
+                        "avatar": avatar,
+                        "description": description,
+                    })
+            if not payload.get("has_more"):
+                break
+            page_token = payload.get("page_token")
+            if not page_token:
+                break
+        return chats
+
     def get_user_name(
         self,
         binding: ChannelBinding,

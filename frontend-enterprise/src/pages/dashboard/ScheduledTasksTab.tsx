@@ -152,6 +152,37 @@ export default function ScheduledTasksTab() {
     setDeleteTarget(row);
   }
 
+  async function duplicate(row: ScheduledTaskRead) {
+    try {
+      const duplicated = await api.post<ScheduledTaskRead>(
+        `/api/enterprise/scheduled-tasks/${row.id}/duplicate?tenant_id=${TENANT_ID}`,
+      );
+      notify.success(`已复制任务 "${duplicated.title}"，状态默认为暂停`);
+      await load();
+      navigate(`/enterprise/scheduled-tasks/${duplicated.id}/edit`);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '复制定时任务失败');
+    }
+  }
+
+  async function testNotify(row: ScheduledTaskRead) {
+    try {
+      const result = await api.post<{
+        ok: boolean;
+        error?: string;
+        sent_count: number;
+        failed_count: number;
+      }>(`/api/enterprise/scheduled-tasks/${row.id}/test-notify?tenant_id=${TENANT_ID}`);
+      if (result.ok) {
+        notify.success(`测试推送成功（已送达 ${result.sent_count} 个通道）`);
+      } else {
+        notify.error(`测试推送未完全成功：${result.error || '部分目标推送失败'}`);
+      }
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '测试推送失败');
+    }
+  }
+
   async function confirmDelete() {
     if (!deleteTarget) return;
     setDeleting(true);
@@ -204,6 +235,8 @@ export default function ScheduledTasksTab() {
       onEdit={(task) => navigate(`/enterprise/scheduled-tasks/${task.id}/edit`)}
       onRunNow={runNow}
       onToggleStatus={toggleStatus}
+      onDuplicate={duplicate}
+      onTestNotify={testNotify}
       onDelete={remove}
     />
   );

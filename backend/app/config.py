@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     general_skill_pip_index_url: str = ""
     general_skill_pip_timeout_seconds: int = 180
     general_skill_network_install: bool = True
+    # 通用技能子进程环境透传白名单：逗号分隔的变量名。技能包 run.py 需要平台侧
+    # 凭证（如固定流程的飞书 Webhook 兜底变量，见 scheduled_tasks/
+    # fixed_process_workflow.md），而这些值只存在于 .env / 进程环境中，不会被
+    # 沙箱子进程继承。这里只声明"变量名"，值仍从 .env 或 os.environ 读取，
+    # 避免把密钥写进任务配置、Prompt 或对话。
+    general_skill_env_passthrough: str = (
+        "FEISHU_SALES_REPORT_WEBHOOK,FEISHU_ALERT_WEBHOOK"
+    )
     channel_secret: str = ""
     staffdeck_role: str = "all"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
@@ -88,6 +96,47 @@ class Settings(BaseSettings):
     @property
     def general_skill_runtime_package_list(self) -> list[str]:
         return [item.strip() for item in self.general_skill_runtime_packages.split(",") if item.strip()]
+
+    @property
+    def general_skill_env_passthrough_keys(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self.general_skill_env_passthrough.split(",")
+            if item.strip()
+        ]
+
+    def general_skill_env_passthrough_values(self) -> dict[str, str]:
+        """Resolve the declared variables for skill subprocesses.
+
+        ``.env`` values are loaded into this settings object only: undeclared
+        keys are dropped by ``extra="ignore"`` and never reach ``os.environ``.
+        Skill scripts still need them, so each declared name is resolved from
+        the process environment first and then from the same env file pydantic
+        read. Values are never written anywhere else.
+        """
+
+        keys = self.general_skill_env_passthrough_keys
+        if not keys:
+            return {}
+        file_values = self._env_file_values()
+        resolved: dict[str, str] = {}
+        for key in keys:
+            value = _os.environ.get(key) or file_values.get(key) or ""
+            if value.strip():
+                resolved[key] = value
+        return resolved
+
+    def _env_file_values(self) -> dict[str, str]:
+        env_file = self.model_config.get("env_file")
+        if not env_file or not _os.path.exists(env_file):
+            return {}
+        try:
+            from dotenv import dotenv_values
+
+            values = dotenv_values(env_file)
+        except (ImportError, OSError, UnicodeDecodeError):
+            return {}
+        return {key: value for key, value in values.items() if value is not None}
 
 
 @lru_cache

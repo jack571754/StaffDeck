@@ -1190,6 +1190,8 @@ class ScheduledTask(SQLModel, table=True):
     lease_until: Optional[datetime] = Field(default=None, index=True)
     source_session_id: Optional[str] = Field(default=None, index=True)
     metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    execution_mode: str = Field(default="agent", index=True)
+    pipeline_steps_json: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

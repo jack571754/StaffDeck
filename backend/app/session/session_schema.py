@@ -238,6 +238,10 @@ class ChatTurnRequest(BaseModel):
     # server-only and is applied only after the current employee binding has
     # been verified, so pinning a version never bypasses capability access.
     forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
+    # Scheduled tasks carry their own record id so the sandboxed skill process can
+    # report it back and let the server resolve task-scoped config (e.g. which
+    # Feishu app to push with) without relying on the model to forward identifiers.
+    scheduled_task_id: Optional[str] = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
 

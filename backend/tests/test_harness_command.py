@@ -739,6 +739,30 @@ def test_windows_broker_environment_keeps_system_paths_without_secrets(
     assert "OPENAI_API_KEY" not in result
 
 
+def test_managed_process_environment_allows_task_identifiers_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非密的任务/租户标识可下传技能子进程，凭证与内部令牌必须仍被过滤。"""
+
+    monkeypatch.setattr(command_module.sys, "platform", "win32")
+
+    result = command_module._managed_process_environment(
+        {
+            "STAFFDECK_TASK_ID": "task_price",
+            "STAFFDECK_TENANT_ID": "tenant_demo",
+            "APP_SECRET": "must-not-leak",
+            "STAFFDECK_INTERNAL_TOKEN": "must-not-leak",
+            "OPENAI_API_KEY": "must-not-leak",
+        }
+    )
+
+    assert result["STAFFDECK_TASK_ID"] == "task_price"
+    assert result["STAFFDECK_TENANT_ID"] == "tenant_demo"
+    assert "APP_SECRET" not in result
+    assert "STAFFDECK_INTERNAL_TOKEN" not in result
+    assert "OPENAI_API_KEY" not in result
+
+
 def test_sandboxed_process_maps_structured_paths_and_cwd_for_bubblewrap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

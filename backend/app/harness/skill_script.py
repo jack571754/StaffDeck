@@ -79,6 +79,7 @@ def run_skill_script(
         network_mode=context.sandbox_network_mode,
         allowed_domains=context.sandbox_allowed_domains,
         sandbox_enabled=context.sandbox_enabled,
+        env=_skill_process_env(context),
     )
     stdout = process.stdout.decode("utf-8", errors="replace")
     stderr = process.stderr.decode("utf-8", errors="replace")
@@ -103,6 +104,24 @@ def run_skill_script(
         "duration_ms": process.duration_ms,
         "script_path": script.relative_to(workspace).as_posix(),
         "isolation_mode": process.isolation_mode,
+    }
+
+
+def _skill_process_env(context: HarnessToolContext) -> dict[str, str]:
+    """Non-secret identifiers a skill script needs to report its origin.
+
+    Lets the server resolve task-scoped configuration (which Feishu app to push
+    with) without trusting the model to forward opaque ids through argv.
+    """
+
+    identifiers = {
+        "STAFFDECK_TASK_ID": context.scheduled_task_id,
+        "STAFFDECK_TENANT_ID": context.tenant_id,
+    }
+    return {
+        key: str(value).strip()
+        for key, value in identifiers.items()
+        if value and str(value).strip()
     }
 
 

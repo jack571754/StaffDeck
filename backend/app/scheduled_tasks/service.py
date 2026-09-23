@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.agents.branching import model_for_agent, visible_published_skills
+from app.channels.feishu_binding import resolve_feishu_binding
 from app.core import AgentLoop
 from app.core.harness_turn_store import HarnessTurnConflict
 from app.db import engine
@@ -137,6 +138,8 @@ def scheduled_task_read(row: ScheduledTask) -> ScheduledTaskRead:
         run_count=row.run_count,
         source_session_id=row.source_session_id,
         metadata=metadata,
+        execution_mode=getattr(row, "execution_mode", "agent") or "agent",
+        pipeline_steps=list(getattr(row, "pipeline_steps_json", []) or []),
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -174,6 +177,13 @@ def create_scheduled_task(
     schedule = normalize_schedule(request.schedule_type, request.schedule, request.timezone)
     now = utc_now()
     end_at = parse_user_datetime(request.end_at, request.timezone) if request.end_at else None
+    metadata = _prepare_scheduled_task_sop_metadata(
+        db,
+        request.tenant_id,
+        request.agent_id,
+        request.metadata,
+    )
+    metadata = _prepare_scheduled_task_feishu_metadata(db, request.tenant_id, metadata)
     row = ScheduledTask(
         tenant_id=request.tenant_id,
         agent_id=request.agent_id,
@@ -191,12 +201,9 @@ def create_scheduled_task(
         max_runs=request.max_runs,
         end_at=end_at,
         source_session_id=request.source_session_id,
-        metadata_json=_prepare_scheduled_task_sop_metadata(
-            db,
-            request.tenant_id,
-            request.agent_id,
-            request.metadata,
-        ),
+        metadata_json=metadata,
+        execution_mode=getattr(request, "execution_mode", "agent") or "agent",
+        pipeline_steps_json=list(getattr(request, "pipeline_steps", []) or []),
         created_at=now,
         updated_at=now,
     )
@@ -246,6 +253,8 @@ def update_scheduled_task(
         row.max_runs = request.max_runs
     if request.end_at is not None:
         row.end_at = parse_user_datetime(request.end_at, row.timezone) if request.end_at else None
+    if request.metadata is not None or agent_changed:
+        previous_metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
     if request.metadata is not None:
         row.metadata_json = _prepare_scheduled_task_sop_metadata(
             db,
@@ -254,6 +263,12 @@ def update_scheduled_task(
             request.metadata,
             existing=None if agent_changed else row.metadata_json,
         )
+        row.metadata_json = _prepare_scheduled_task_feishu_metadata(
+            db,
+            row.tenant_id,
+            row.metadata_json,
+            existing=previous_metadata,
+        )
     elif agent_changed:
         row.metadata_json = _prepare_scheduled_task_sop_metadata(
             db,
@@ -261,12 +276,123 @@ def update_scheduled_task(
             row.agent_id,
             row.metadata_json,
         )
+    if getattr(request, "execution_mode", None) is not None:
+        row.execution_mode = request.execution_mode
+    if getattr(request, "pipeline_steps", None) is not None:
+        row.pipeline_steps_json = list(request.pipeline_steps or [])
     row.updated_at = utc_now()
     row.next_run_at = compute_next_run_at(row, after=utc_now()) if row.status == "active" else None
     db.add(row)
     db.commit()
     db.refresh(row)
     return row
+
+
+def duplicate_scheduled_task(
+    db: Session,
+    source: ScheduledTask,
+    user_id: str | User,
+) -> ScheduledTask:
+    """Create a paused duplicate copy of an existing scheduled task."""
+    now = utc_now()
+    base_title = source.title.strip()
+    copy_suffix = " (副本)"
+    if len(base_title) + len(copy_suffix) > 80:
+        new_title = base_title[: 80 - len(copy_suffix)] + copy_suffix
+    else:
+        new_title = f"{base_title}{copy_suffix}"
+
+    creator_id = getattr(user_id, "id", None) or str(user_id)
+
+    new_task = ScheduledTask(
+        tenant_id=source.tenant_id,
+        agent_id=source.agent_id,
+        created_by_user_id=creator_id,
+        title=new_title,
+        prompt=source.prompt,
+        description=source.description,
+        schedule_type=source.schedule_type,
+        schedule_json=dict(source.schedule_json or {}),
+        timezone=source.timezone,
+        rrule=source.rrule,
+        status="paused",
+        concurrency_policy=source.concurrency_policy,
+        misfire_policy=source.misfire_policy,
+        max_runs=source.max_runs,
+        end_at=source.end_at,
+        source_session_id=None,
+        metadata_json=dict(source.metadata_json or {}),
+        execution_mode=source.execution_mode or "agent",
+        pipeline_steps_json=list(source.pipeline_steps_json or []),
+        run_count=0,
+        next_run_at=None,
+        lease_owner=None,
+        lease_until=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+    return new_task
+
+
+def build_test_feishu_card(title: str | None = None) -> dict[str, Any]:
+    """Generate an official test card for channel diagnostics."""
+    now_str = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    display_title = title or "定时任务"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": f"🔔 【测试推送】{display_title}",
+            },
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "fields": [
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": "**测试状态**\n<font color='green'>✅ 通道联通正常</font>",
+                        },
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**测试时间**\n{now_str}",
+                        },
+                    },
+                ],
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        "这是一条来自 **StaffDeck 定时任务配置中心** 的通道联通性测试消息。\n\n"
+                        "收到此卡片表明当前配置的飞书通知渠道（群机器人 Webhook / 自建应用私聊直达 / 业务群）"
+                        "已成功打通并具备出站卡片播报能力。"
+                    ),
+                },
+            },
+            {
+                "tag": "note",
+                "elements": [
+                    {
+                        "tag": "plain_text",
+                        "content": "StaffDeck 自动化任务出站中心 · 通道探测合格",
+                    }
+                ],
+            },
+        ],
+    }
 
 
 def detect_scheduled_task_draft(
@@ -532,6 +658,11 @@ def _execute_prepared_scheduled_task(
     *,
     manual: bool,
 ) -> ScheduledTaskRun:
+    if getattr(task, "execution_mode", "agent") == "pipeline" and getattr(task, "pipeline_steps_json", None):
+        from app.scheduled_tasks.pipeline import execute_pipeline_scheduled_task
+
+        return execute_pipeline_scheduled_task(db, task, run, manual=manual)
+
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
@@ -547,6 +678,7 @@ def _execute_prepared_scheduled_task(
             interaction_mode="scheduled_task",
             forced_sop_id=_scheduled_task_sop_id(task),
             forced_sop_snapshot=_scheduled_task_sop_snapshot(task),
+            scheduled_task_id=task.id,
             client_timezone=task.timezone,
         )
         result: ChatTurnResponse | None = None
@@ -898,7 +1030,64 @@ def _record_scheduled_task_stream_event(
 
 
 def automatic_task_message(task: ScheduledTask) -> str:
-    return task.prompt.strip() or task.title
+    base = task.prompt.strip() or task.title
+    metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
+    notify = metadata.get("feishu_notify")
+    if isinstance(notify, dict) and notify.get("enabled"):
+        chat_ids: list[str] = []
+        if notify.get("chat_id") and str(notify["chat_id"]).strip():
+            chat_ids.append(str(notify["chat_id"]).strip())
+        for cid in notify.get("chat_ids", []):
+            c = str(cid).strip()
+            if c and c not in chat_ids:
+                chat_ids.append(c)
+
+        chat_names = [str(n).strip() for n in notify.get("chat_names", []) if str(n).strip()]
+
+        webhooks: list[str] = []
+        if notify.get("webhook_url") and str(notify["webhook_url"]).strip():
+            webhooks.append(str(notify["webhook_url"]).strip())
+        for wh in notify.get("webhooks", []):
+            w = str(wh).strip()
+            if w and w not in webhooks:
+                webhooks.append(w)
+
+        mobiles = [str(m).strip() for m in notify.get("mobiles", []) if str(m).strip()]
+
+        info_lines = ["\n\n【系统预设飞书推送配置】"]
+        binding_id = str(notify.get("binding_id") or "").strip()
+        if binding_id:
+            app_label = (
+                str(notify.get("app_name") or "").strip()
+                or str(notify.get("app_id") or "").strip()
+                or binding_id
+            )
+            info_lines.append(f"- 飞书应用: {app_label} (binding_id={binding_id})")
+        if chat_ids:
+            group_labels = []
+            for i, cid in enumerate(chat_ids):
+                name = (
+                    chat_names[i]
+                    if i < len(chat_names) and chat_names[i]
+                    else (str(notify.get("chat_name") or "") if i == 0 else "")
+                )
+                group_labels.append(f"{name} ({cid})" if name else cid)
+            info_lines.append(f"- 目标群聊（企业应用）: {', '.join(group_labels)}")
+
+        if webhooks:
+            masked_hooks = [
+                f"Webhook #{i+1} ({h[:35]}...)" if len(h) > 35 else h
+                for i, h in enumerate(webhooks)
+            ]
+            info_lines.append(f"- 目标群机器人 (Webhook): {', '.join(masked_hooks)}")
+
+        if mobiles:
+            joined_mobiles = ", ".join(mobiles)
+            info_lines.append(f"- 责任人手机号 (私聊直达): {joined_mobiles}")
+
+        info_lines.append("请使用上述配置通过飞书执行消息推送与播报。")
+        base = base + "\n".join(info_lines)
+    return base
 
 
 def _scheduled_task_sop_id(task: ScheduledTask) -> str | None:
@@ -977,6 +1166,50 @@ def _prepare_scheduled_task_sop_metadata(
         "content_json": expanded.content_json,
     }
     return metadata
+
+
+def _prepare_scheduled_task_feishu_metadata(
+    db: Session,
+    tenant_id: str,
+    metadata: dict[str, Any],
+    *,
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """校验飞书通知配置里所选的应用，防止把卡片发到不可用的应用。
+
+    ``binding_id`` 为空表示"自动"（运行时取租户最新启用的飞书应用），不做校验。
+    """
+    notify = metadata.get("feishu_notify")
+    if not isinstance(notify, dict):
+        return metadata
+
+    binding_id = str(notify.get("binding_id") or "").strip()
+    if not binding_id:
+        return metadata
+
+    binding, error = resolve_feishu_binding(db, tenant_id, binding_id)
+    if binding is None:
+        raise HTTPException(status_code=400, detail=error)
+
+    previous = existing if isinstance(existing, dict) else {}
+    previous_notify = previous.get("feishu_notify")
+    previous_binding_id = (
+        str(previous_notify.get("binding_id") or "").strip()
+        if isinstance(previous_notify, dict)
+        else ""
+    )
+    # chat_id 属于具体应用：换了应用还留着旧应用的群 ID，投递必然失败。
+    if previous_binding_id and previous_binding_id != binding_id and _notify_chat_ids(notify):
+        raise HTTPException(status_code=400, detail="切换飞书应用后必须重新选择目标群聊")
+    return metadata
+
+
+def _notify_chat_ids(notify: dict[str, Any]) -> list[str]:
+    ids = [str(cid).strip() for cid in notify.get("chat_ids", []) if str(cid).strip()]
+    legacy = str(notify.get("chat_id") or "").strip()
+    if legacy and legacy not in ids:
+        ids.append(legacy)
+    return ids
 
 
 def compute_next_run_at(task: ScheduledTask, after: datetime | None = None) -> datetime | None:

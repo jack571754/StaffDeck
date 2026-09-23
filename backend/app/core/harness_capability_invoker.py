@@ -93,6 +93,7 @@ class HarnessCapabilityInvoker:
         active_step_id: str | None,
         agent_id: str | None,
         run_id: str | None = None,
+        scheduled_task_id: str | None = None,
         initially_activated_names: set[str] | None = None,
         is_cancelled: Any | None = None,
         ensure_execution_lease: Any | None = None,
@@ -111,6 +112,7 @@ class HarnessCapabilityInvoker:
         )
         self.active_step_id = active_step_id
         self.agent_id = agent_id
+        self.scheduled_task_id = scheduled_task_id
         self.is_cancelled = is_cancelled
         self.ensure_execution_lease = ensure_execution_lease
         self.trace_sink = trace_sink
@@ -139,6 +141,7 @@ class HarnessCapabilityInvoker:
             run_id=self.run_id,
             task_frame_id=task_frame_id,
             tenant_id=tenant_id,
+            scheduled_task_id=self.scheduled_task_id,
             workspace_root=self.workspace_root,
             sandbox_enabled=sandbox_enabled,
             sandbox_network_mode=sandbox_mode,
@@ -649,6 +652,7 @@ class HarnessCapabilityInvoker:
             run_id=self.run_id,
             task_frame_id=task_frame_id,
             tenant_id=self.tenant_id,
+            scheduled_task_id=self._file_context.scheduled_task_id,
             workspace_root=workspace_root,
             limits=self._file_context.limits,
             sandbox_enabled=self._file_context.sandbox_enabled,

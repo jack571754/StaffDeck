@@ -1,11 +1,8 @@
 {
   "name": "fixed-etl-notify",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "default_template_id": "qt_50f463a815af4801",
-  "env_mapping": {
-    "webhook_url": "FEISHU_ALERT_WEBHOOK",
-    "fallback_webhook_url": "FEISHU_SALES_REPORT_WEBHOOK"
-  },
-  "dedup_ttl_hours": 24,
-  "max_display_items": 15
+  "max_display_items": 15,
+  "default_notify_mode": "app",
+  "_comment": "已全面升级为飞书企业自建应用出站通道；群聊与接收人手机号直接由定时任务UI配置动态注入，无需在代码或本文件中维护硬编码路由。"
 }

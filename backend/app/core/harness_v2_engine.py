@@ -974,6 +974,7 @@ class HarnessV2Engine:
             invoker = HarnessCapabilityInvoker(
                 self.db,
                 tenant_id=request.tenant_id,
+                scheduled_task_id=request.scheduled_task_id,
                 session=session,
                 task_frame_id=row.task_id,
                 model_config=model_config,

@@ -9,8 +9,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlmodel import Session
 
+from app.channels.feishu_binding import resolve_feishu_binding
 from app.db import get_session
-from app.db.models import MockOrder, utc_now
+from app.db.models import ChannelBinding, MockOrder, ScheduledTask, utc_now
 from app.security.internal_service import require_internal_service
 
 router = APIRouter(
@@ -572,3 +573,315 @@ def mock_data_query_execute(
         "execution_time_ms": result.execution_time_ms,
         "cached": result.cached,
     }
+
+
+class FeishuAppNotifyRequest(BaseModel):
+    tenant_id: str = "tenant_demo"
+    binding_id: str | None = None
+    # 定时任务上下文：服务端据此读取该任务所选飞书应用，避免依赖调用方传递应用标识。
+    scheduled_task_id: str | None = None
+    chat_id: str | None = None
+    chat_ids: list[str] = Field(default_factory=list)
+    webhooks: list[str] = Field(default_factory=list)
+    webhook_url: str | None = None
+    mobiles: list[str] = Field(default_factory=list)
+    emails: list[str] = Field(default_factory=list)
+    open_ids: list[str] = Field(default_factory=list)
+    card: dict[str, Any]
+    title: str | None = None
+
+
+def _resolve_notify_binding(
+    db: Session,
+    request: FeishuAppNotifyRequest,
+) -> tuple[ChannelBinding | None, str | None]:
+    """确定本次推送使用的飞书应用，返回 (binding, error)。
+
+    优先级：定时任务所选应用 > 请求显式 binding_id > 租户最新 active。
+    前两者一旦指定就绝不回退——静默换用另一个应用会把卡片发到错误的企业应用。
+    """
+
+    task_binding_id: str | None = None
+    if request.scheduled_task_id:
+        task = db.get(ScheduledTask, request.scheduled_task_id)
+        if task is None or task.tenant_id != request.tenant_id:
+            return None, f"定时任务 {request.scheduled_task_id} 不存在或不属于租户 {request.tenant_id}，无法解析其飞书应用"
+        metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
+        notify = metadata.get("feishu_notify")
+        if isinstance(notify, dict):
+            task_binding_id = str(notify.get("binding_id") or "").strip() or None
+
+    requested = (request.binding_id or "").strip() or None
+
+    if task_binding_id and requested and task_binding_id != requested:
+        return None, "飞书应用标识不一致（任务绑定 vs 请求参数），请重新保存定时任务配置"
+
+    if task_binding_id or requested:
+        return resolve_feishu_binding(db, request.tenant_id, task_binding_id or requested)
+
+    return resolve_feishu_binding(db, request.tenant_id, None)
+
+
+@router.post("/feishu-app-notify")
+def feishu_app_notify(
+    request: FeishuAppNotifyRequest,
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Send feishu interactive card to chats, users and webhooks."""
+    import requests
+
+    from app.channels.adapters.feishu import FeishuAdapter
+
+    # 1. 若来自定时任务上下文且未传显式目标，自动继承任务中配置的飞书通知目标
+    task_notify: dict[str, Any] = {}
+    if request.scheduled_task_id:
+        task = db.get(ScheduledTask, request.scheduled_task_id)
+        if task and isinstance(task.metadata_json, dict):
+            raw_fn = task.metadata_json.get("feishu_notify")
+            if isinstance(raw_fn, dict):
+                has_explicit_targets = bool(
+                    request.chat_id
+                    or request.chat_ids
+                    or request.webhook_url
+                    or request.webhooks
+                    or request.mobiles
+                    or request.open_ids
+                    or request.emails
+                )
+                if raw_fn.get("enabled") is False and not has_explicit_targets:
+                    return {
+                        "ok": True,
+                        "skipped": True,
+                        "message": "该定时任务的飞书消息推送配置未启用",
+                        "sent_count": 0,
+                        "failed_count": 0,
+                        "sent": [],
+                        "failed": [],
+                    }
+                task_notify = raw_fn
+
+    # 规范化目标列表
+    chat_ids_to_send: list[str] = []
+    if request.chat_id and request.chat_id.strip():
+        chat_ids_to_send.append(request.chat_id.strip())
+    for cid in request.chat_ids:
+        c = cid.strip()
+        if c and c not in chat_ids_to_send:
+            chat_ids_to_send.append(c)
+    if not chat_ids_to_send and task_notify:
+        for cid in task_notify.get("chat_ids") or []:
+            c = str(cid).strip()
+            if c and c not in chat_ids_to_send:
+                chat_ids_to_send.append(c)
+        if task_notify.get("chat_id") and str(task_notify["chat_id"]).strip():
+            c = str(task_notify["chat_id"]).strip()
+            if c not in chat_ids_to_send:
+                chat_ids_to_send.append(c)
+
+    webhooks_to_send: list[str] = []
+    if request.webhook_url and request.webhook_url.strip():
+        webhooks_to_send.append(request.webhook_url.strip())
+    for wh in request.webhooks:
+        w = wh.strip()
+        if w and w not in webhooks_to_send:
+            webhooks_to_send.append(w)
+    if not webhooks_to_send and task_notify:
+        for wh in task_notify.get("webhooks") or []:
+            w = str(wh).strip()
+            if w and w not in webhooks_to_send:
+                webhooks_to_send.append(w)
+        if task_notify.get("webhook_url") and str(task_notify["webhook_url"]).strip():
+            w = str(task_notify["webhook_url"]).strip()
+            if w not in webhooks_to_send:
+                webhooks_to_send.append(w)
+
+    open_ids_to_send = [oid.strip() for oid in request.open_ids if oid.strip()]
+    if not open_ids_to_send and task_notify:
+        for oid in task_notify.get("open_ids") or []:
+            o = str(oid).strip()
+            if o and o not in open_ids_to_send:
+                open_ids_to_send.append(o)
+
+    raw_mobiles = [m.strip() for m in request.mobiles if str(m).strip()]
+    if not raw_mobiles and task_notify:
+        for m in task_notify.get("mobiles") or []:
+            ms = str(m).strip()
+            if ms and ms not in raw_mobiles:
+                raw_mobiles.append(ms)
+
+    mobiles_to_send: list[str] = []
+    for item in raw_mobiles:
+        if item.startswith("ou_") or item.startswith("on_"):
+            if item not in open_ids_to_send:
+                open_ids_to_send.append(item)
+        else:
+            if item not in mobiles_to_send:
+                mobiles_to_send.append(item)
+
+    emails_to_send = [e.strip() for e in request.emails if e.strip()]
+
+    has_app_targets = bool(chat_ids_to_send or open_ids_to_send or mobiles_to_send or emails_to_send)
+    has_webhook_targets = bool(webhooks_to_send)
+
+    if not has_app_targets and not has_webhook_targets:
+        return {
+            "ok": False,
+            "error": "未提供任何有效的推送目标（chat_ids、webhooks、mobiles、emails 或 open_ids）",
+            "sent_count": 0,
+            "failed_count": 0,
+            "sent": [],
+            "failed": [],
+        }
+
+    card_content = request.card
+    if isinstance(card_content, dict) and "card" in card_content and isinstance(card_content["card"], dict):
+        card_content = card_content["card"]
+
+    sent_results: list[dict[str, Any]] = []
+    failed_results: list[dict[str, Any]] = []
+
+    # 2. 发送自定义群机器人 Webhooks
+    for wh in webhooks_to_send:
+        try:
+            wh_payload = {
+                "msg_type": "interactive",
+                "card": card_content,
+            }
+            resp = requests.post(wh, json=wh_payload, timeout=15)
+            if resp.status_code == 200:
+                resp_json = {}
+                try:
+                    resp_json = resp.json()
+                except Exception:  # noqa: BLE001
+                    resp_json = {}
+                if resp_json.get("code") in (None, 0):
+                    sent_results.append({
+                        "target_type": "webhook",
+                        "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
+                        "url": wh,
+                        "message_id": resp_json.get("data", {}).get("message_id") or "webhook_ok",
+                    })
+                else:
+                    failed_results.append({
+                        "target_type": "webhook",
+                        "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
+                        "error": f"Webhook 返回错误码 {resp_json.get('code')}: {resp_json.get('msg')}",
+                    })
+            else:
+                failed_results.append({
+                    "target_type": "webhook",
+                    "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
+                    "error": f"Webhook 请求返回 HTTP {resp.status_code}: {resp.text[:150]}",
+                })
+        except Exception as exc:  # noqa: BLE001
+            failed_results.append({
+                "target_type": "webhook",
+                "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
+                "error": str(exc),
+            })
+
+    # 3. 发送企业自建应用通道 (群聊与个人私聊)
+    if has_app_targets:
+        binding, binding_error = _resolve_notify_binding(db, request)
+
+        if binding is None:
+            err_msg = binding_error or f"未找到租户 {request.tenant_id} 有效的飞书应用绑定，请先在渠道管理中配置"
+            if not has_webhook_targets:
+                return {
+                    "ok": False,
+                    "error": err_msg,
+                    "sent_count": 0,
+                    "failed_count": 0,
+                    "sent": [],
+                    "failed": [],
+                }
+            for cid in chat_ids_to_send:
+                failed_results.append({"target_type": "chat_id", "identifier": cid, "error": err_msg})
+            for m in mobiles_to_send:
+                failed_results.append({"target_type": "user_mobile", "identifier": m, "error": err_msg})
+        else:
+            adapter = FeishuAdapter()
+            app_targets: list[dict[str, Any]] = []
+
+            for cid in chat_ids_to_send:
+                app_targets.append({
+                    "target_type": "chat_id",
+                    "receive_id": cid,
+                    "receive_id_type": "chat_id",
+                    "identifier": cid,
+                })
+
+            for oid in open_ids_to_send:
+                app_targets.append({
+                    "target_type": "open_id",
+                    "receive_id": oid,
+                    "receive_id_type": "open_id",
+                    "identifier": oid,
+                })
+
+            if mobiles_to_send:
+                resolved_mobiles = adapter.resolve_open_ids_by_mobiles(binding, mobiles_to_send)
+                for m in mobiles_to_send:
+                    oid = resolved_mobiles.get(m)
+                    if oid:
+                        app_targets.append({
+                            "target_type": "user_mobile",
+                            "receive_id": oid,
+                            "receive_id_type": "open_id",
+                            "identifier": m,
+                        })
+                    else:
+                        failed_results.append({
+                            "target_type": "user_mobile",
+                            "identifier": m,
+                            "error": (
+                                f"手机号 {m} 无法在飞书通讯录解析（应用缺少 contact:user.phone:readonly 权限或号码未在应用可用范围内）。"
+                                f"建议在配置中直接填写 OpenID（形如 ou_xxx）或选择已绑定的飞书账号。"
+                            ),
+                        })
+
+            for email in emails_to_send:
+                resolved_open_id = adapter.resolve_open_id_by_mobile_or_email(binding, email=email)
+                if resolved_open_id:
+                    app_targets.append({
+                        "target_type": "user_email",
+                        "receive_id": resolved_open_id,
+                        "receive_id_type": "open_id",
+                        "identifier": email,
+                    })
+                else:
+                    failed_results.append({
+                        "target_type": "user_email",
+                        "identifier": email,
+                        "error": f"通讯录无法反查到邮箱 {email} 对应的 OpenID，请检查通讯录权限或邮箱是否正确",
+                    })
+
+            for t in app_targets:
+                try:
+                    msg_id = adapter.create_card(
+                        binding=binding,
+                        target={"receive_id": t["receive_id"], "receive_id_type": t["receive_id_type"]},
+                        card_json=card_content,
+                        idempotency_key=f"feishu_notify_{uuid4().hex}",
+                    )
+                    sent_results.append({
+                        "target_type": t["target_type"],
+                        "identifier": t["identifier"],
+                        "receive_id": t["receive_id"],
+                        "message_id": msg_id,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    failed_results.append({
+                        "target_type": t["target_type"],
+                        "identifier": t["identifier"],
+                        "error": str(exc),
+                    })
+
+    return {
+        "ok": len(sent_results) > 0,
+        "sent_count": len(sent_results),
+        "failed_count": len(failed_results),
+        "sent": sent_results,
+        "failed": failed_results,
+    }
+

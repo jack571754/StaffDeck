@@ -7,10 +7,10 @@ execution timing.
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from decimal import Decimal
 import hashlib
 import time
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from sqlmodel import Session
@@ -111,6 +111,16 @@ def _validate_params(params: dict[str, Any], params_def: list[dict[str, Any]]) -
                     f"Parameter {name!r} must be a boolean, got {type(value).__name__}"
                 )
         elif ptype == "date":
+            # Dynamic date macro translation
+            if isinstance(value, str):
+                v_lower = value.strip().lower()
+                if v_lower in ("今天", "today", "@today", "now", "当前"):
+                    value = datetime.now(UTC).strftime("%Y-%m-%d")
+                elif v_lower in ("昨天", "yesterday", "@yesterday"):
+                    value = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+                elif v_lower in ("前天", "before_yesterday"):
+                    value = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
+
             # Validate YYYY-MM-DD format
             if not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-":
                 raise ValueError(

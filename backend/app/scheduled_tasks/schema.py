@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-
 
 ScheduleType = Literal["once", "daily", "weekly", "monthly", "interval"]
 ScheduledTaskStatus = Literal["active", "paused", "completed", "archived"]
@@ -16,18 +15,20 @@ class ScheduledTaskBase(BaseModel):
     agent_id: str
     title: str
     prompt: str
-    description: Optional[str] = None
+    description: str | None = None
     schedule_type: ScheduleType = "daily"
     schedule: dict[str, Any] = Field(default_factory=dict)
     timezone: str = "Asia/Shanghai"
-    rrule: Optional[str] = None
+    rrule: str | None = None
     status: ScheduledTaskStatus = "active"
     concurrency_policy: ConcurrencyPolicy = "forbid"
     misfire_policy: MisfirePolicy = "coalesce"
-    max_runs: Optional[int] = None
-    end_at: Optional[str] = None
-    source_session_id: Optional[str] = None
+    max_runs: int | None = None
+    end_at: str | None = None
+    source_session_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    execution_mode: str | None = "agent"
+    pipeline_steps: list[dict[str, Any]] | None = None
 
 
 class ScheduledTaskCreateRequest(ScheduledTaskBase):
@@ -36,28 +37,30 @@ class ScheduledTaskCreateRequest(ScheduledTaskBase):
 
 class ScheduledTaskUpdateRequest(BaseModel):
     tenant_id: str
-    agent_id: Optional[str] = None
-    title: Optional[str] = None
-    prompt: Optional[str] = None
-    description: Optional[str] = None
-    schedule_type: Optional[ScheduleType] = None
-    schedule: Optional[dict[str, Any]] = None
-    timezone: Optional[str] = None
-    rrule: Optional[str] = None
-    status: Optional[ScheduledTaskStatus] = None
-    concurrency_policy: Optional[ConcurrencyPolicy] = None
-    misfire_policy: Optional[MisfirePolicy] = None
-    max_runs: Optional[int] = None
-    end_at: Optional[str] = None
-    metadata: Optional[dict[str, Any]] = None
+    agent_id: str | None = None
+    title: str | None = None
+    prompt: str | None = None
+    description: str | None = None
+    schedule_type: ScheduleType | None = None
+    schedule: dict[str, Any] | None = None
+    timezone: str | None = None
+    rrule: str | None = None
+    status: ScheduledTaskStatus | None = None
+    concurrency_policy: ConcurrencyPolicy | None = None
+    misfire_policy: MisfirePolicy | None = None
+    max_runs: int | None = None
+    end_at: str | None = None
+    metadata: dict[str, Any] | None = None
+    execution_mode: str | None = None
+    pipeline_steps: list[dict[str, Any]] | None = None
 
 
 class ScheduledTaskDraftRequest(BaseModel):
     tenant_id: str
     agent_id: str
-    session_id: Optional[str] = None
+    session_id: str | None = None
     message: str
-    timezone: Optional[str] = None
+    timezone: str | None = None
 
 
 class ScheduledTaskDraftRead(BaseModel):
@@ -66,14 +69,14 @@ class ScheduledTaskDraftRead(BaseModel):
     agent_id: str
     title: str = ""
     prompt: str = ""
-    description: Optional[str] = None
+    description: str | None = None
     schedule_type: ScheduleType = "daily"
     schedule: dict[str, Any] = Field(default_factory=dict)
     timezone: str = "Asia/Shanghai"
-    rrule: Optional[str] = None
+    rrule: str | None = None
     confidence: float = 0.0
-    reason: Optional[str] = None
-    source_session_id: Optional[str] = None
+    reason: str | None = None
+    source_session_id: str | None = None
 
 
 class ScheduledTaskRead(BaseModel):
@@ -83,22 +86,24 @@ class ScheduledTaskRead(BaseModel):
     created_by_user_id: str
     title: str
     prompt: str
-    description: Optional[str] = None
+    description: str | None = None
     schedule_type: str
     schedule: dict[str, Any] = Field(default_factory=dict)
     timezone: str
-    rrule: Optional[str] = None
+    rrule: str | None = None
     status: str
     concurrency_policy: str
     misfire_policy: str
-    max_runs: Optional[int] = None
-    end_at: Optional[str] = None
-    next_run_at: Optional[str] = None
-    last_run_at: Optional[str] = None
-    last_status: Optional[str] = None
+    max_runs: int | None = None
+    end_at: str | None = None
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    last_status: str | None = None
     run_count: int
-    source_session_id: Optional[str] = None
+    source_session_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    execution_mode: str = "agent"
+    pipeline_steps: list[dict[str, Any]] = Field(default_factory=list)
     created_at: str
     updated_at: str
 
@@ -109,17 +114,17 @@ class ScheduledTaskRunRead(BaseModel):
     id: str
     tenant_id: str
     scheduled_task_id: str
-    task_title: Optional[str] = None
-    task_status: Optional[str] = None
+    task_title: str | None = None
+    task_status: str | None = None
     agent_id: str
     user_id: str
-    session_id: Optional[str] = None
+    session_id: str | None = None
     scheduled_for: str
     status: str
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    result_summary: Optional[str] = None
-    error: Optional[str] = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    result_summary: str | None = None
+    error: str | None = None
     trace: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str

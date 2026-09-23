@@ -46,6 +46,9 @@ class HarnessToolContext:
     workspace_root: Path
     task_frame_id: str | None = None
     tenant_id: str | None = None
+    # Set only when this frame belongs to a scheduled task; forwarded to skill
+    # subprocesses as STAFFDECK_TASK_ID so they can report their origin.
+    scheduled_task_id: str | None = None
     limits: HarnessLimits = field(default_factory=HarnessLimits)
     # Internal/direct callers preserve the fail-closed historical behavior.
     # Tenant runtime code always passes the administrator's explicit setting.

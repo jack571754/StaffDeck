@@ -159,3 +159,104 @@ def test_run_skill_script_propagates_structured_business_failure(
     assert result.data["ok"] is False
     assert result.data["status"] == "failed"
     assert result.data["structured_result"]["push_status"] == "failed"
+
+
+def test_run_skill_script_forwards_scheduled_task_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """定时任务上下文以非密环境变量下传，供服务端解析该任务所选飞书应用。"""
+
+    package = tmp_path / ".harness" / "skill-packages" / "demo-digest"
+    package.mkdir(parents=True)
+    script = package / "runner.py"
+    script.write_text("print('ok')", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        skill_script_module,
+        "run_sandboxed_process",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or SimpleNamespace(
+                returncode=0,
+                timed_out=False,
+                stdout=b"ok\n",
+                stderr=b"",
+                stdout_bytes=3,
+                stderr_bytes=0,
+                output_truncated=False,
+                duration_ms=5,
+                isolation_mode="test",
+            )
+        ),
+    )
+    registry = register_skill_script_tools(HarnessRegistry())
+
+    HarnessExecutor(registry).execute(
+        HarnessToolContext(
+            run_id="run-test-task-env",
+            workspace_root=tmp_path.resolve(),
+            tenant_id="tenant_demo",
+            scheduled_task_id="task_price",
+            sandbox_enabled=False,
+        ),
+        HarnessToolCall(
+            call_id="call-test-task-env",
+            name="run_skill_script",
+            arguments={"script_path": script.relative_to(tmp_path).as_posix()},
+        ),
+    )
+
+    assert captured["env"] == {
+        "STAFFDECK_TASK_ID": "task_price",
+        "STAFFDECK_TENANT_ID": "tenant_demo",
+    }
+
+
+def test_run_skill_script_omits_task_env_for_ordinary_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通会话不携带任务标识，避免污染技能脚本的环境判断。"""
+
+    package = tmp_path / ".harness" / "skill-packages" / "demo-digest"
+    package.mkdir(parents=True)
+    script = package / "runner.py"
+    script.write_text("print('ok')", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        skill_script_module,
+        "run_sandboxed_process",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or SimpleNamespace(
+                returncode=0,
+                timed_out=False,
+                stdout=b"ok\n",
+                stderr=b"",
+                stdout_bytes=3,
+                stderr_bytes=0,
+                output_truncated=False,
+                duration_ms=5,
+                isolation_mode="test",
+            )
+        ),
+    )
+    registry = register_skill_script_tools(HarnessRegistry())
+
+    HarnessExecutor(registry).execute(
+        HarnessToolContext(
+            run_id="run-test-plain-env",
+            workspace_root=tmp_path.resolve(),
+            sandbox_enabled=False,
+        ),
+        HarnessToolCall(
+            call_id="call-test-plain-env",
+            name="run_skill_script",
+            arguments={"script_path": script.relative_to(tmp_path).as_posix()},
+        ),
+    )
+
+    assert captured["env"] == {}

@@ -64,6 +64,17 @@ _READ_ONLY_SYSTEM_PATHS = (
     "/etc/ssl/certs",
 )
 _SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Non-secret context a skill subprocess may see. Credentials (APP_SECRET, internal
+# tokens, provider API keys) must never be added here.
+_SKILL_CONTEXT_ENV_KEYS = frozenset(
+    {
+        "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG", "SKILL_NAME",
+        "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
+        "STAFFDECK_TASK_ID", "STAFFDECK_TENANT_ID",
+    }
+)
+
+
 class ExecCommandArguments(BaseModel):
     """Typed arguments for the isolated Bash command capability."""
 
@@ -810,10 +821,7 @@ def _bubblewrap_argv(
     allowed_env = {
         key: value
         for key, value in (env or {}).items()
-        if key in {
-            "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG", "SKILL_NAME",
-            "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
-        }
+        if key in _SKILL_CONTEXT_ENV_KEYS
     }
     for key, value in allowed_env.items():
         if len(value) <= 16 * 1024:
@@ -849,11 +857,7 @@ def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
     allowed = {
         key: value
         for key, value in (env or {}).items()
-        if key in {
-            "PATH", "HOME", "PWD", "TMPDIR", "LANG", "LC_ALL",
-            "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG",
-            "SKILL_NAME", "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
-        }
+        if key in _SKILL_CONTEXT_ENV_KEYS | {"PATH", "HOME", "PWD", "TMPDIR", "LANG", "LC_ALL"}
     }
     return {**baseline, **allowed}
 

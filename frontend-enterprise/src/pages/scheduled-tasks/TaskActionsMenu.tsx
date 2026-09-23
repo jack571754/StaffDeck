@@ -12,6 +12,7 @@ import IconMore from '../../assets/icons/more.svg?react';
 import IconPause from '../../assets/icons/pause.svg?react';
 import IconPlay from '../../assets/icons/play.svg?react';
 import IconTrash from '../../assets/icons/trash.svg?react';
+import { Copy, Send } from 'lucide-react';
 import type { ScheduledTaskRead } from '../../types';
 
 const MENU_ITEM_CLASS =
@@ -25,6 +26,8 @@ export type TaskActionsMenuProps = {
   onEdit: (task: ScheduledTaskRead) => void;
   onRunNow: (task: ScheduledTaskRead) => void;
   onToggleStatus: (task: ScheduledTaskRead) => void;
+  onDuplicate: (task: ScheduledTaskRead) => void;
+  onTestNotify?: (task: ScheduledTaskRead) => void;
   onDelete: (task: ScheduledTaskRead) => void;
 };
 
@@ -35,6 +38,8 @@ export function TaskActionsMenu({
   onEdit,
   onRunNow,
   onToggleStatus,
+  onDuplicate,
+  onTestNotify,
   onDelete,
 }: TaskActionsMenuProps) {
   const isArchived = task.status === 'archived';
@@ -61,6 +66,16 @@ export function TaskActionsMenu({
               <IconEdit />
               编辑
             </DropdownMenuItem>
+            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onDuplicate(task)}>
+              <Copy className="size-3.5" />
+              复制任务
+            </DropdownMenuItem>
+            {onTestNotify && (
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onTestNotify(task)}>
+                <Send className="size-3.5" />
+                测试推送
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => onRunNow(task)}>
               <IconPlay />
               立即执行
