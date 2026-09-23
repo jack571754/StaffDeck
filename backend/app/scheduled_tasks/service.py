@@ -394,6 +394,12 @@ def execute_scheduled_task(
         return skipped
     run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
     if run.status != "running" or not run.session_id:
+        if not manual and task.lease_owner is not None:
+            task.lease_owner = None
+            task.lease_until = None
+            db.add(task)
+            db.commit()
+            db.refresh(task)
         return run
     return _execute_prepared_scheduled_task(db, task, run, manual=manual)
 
@@ -416,6 +422,12 @@ def start_scheduled_task_async(
             args=(task.id, run.id, manual),
             daemon=True,
         ).start()
+    elif not manual and task.lease_owner is not None:
+        task.lease_owner = None
+        task.lease_until = None
+        db.add(task)
+        db.commit()
+        db.refresh(task)
     return run
 
 
@@ -441,6 +453,8 @@ def _prepare_scheduled_task_run(
             db.add(existing)
             db.commit()
             db.refresh(existing)
+        elif not manual and existing.status in {"succeeded", "failed", "skipped", "cancelled"}:
+            _advance_task_schedule_after_terminal(db, task, scheduled_for)
         return existing
     if task.concurrency_policy == "forbid":
         running = db.exec(
@@ -487,6 +501,9 @@ def _prepare_scheduled_task_run(
                 run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
                 run.finished_at = utc_now()
                 _finish_task_schedule(db, task, scheduled_for, "skipped", manual)
+                task.lease_owner = None
+                task.lease_until = None
+                db.add(task)
                 db.add(run)
                 db.commit()
                 db.refresh(run)
@@ -543,6 +560,8 @@ def _skip_misfired_run(
         )
     ).first()
     if existing:
+        if not manual and existing.status in {"succeeded", "failed", "skipped", "cancelled"}:
+            _advance_task_schedule_after_terminal(db, task, scheduled_for)
         return existing
     run = _create_run(db, task, scheduled_for, "skipped")
     run.error = "计划执行时间已超过补偿窗口，已按 skip 策略跳过。"
@@ -564,6 +583,20 @@ def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, ma
         if not task or not run:
             return
         _execute_prepared_scheduled_task(db, task, run, manual=manual)
+
+
+def _turn_budget_seconds(task: ScheduledTask) -> int | None:
+    """interval 任务的单轮执行预算 = 周期的 0.8 倍，下限 30s。
+
+    单轮若超出预算将被 Harness 按 deadline 收尾并推进 next_run_at，而不是
+    长时间占住 worker 并触发 forbid 跳过。非 interval 任务无固定周期，不注入。
+    """
+    if task.schedule_type != "interval":
+        return None
+    interval_seconds = int((task.schedule_json or {}).get("interval_seconds") or 0)
+    if interval_seconds <= 0:
+        return None
+    return max(30, int(interval_seconds * 0.8))
 
 
 def _execute_prepared_scheduled_task(
@@ -594,6 +627,7 @@ def _execute_prepared_scheduled_task(
             interaction_mode="scheduled_task",
             forced_sop_id=_scheduled_task_sop_id(task),
             forced_sop_snapshot=_scheduled_task_sop_snapshot(task),
+            turn_budget_seconds=_turn_budget_seconds(task),
             client_timezone=task.timezone,
         )
         result: ChatTurnResponse | None = None
@@ -1138,6 +1172,33 @@ def _finish_task_schedule(db: Session, task: ScheduledTask, scheduled_for: datet
                 # must remain retryable instead of disappearing as completed.
                 task.status = "completed" if status == "succeeded" else "paused"
     db.add(task)
+
+
+def _advance_task_schedule_after_terminal(
+    db: Session,
+    task: ScheduledTask,
+    scheduled_for: datetime,
+) -> None:
+    now = utc_now()
+    schedule_after = scheduled_for + timedelta(seconds=1)
+    if task.misfire_policy in {"coalesce", "skip"}:
+        schedule_after = max(schedule_after, now)
+    next_run = compute_next_run_at(task, after=schedule_after)
+    if (task.max_runs is not None and task.run_count >= task.max_runs) or (
+        task.end_at and next_run and next_run > task.end_at
+    ):
+        task.status = "completed"
+        task.next_run_at = None
+    else:
+        task.next_run_at = next_run
+        if task.schedule_type == "once" and next_run is None:
+            task.status = "completed"
+    task.lease_owner = None
+    task.lease_until = None
+    task.updated_at = now
+    db.add(task)
+    db.commit()
+    db.refresh(task)
 
 
 def _detect_with_llm(

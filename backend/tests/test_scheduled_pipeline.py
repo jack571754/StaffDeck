@@ -149,8 +149,12 @@ def test_pipeline_execution_step_failure(db_session: Session):
     db_session.refresh(run)
     assert run.status == "failed"
     assert "Query template not found" in (run.error or "")
-    # Second step should not have been called
-    assert not mock_post.called
+    # 正常播报未到达 notify 步骤；webhook 只收到失败告警（P0-3 失败可见性），
+    # 而非正常播报文本。
+    assert mock_post.called
+    alert_text = mock_post.call_args.kwargs["json"]["content"]["text"]
+    assert "Query template not found" in alert_text
+    assert "女装" not in alert_text
 
 
 def test_service_dispatches_pipeline_mode(db_session: Session):
