@@ -101,9 +101,55 @@ class BaseConnector:
         """
         raise NotImplementedError
 
+    def list_tables(self) -> list[dict[str, Any]]:
+        """List tables available in the data source.
+
+        Returns:
+            A list of dicts with keys ``name``, ``comment``, and
+            ``row_count_estimate``.
+        """
+        raise NotImplementedError
+
+    def describe_table(self, table: str) -> list[dict[str, Any]]:
+        """Return column definitions and metadata for *table*.
+
+        Args:
+            table: Table identifier.
+
+        Returns:
+            A list of dicts with keys ``name``, ``data_type``, ``column_type``,
+            ``is_nullable``, and ``comment``.
+        """
+        raise NotImplementedError
+
+    def preview_table(self, table: str, limit: int = 20) -> QueryResult:
+        """Fetch sample rows from *table* with a strict limit.
+
+        Args:
+            table: Table identifier.
+            limit: Number of sample rows (capped by connector).
+
+        Returns:
+            A :class:`QueryResult` with columns and sample rows.
+        """
+        raise NotImplementedError
+
+    def explain(self, sql: str, params: dict[str, Any]) -> QueryResult:
+        """Explain query execution plan for dry-run or diagnostic inspection.
+
+        Args:
+            sql: The query statement.
+            params: Query parameter mappings.
+
+        Returns:
+            A :class:`QueryResult` representing the plan.
+        """
+        raise NotImplementedError
+
     def close(self) -> None:
         """Release any resources held by the connector (connections, etc.).
 
         Subclasses should override if they hold open resources.
         """
         self._connected = False
+

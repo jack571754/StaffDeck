@@ -406,7 +406,7 @@ export type ToolRead = {
   description?: string;
   capability_scope?: CapabilityScope;
   bucket: string;
-  tool_type: 'http' | 'a2a' | 'mcp' | string;
+  tool_type: 'http' | 'a2a' | 'mcp' | 'data_query' | 'data_query_source' | string;
   method: string;
   url: string;
   headers: Record<string, unknown>;
@@ -428,6 +428,7 @@ export type ToolRead = {
   output_schema: Record<string, unknown>;
   allowed_skills: string[];
   mcp_server_id?: string | null;
+  data_source_id?: string | null;
   enabled: boolean;
   metadata?: Record<string, unknown>;
   created_at: string;

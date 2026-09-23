@@ -13,10 +13,14 @@ export interface DataSource {
   type: string;
   read_only: boolean;
   status: string;
+  allowed_tables_json?: string[];
+  schema_cache_json?: Record<string, unknown>;
+  schema_refreshed_at?: string | null;
   last_test_at: string | null;
   created_at: string;
   updated_at: string;
 }
+
 
 export interface DataSourceCreate {
   name: string;
@@ -25,7 +29,9 @@ export interface DataSourceCreate {
   config_json: Record<string, unknown>;
   read_only?: boolean;
   status?: string;
+  allowed_tables_json?: string[];
 }
+
 
 export interface DataSourceUpdate {
   name?: string;
@@ -34,7 +40,48 @@ export interface DataSourceUpdate {
   config_json?: Record<string, unknown>;
   read_only?: boolean;
   status?: string;
+  allowed_tables_json?: string[];
 }
+
+export interface TableSummary {
+  name: string;
+  comment: string;
+  row_count_estimate: number;
+}
+
+export interface ColumnMeta {
+  name: string;
+  data_type: string;
+  column_type: string;
+  is_nullable: boolean;
+  comment: string;
+}
+
+export interface TablePreviewResult {
+  table: string;
+  columns: string[];
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+}
+
+export interface AdhocTestRequest {
+  data_source_id: string;
+  query_content: string;
+  query_type?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface QueryTemplateVersion {
+  id: string;
+  tenant_id: string;
+  template_id: string;
+  version: number;
+  snapshot_json: Record<string, unknown>;
+  change_reason: string;
+  created_by?: string | null;
+  created_at: string;
+}
+
 
 export interface QueryTemplate {
   id: string;
@@ -50,6 +97,14 @@ export interface QueryTemplate {
   timeout_seconds: number;
   max_rows: number;
   status: string;
+  tool_id?: string | null;
+  origin_nl?: string | null;
+  business_notes?: string;
+  dimensions_json?: string[];
+  metrics_json?: string[];
+  example_questions_json?: string[];
+  evolution_version?: number;
+  generated_by?: string;
   created_at: string;
   updated_at: string;
 }
@@ -66,6 +121,14 @@ export interface QueryTemplateCreate {
   timeout_seconds?: number;
   max_rows?: number;
   status?: string;
+  tool_id?: string | null;
+  origin_nl?: string | null;
+  business_notes?: string;
+  dimensions_json?: string[];
+  metrics_json?: string[];
+  example_questions_json?: string[];
+  evolution_version?: number;
+  generated_by?: string;
 }
 
 export interface QueryTemplateUpdate {
@@ -80,7 +143,16 @@ export interface QueryTemplateUpdate {
   timeout_seconds?: number;
   max_rows?: number;
   status?: string;
+  tool_id?: string | null;
+  origin_nl?: string | null;
+  business_notes?: string;
+  dimensions_json?: string[];
+  metrics_json?: string[];
+  example_questions_json?: string[];
+  evolution_version?: number;
+  generated_by?: string;
 }
+
 
 export interface QueryExecuteResult {
   template_id: string;
@@ -111,7 +183,20 @@ export const dataSourcesApi = {
 
   test: (id: string): Promise<{ success: boolean; message: string }> =>
     api.post(`${BASE}/data-sources/${id}/test?${tenantParam()}`),
+
+  getTables: (id: string): Promise<TableSummary[]> =>
+    api.get<TableSummary[]>(`${BASE}/data-sources/${id}/tables?${tenantParam()}`),
+
+  getColumns: (id: string, table: string): Promise<ColumnMeta[]> =>
+    api.get<ColumnMeta[]>(`${BASE}/data-sources/${id}/tables/${encodeURIComponent(table)}?${tenantParam()}`),
+
+  previewTable: (id: string, table: string, limit = 20): Promise<TablePreviewResult> =>
+    api.get<TablePreviewResult>(`${BASE}/data-sources/${id}/tables/${encodeURIComponent(table)}/preview?${tenantParam()}&limit=${limit}`),
+
+  refreshSchema: (id: string): Promise<Record<string, unknown>> =>
+    api.post<Record<string, unknown>>(`${BASE}/data-sources/${id}/schema/refresh?${tenantParam()}`),
 };
+
 
 // --- Query Templates API ---
 
@@ -139,7 +224,23 @@ export const queryTemplatesApi = {
       `${BASE}/query-templates/${id}/test?${tenantParam()}`,
       { params }
     ),
+
+  listByTool: (toolId: string, status?: string): Promise<QueryTemplate[]> => {
+    const params = [tenantParam()];
+    if (status) params.push(`status=${encodeURIComponent(status)}`);
+    return api.get<QueryTemplate[]>(`/api/enterprise/tools/${encodeURIComponent(toolId)}/skills?${params.join('&')}`);
+  },
+
+  adhocTest: (data: AdhocTestRequest): Promise<QueryExecuteResult> =>
+    api.post<QueryExecuteResult>(`${BASE}/query-templates/adhoc-test?${tenantParam()}`, data),
+
+  getVersions: (id: string): Promise<QueryTemplateVersion[]> =>
+    api.get<QueryTemplateVersion[]>(`${BASE}/query-templates/${id}/versions?${tenantParam()}`),
+
+  rollbackVersion: (id: string, version: number): Promise<QueryTemplate> =>
+    api.post<QueryTemplate>(`${BASE}/query-templates/${id}/versions/${version}/rollback?${tenantParam()}`),
 };
+
 
 // --- Execute API ---
 

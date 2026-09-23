@@ -165,6 +165,22 @@ class HttpApiConnector(BaseConnector):
 
         return _normalize_json_response(data, max_rows=max_rows)
 
+    def list_tables(self) -> list[dict[str, Any]]:
+        """HTTP data sources do not have tables; return an empty list."""
+        return []
+
+    def describe_table(self, table: str) -> list[dict[str, Any]]:
+        """HTTP data sources do not have schema tables; return an empty list."""
+        return []
+
+    def preview_table(self, table: str, limit: int = 20) -> QueryResult:
+        """HTTP data sources do not support table previews; return empty result."""
+        return QueryResult(columns=[], rows=[], row_count=0)
+
+    def explain(self, sql: str, params: dict[str, Any]) -> QueryResult:
+        """Probe the HTTP endpoint with max_rows=1 to discover schema."""
+        return self.execute(sql, params, timeout=10, max_rows=1)
+
     def close(self) -> None:
         """Release the underlying httpx client."""
         if self._client is not None:
@@ -174,6 +190,7 @@ class HttpApiConnector(BaseConnector):
                 pass
             self._client = None
         super().close()
+
 
 
 # -- JSON normalization ------------------------------------------------------

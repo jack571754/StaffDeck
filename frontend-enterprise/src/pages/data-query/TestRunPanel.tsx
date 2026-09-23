@@ -26,8 +26,11 @@ const CARD_TITLE_CLASS = 'text-[14px] font-medium text-[#18181a]';
 const FIELD_LABEL_CLASS = 'text-[12px] font-medium text-[#464c5e]';
 
 export interface TestRunPanelProps {
-  templateId: string | null;
+  templateId?: string | null;
   params: QueryParam[];
+  dataSourceId?: string | null;
+  queryContent?: string;
+  queryType?: string;
 }
 
 /**
@@ -53,7 +56,13 @@ function getDefaultValue(param: QueryParam): unknown {
  * 测试运行面板组件
  * 动态生成参数输入、运行测试、展示结果
  */
-export default function TestRunPanel({ templateId, params }: TestRunPanelProps) {
+export default function TestRunPanel({
+  templateId,
+  params,
+  dataSourceId,
+  queryContent,
+  queryType = 'sql',
+}: TestRunPanelProps) {
   const [paramValues, setParamValues] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<QueryExecuteResult | null>(null);
@@ -84,9 +93,12 @@ export default function TestRunPanel({ templateId, params }: TestRunPanelProps) 
     setParamValues((prev) => ({ ...prev, [name]: value }));
   };
 
+  const isAdhoc = !templateId && Boolean(dataSourceId && queryContent?.trim());
+  const canRun = (Boolean(templateId) || isAdhoc) && !loading;
+
   const handleRun = async () => {
-    if (!templateId) {
-      notify.error('请先保存模板');
+    if (!templateId && !isAdhoc) {
+      notify.error('请提供已保存模板或填写 SQL 与数据源进行试跑');
       return;
     }
 
@@ -95,7 +107,17 @@ export default function TestRunPanel({ templateId, params }: TestRunPanelProps) 
     setResult(null);
 
     try {
-      const data = await queryTemplatesApi.test(templateId, mergedParamValues);
+      let data: QueryExecuteResult;
+      if (templateId) {
+        data = await queryTemplatesApi.test(templateId, mergedParamValues);
+      } else {
+        data = await queryTemplatesApi.adhocTest({
+          data_source_id: dataSourceId!,
+          query_content: queryContent!,
+          query_type: queryType,
+          params: mergedParamValues,
+        });
+      }
       setResult(data);
     } catch (err) {
       const message = err instanceof Error ? err.message : '运行失败';
@@ -105,15 +127,15 @@ export default function TestRunPanel({ templateId, params }: TestRunPanelProps) 
     }
   };
 
-  const canRun = templateId !== null && !loading;
-
   return (
     <section className={CARD_CLASS + ' overflow-hidden'}>
       {/* 标题栏 */}
       <div className="flex min-h-[54px] items-center justify-between gap-[12px] border-b border-[#eceef1] px-[20px] py-[10px]">
-        <div className={'min-w-0 ' + CARD_TITLE_CLASS}>测试运行</div>
+        <div className={'min-w-0 ' + CARD_TITLE_CLASS}>
+          {isAdhoc ? '临时试跑 (Ad-hoc)' : '测试运行'}
+        </div>
         <div className="flex shrink-0 items-center gap-[6px]">
-          {!templateId ? (
+          {!canRun ? (
             <Tooltip>
               <TooltipTrigger asChild>
                 <span tabIndex={0}>
@@ -123,7 +145,13 @@ export default function TestRunPanel({ templateId, params }: TestRunPanelProps) 
                   </Button>
                 </span>
               </TooltipTrigger>
-              <TooltipContent>请先保存模板</TooltipContent>
+              <TooltipContent>
+                {!templateId && !dataSourceId
+                  ? '请选择数据源'
+                  : !templateId && !queryContent?.trim()
+                  ? '请填写 SQL 后试跑'
+                  : '请先保存模板'}
+              </TooltipContent>
             </Tooltip>
           ) : (
             <Button variant="default" size="xs" onClick={handleRun} disabled={loading}>
@@ -135,13 +163,14 @@ export default function TestRunPanel({ templateId, params }: TestRunPanelProps) 
               ) : (
                 <>
                   <Play className="size-3.5" />
-                  运行测试
+                  {isAdhoc ? '试跑未保存 SQL' : '运行测试'}
                 </>
               )}
             </Button>
           )}
         </div>
       </div>
+
 
       {/* 内容区 */}
       <div className="flex flex-col gap-[12px] p-[12px]">

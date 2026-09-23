@@ -2,9 +2,10 @@ import { ApiOutlined, CheckOutlined, ExperimentOutlined, ToolOutlined } from '..
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Activity, Copy, FlaskConical, RotateCcw, TerminalSquare, Users, XCircle } from 'lucide-react';
+import { Activity, Copy, Database, FlaskConical, RotateCcw, TerminalSquare, Users, XCircle } from 'lucide-react';
 import { pinyin } from 'pinyin-pro';
 
+import { dataSourcesApi, type DataSource } from '@/api/data-query';
 import { api, TENANT_ID } from '../api/client';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
@@ -69,6 +70,7 @@ import {
 import { useClientPagination } from '../hooks/useClientPagination';
 import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
+import type { BadgeTone } from './scheduled-tasks/shared';
 import type {
   AgentProfileRead,
   A2ATaskRunRead,
@@ -92,7 +94,8 @@ type ToolPageProps = {
 const ENTERPRISE_AGENT_STORAGE_KEY = 'ultrarag_enterprise_agent_scope';
 const TOOL_PAGE_SIZE = 10;
 export const TOOL_FORM_INITIAL_VALUES = {
-  tool_type: 'http' as 'http' | 'a2a' | 'mcp',
+  tool_type: 'http' as 'http' | 'a2a' | 'mcp' | 'data_query_source' | 'data_query',
+  data_source_id: '',
   method: 'POST',
   enabled: true,
   bucket: '未分桶',
@@ -120,6 +123,7 @@ type ToolFormValues = typeof TOOL_FORM_INITIAL_VALUES & {
   description?: string;
   allowed_skills?: string;
   url?: string;
+  data_source_id?: string;
 };
 
 const TRANSPORT_OPTIONS: { value: MCPTransport; label: string; hint: string }[] = [
@@ -473,11 +477,18 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
           <IconMore className="size-3.5" />
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className={MENU_CONTENT_CLASS}>
-          {canManageCurrentScope && !isMcpChild && (
-            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/edit`)}>
-              <IconEdit />
-              编辑
+          {row.tool_type === 'data_query_source' ? (
+            <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}`)}>
+              <Database className="size-3.5" />
+              详情 / 技能管理
             </DropdownMenuItem>
+          ) : (
+            canManageCurrentScope && !isMcpChild && (
+              <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/edit`)}>
+                <IconEdit />
+                编辑
+              </DropdownMenuItem>
+            )
           )}
           <DropdownMenuItem className={MENU_ITEM_CLASS} onSelect={() => navigate(`/enterprise/tools/${row.id}/test`)}>
             <FlaskConical />
@@ -508,8 +519,21 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       width: 200,
       className: 'text-[#18181a]',
       render: (row) => (
-        <div className="flex min-w-0 flex-col gap-[2px]">
-          <span className="truncate font-medium leading-[18px] text-[#18181a]" title={row.display_name || row.name}>
+        <div
+          className={cn('flex min-w-0 flex-col gap-[2px]', row.tool_type === 'data_query_source' && 'cursor-pointer')}
+          onClick={() => {
+            if (row.tool_type === 'data_query_source') {
+              navigate(`/enterprise/tools/${row.id}`);
+            }
+          }}
+        >
+          <span
+            className={cn(
+              'truncate font-medium leading-[18px] text-[#18181a]',
+              row.tool_type === 'data_query_source' && 'text-[#1a71ff] hover:underline',
+            )}
+            title={row.display_name || row.name}
+          >
             {row.display_name || row.name}
           </span>
           <span className="truncate text-[#858b9c]" title={row.name}>
@@ -529,7 +553,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       title: '类型',
       width: 90,
       render: (row) => (
-        <StatusBadge tone={row.tool_type === 'mcp' || row.tool_type === 'a2a' ? 'blue' : 'gray'}>{row.tool_type === 'mcp' ? 'MCP' : row.tool_type === 'a2a' ? 'A2A' : 'HTTP'}</StatusBadge>
+        <StatusBadge tone={toolTypeBadgeTone(row)}>{toolTypeLabel(row)}</StatusBadge>
       ),
     },
     {
@@ -674,8 +698,20 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
   const renderMobileCard = (row: ToolRead) => (
     <article className={MOBILE_CARD_CLASS} key={row.id}>
       <div className="flex min-w-0 items-start justify-between gap-[10px]">
-        <div className="min-w-0">
-          <strong className="block truncate text-[14px] font-semibold text-[#18181a]">
+        <div
+          className={cn('min-w-0 flex-1', row.tool_type === 'data_query_source' && 'cursor-pointer')}
+          onClick={() => {
+            if (row.tool_type === 'data_query_source') {
+              navigate(`/enterprise/tools/${row.id}`);
+            }
+          }}
+        >
+          <strong
+            className={cn(
+              'block truncate text-[14px] font-medium text-[#18181a]',
+              row.tool_type === 'data_query_source' && 'text-[#1a71ff]',
+            )}
+          >
             {row.display_name || row.name}
           </strong>
           <span className="mt-[2px] block truncate text-[12px] text-[#858b9c]">{row.name}</span>
@@ -685,7 +721,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       </div>
       <div className="mt-[8px] flex flex-wrap items-center gap-[6px]">
         <StatusBadge tone="gray">{row.bucket || '未分桶'}</StatusBadge>
-        <StatusBadge tone={row.tool_type === 'mcp' || row.tool_type === 'a2a' ? 'blue' : 'gray'}>{row.tool_type === 'mcp' ? 'MCP' : row.tool_type === 'a2a' ? 'A2A' : 'HTTP'}</StatusBadge>
+        <StatusBadge tone={toolTypeBadgeTone(row)}>{toolTypeLabel(row)}</StatusBadge>
         <CapabilityScopeBadge value={row.capability_scope} />
         <StatusBadge tone={row.enabled ? 'green' : 'gray'}>{row.enabled ? '已启用' : '已停用'}</StatusBadge>
       </div>
@@ -993,12 +1029,19 @@ export function McpServerEditPage(props: ToolPageProps = {}) {
  * 新建工具时顶部的类型切换条：HTTP 工具 / MCP 服务器。
  * 点击即跳转到对应的新建页，体验上像同一个「新建工具」流程里的分支。
  */
-function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a' | 'mcp'; onProtocolChange?: (protocol: 'http' | 'a2a') => void }) {
+function ToolTypeSwitcher({
+  active,
+  onProtocolChange,
+}: {
+  active: 'http' | 'a2a' | 'mcp' | 'data_query_source' | string;
+  onProtocolChange?: (protocol: 'http' | 'a2a' | 'data_query_source') => void;
+}) {
   const navigate = useNavigate();
-  const options: { value: 'http' | 'a2a' | 'mcp'; label: string; hint: string; to: string }[] = [
+  const options: { value: 'http' | 'a2a' | 'mcp' | 'data_query_source'; label: string; hint: string; to: string }[] = [
     { value: 'http', label: 'HTTP 工具', hint: '配置单个 HTTP 接口作为工具', to: '/enterprise/tools/new' },
-    { value: 'a2a', label: 'A2A Agent', hint: '通过 A2A SendMessage 调用远程智能体', to: '/enterprise/tools/new' },
+    { value: 'a2a', label: 'A2A Agent', hint: '通过 A2A SendMessage 调用远程智能体', to: '/enterprise/tools/new?type=a2a' },
     { value: 'mcp', label: 'MCP 服务器', hint: '连接 MCP Server，自动发现并同步其工具集', to: '/enterprise/tools/mcp/new' },
+    { value: 'data_query_source', label: '数据源查询工具（Data Source）', hint: '连接数据库/数据源，统一管理 SQL 查询技能，支持自然语言查数与技能自进化沉淀', to: '/enterprise/tools/new?type=data_query_source' },
   ];
   return (
     <div className="mb-[16px] flex flex-col gap-[8px]">
@@ -1011,9 +1054,13 @@ function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a'
               key={option.value}
               type="button"
               onClick={() => {
-                if (option.value === 'mcp') navigate(option.to);
-                else if (onProtocolChange) onProtocolChange(option.value);
-                else navigate(`${option.to}?type=${option.value}`);
+                if (option.value === 'mcp') {
+                  navigate(option.to);
+                } else if (onProtocolChange) {
+                  onProtocolChange(option.value);
+                } else {
+                  navigate(option.to);
+                }
               }}
               className={cn(
                 'relative flex min-w-[200px] flex-1 items-start gap-[10px] rounded-[12px] border px-[16px] py-[12px] text-left transition-all',
@@ -1029,7 +1076,7 @@ function ToolTypeSwitcher({ active, onProtocolChange }: { active: 'http' | 'a2a'
                   isActive ? 'bg-white/15 text-white' : 'bg-[#f2f3f7] text-[#757f9c]',
                 )}
               >
-                {option.value === 'mcp' ? <ApiOutlined className="size-[15px] shrink-0" /> : <IconTool className="size-[15px] shrink-0" />}
+                {option.value === 'mcp' ? <ApiOutlined className="size-[15px] shrink-0" /> : option.value === 'data_query_source' ? <Database className="size-[15px] shrink-0" /> : <IconTool className="size-[15px] shrink-0" />}
               </span>
               <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
                 <span className={cn('text-[13px] font-semibold', isActive ? 'text-white' : 'text-[#18181a]')}>
@@ -1061,7 +1108,9 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
   const [searchParams] = useSearchParams();
   const { toolId } = useParams();
   const isEdit = mode === 'edit';
-  const requestedToolType = searchParams.get('type') === 'a2a' ? 'a2a' : 'http';
+  const queryType = searchParams.get('type');
+  const requestedToolType: 'http' | 'a2a' | 'data_query_source' =
+    queryType === 'a2a' ? 'a2a' : queryType === 'data_query_source' ? 'data_query_source' : 'http';
 
   const setField = <K extends keyof ToolFormValues>(name: K, value: ToolFormValues[K]) =>
     setValues((prev) => ({ ...prev, [name]: value }));
@@ -1072,7 +1121,11 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
 
   useEffect(() => {
     if (!isEdit) {
-      setValues({ ...TOOL_FORM_INITIAL_VALUES, tool_type: requestedToolType });
+      setValues({
+        ...TOOL_FORM_INITIAL_VALUES,
+        tool_type: requestedToolType,
+        bucket: requestedToolType === 'data_query_source' ? '数据源查询工具' : '未分桶',
+      });
       setTool(null);
       return;
     }
@@ -1094,9 +1147,16 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       notify.error('请填写工具名称');
       return;
     }
-    if (!String(values.url || '').trim()) {
-      notify.error('请填写 URL');
-      return;
+    if (values.tool_type === 'data_query_source') {
+      if (!String(values.data_source_id || '').trim()) {
+        notify.error('请选择要绑定的只读数据源');
+        return;
+      }
+    } else {
+      if (!String(values.url || '').trim()) {
+        notify.error('请填写 URL');
+        return;
+      }
     }
     const payload = buildToolPayload(values);
     if (!payload) return;
@@ -1114,7 +1174,11 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
       setTool(saved);
       setValues(toolToFormValues(saved));
       if (!isEdit) {
-        navigate(`/enterprise/tools/${saved.id}/edit`, { replace: true });
+        if (saved.tool_type === 'data_query_source') {
+          navigate(`/enterprise/tools/${saved.id}`, { replace: true });
+        } else {
+          navigate(`/enterprise/tools/${saved.id}/edit`, { replace: true });
+        }
       }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存失败');
@@ -1154,13 +1218,47 @@ function ToolEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'edit' 
           保存
         </UIButton>
       </div>
-      {!isEdit && <ToolTypeSwitcher active={values.tool_type} onProtocolChange={(protocol) => setValues((previous) => ({ ...previous, tool_type: protocol, method: 'POST' }))} />}
+      {!isEdit && (
+        <ToolTypeSwitcher
+          active={values.tool_type}
+          onProtocolChange={(protocol) =>
+            setValues((previous) => ({
+              ...previous,
+              tool_type: protocol,
+              method: 'POST',
+              bucket: protocol === 'data_query_source' ? '数据源查询工具' : previous.bucket,
+            }))
+          }
+        />
+      )}
       <div className="grid grid-cols-1 items-start gap-[20px] xl:grid-cols-2">
         <SectionCard title="工具定义" loading={loading && isEdit && !tool}>
           <ToolFormFields values={values} setField={setField} bucketOptions={bucketOptions} lockName={isEdit} />
         </SectionCard>
         <div className="flex w-full flex-col gap-[20px]">
-          <ToolProbeCard values={values} />
+          {values.tool_type === 'data_query_source' ? (
+            <SectionCard
+              title="数据源查询工具说明"
+              bodyClassName="flex flex-col gap-[14px] text-xs leading-relaxed text-[#555a6d]"
+            >
+              <div className="rounded-[10px] border border-[#eef4ff] bg-[#f5f8ff] p-4 text-[13px] text-[#1a71ff]">
+                <strong>💡 容器化门面架构</strong>
+                <p className="mt-1 text-xs text-[#4169e1]">
+                  数据源查询工具作为数据底座在员工和智能体面前的统一门面。创建后，所有只读 SQL 查询技能都将在工具详情页中集中沉淀、试跑与维护。
+                </p>
+              </div>
+              <div className="rounded-[8px] border border-[#eceef1] bg-[#fafbfc] p-3 text-[12px]">
+                <p className="font-medium text-[#18181a]">实施指引：</p>
+                <ul className="mt-1.5 list-disc pl-4 space-y-1 text-[#60677c]">
+                  <li>选择已配置好的受控只读数据源（若尚未配置，可在「数据查询中心」建立连接）；</li>
+                  <li>填写工具标识名称（如 <code>sales_data_center</code>）与直观的展示名称；</li>
+                  <li>保存后系统将自动导航至<strong>工具详情页</strong>，供您查看和审核挂载的 SQL 查询技能。</li>
+                </ul>
+              </div>
+            </SectionCard>
+          ) : (
+            <ToolProbeCard values={values} />
+          )}
           {isEdit && tool && <SavedToolTestCard tool={tool} />}
         </div>
       </div>
@@ -1979,6 +2077,71 @@ function McpServerEditorPage({ mode, currentUser, onLogout }: { mode: 'new' | 'e
   );
 }
 
+function DataSourceBindingField({
+  value,
+  onChange,
+}: {
+  value?: string;
+  onChange: (value: string) => void;
+}) {
+  const navigate = useNavigate();
+  const [dataSources, setDataSources] = useState<DataSource[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    dataSourcesApi
+      .list()
+      .then((res) => setDataSources(res || []))
+      .catch(() => setDataSources([]))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const readOnlySources = dataSources.filter((ds) => ds.read_only);
+
+  return (
+    <div className="flex flex-col gap-[10px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] p-[16px]">
+      <div className="flex items-center justify-between">
+        <span className={FIELD_LABEL_CLASS}>关联只读数据源</span>
+        <button
+          type="button"
+          onClick={() => navigate('/enterprise/data-query')}
+          className="text-[12px] text-[#1a71ff] hover:underline"
+        >
+          前往数据查询中心管理
+        </button>
+      </div>
+      <p className={HINT_CLASS}>
+        数据源查询工具强制要求绑定 <code>read_only=true</code> 的只读数据源，避免写穿底库。工具创建后将自动继承对应数据源的员工授权策略。
+      </p>
+      {loading ? (
+        <div className="py-2 text-[12px] text-[#858b9c]">加载可用数据源列表中…</div>
+      ) : readOnlySources.length === 0 ? (
+        <div className="rounded-[8px] border border-[#f5c6cb] bg-[#fff5f5] p-3 text-[12px] text-[#d93025]">
+          当前租户暂无已配置的「只读」数据源。请先在「数据查询中心」配置一个只读数据库连接，再创建查询工具。
+        </div>
+      ) : (
+        <UISelect value={value || ''} onValueChange={onChange}>
+          <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full bg-white')}>
+            <SelectValue placeholder="请选择只读数据源…" />
+          </SelectTrigger>
+          <SelectContent>
+            {readOnlySources.map((ds) => (
+              <SelectItem key={ds.id} value={ds.id}>
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-[#18181a]">{ds.name}</span>
+                  <span className="text-[11px] uppercase tracking-wider text-[#858b9c]">({ds.type})</span>
+                  <span className="rounded bg-[#e6f4ea] px-1.5 py-0.5 text-[10px] font-medium text-[#137333]">只读受控</span>
+                </div>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </UISelect>
+      )}
+    </div>
+  );
+}
+
 function ToolFormFields({
   values,
   setField,
@@ -1999,7 +2162,7 @@ function ToolFormFields({
             <Input
               id="tool-name"
               className="pl-[30px]"
-              placeholder="order_query"
+              placeholder={values.tool_type === 'data_query_source' ? 'sales_data_center' : 'order_query'}
               value={values.name || ''}
               disabled={lockName}
               onChange={(event) => {
@@ -2012,7 +2175,7 @@ function ToolFormFields({
         <Field label="展示名称" htmlFor="tool-display-name">
           <Input
             id="tool-display-name"
-            placeholder="订单查询"
+            placeholder={values.tool_type === 'data_query_source' ? '销售数据中心' : '订单查询'}
             value={values.display_name || ''}
             onChange={(event) => setField('display_name', event.target.value)}
           />
@@ -2046,33 +2209,47 @@ function ToolFormFields({
         />
       </Field>
 
-      <div
-        className={cn(
-          'grid grid-cols-1 gap-[16px]',
-          values.tool_type === 'http' && 'sm:grid-cols-[140px_minmax(0,1fr)]',
-        )}
-      >
-        {values.tool_type === 'http' && <Field label="HTTP Method">
-          <UISelect value={values.method} onValueChange={(value) => setField('method', value)}>
-            <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full')}>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((value) => (
-                <SelectItem key={value} value={value}>{value}</SelectItem>
-              ))}
-            </SelectContent>
-          </UISelect>
-        </Field>}
-        <Field label={values.tool_type === 'a2a' ? 'A2A Endpoint URL' : 'URL'} htmlFor="tool-url">
-          <Input
-            id="tool-url"
-            placeholder={values.tool_type === 'a2a' ? 'https://agent.example.com/a2a' : '/api/mock/order/query'}
-            value={values.url || ''}
-            onChange={(event) => setField('url', event.target.value)}
-          />
-        </Field>
-      </div>
+      {values.tool_type === 'data_query_source' ? (
+        <DataSourceBindingField
+          value={values.data_source_id}
+          onChange={(dsId) => {
+            setField('data_source_id', dsId);
+            if (!values.url || values.url.startsWith('data_query_source://')) {
+              setField('url', dsId ? `data_query_source://${dsId}` : '');
+            }
+          }}
+        />
+      ) : (
+        <div
+          className={cn(
+            'grid grid-cols-1 gap-[16px]',
+            values.tool_type === 'http' && 'sm:grid-cols-[140px_minmax(0,1fr)]',
+          )}
+        >
+          {values.tool_type === 'http' && (
+            <Field label="HTTP Method">
+              <UISelect value={values.method} onValueChange={(value) => setField('method', value)}>
+                <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-full')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((value) => (
+                    <SelectItem key={value} value={value}>{value}</SelectItem>
+                  ))}
+                </SelectContent>
+              </UISelect>
+            </Field>
+          )}
+          <Field label={values.tool_type === 'a2a' ? 'A2A Endpoint URL' : 'URL'} htmlFor="tool-url">
+            <Input
+              id="tool-url"
+              placeholder={values.tool_type === 'a2a' ? 'https://agent.example.com/a2a' : '/api/mock/order/query'}
+              value={values.url || ''}
+              onChange={(event) => setField('url', event.target.value)}
+            />
+          </Field>
+        </div>
+      )}
 
       {values.tool_type === 'a2a' && <A2AConnectionFields values={values} setField={setField} />}
 
@@ -2209,26 +2386,28 @@ function ToolFormFields({
         />
       </Field>
 
-      <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2">
-        <Field label="Headers JSON" htmlFor="tool-headers">
-          <Textarea
-            id="tool-headers"
-            rows={4}
-            className={MONO_INPUT_CLASS}
-            value={values.headers}
-            onChange={(event) => setField('headers', event.target.value)}
-          />
-        </Field>
-        <Field label="Auth JSON" htmlFor="tool-auth">
-          <Textarea
-            id="tool-auth"
-            rows={4}
-            className={MONO_INPUT_CLASS}
-            value={values.auth}
-            onChange={(event) => setField('auth', event.target.value)}
-          />
-        </Field>
-      </div>
+      {values.tool_type !== 'data_query_source' && (
+        <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2">
+          <Field label="Headers JSON" htmlFor="tool-headers">
+            <Textarea
+              id="tool-headers"
+              rows={4}
+              className={MONO_INPUT_CLASS}
+              value={values.headers}
+              onChange={(event) => setField('headers', event.target.value)}
+            />
+          </Field>
+          <Field label="Auth JSON" htmlFor="tool-auth">
+            <Textarea
+              id="tool-auth"
+              rows={4}
+              className={MONO_INPUT_CLASS}
+              value={values.auth}
+              onChange={(event) => setField('auth', event.target.value)}
+            />
+          </Field>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-[16px] sm:grid-cols-2">
         <Field label="Input Schema" htmlFor="tool-input-schema">
@@ -2530,11 +2709,17 @@ function currentAgentQuery() {
 }
 
 function toolToFormValues(row: ToolRead): ToolFormValues {
+  const isSpecialType =
+    row.tool_type === 'mcp' ||
+    row.tool_type === 'a2a' ||
+    row.tool_type === 'data_query_source' ||
+    row.tool_type === 'data_query';
   return {
     ...TOOL_FORM_INITIAL_VALUES,
     ...row,
-    bucket: row.bucket || '未分桶',
-    tool_type: row.tool_type === 'mcp' || row.tool_type === 'a2a' ? row.tool_type : 'http',
+    bucket: row.bucket || (row.tool_type === 'data_query_source' ? '数据源查询工具' : '未分桶'),
+    tool_type: (isSpecialType ? row.tool_type : 'http') as any,
+    data_source_id: row.data_source_id || (row.mcp_config as any)?.data_source_id || '',
     headers: JSON.stringify(row.headers || {}, null, 2),
     auth: JSON.stringify(row.auth || {}, null, 2),
     mcp_config: JSON.stringify(row.mcp_config || {}, null, 2),
@@ -2566,17 +2751,23 @@ export function buildToolPayload(values: ToolFormValues) {
       notify.error('Provider 原生异步任务需要状态查询 URL');
       return null;
     }
+    const isDataQuerySource = values.tool_type === 'data_query_source';
+    const computedUrl = isDataQuerySource
+      ? (String(values.url || '').trim() || (values.data_source_id ? `data_query_source://${values.data_source_id}` : ''))
+      : String(values.url || '').trim();
+
     return {
       tenant_id: TENANT_ID,
       name: String(values.name || '').trim(),
       display_name: values.display_name,
       description: values.description,
-      bucket: values.bucket || '未分桶',
+      bucket: values.bucket || (isDataQuerySource ? '数据源查询工具' : '未分桶'),
       tool_type: values.tool_type || 'http',
-      method: values.method,
-      url: String(values.url || '').trim(),
-      headers: parseJson(values.headers, {}),
-      auth: parseJson(values.auth, {}),
+      data_source_id: values.data_source_id || undefined,
+      method: isDataQuerySource ? 'POST' : values.method,
+      url: computedUrl,
+      headers: isDataQuerySource ? {} : parseJson(values.headers, {}),
+      auth: isDataQuerySource ? {} : parseJson(values.auth, {}),
       mcp_config: values.tool_type === 'mcp' || values.tool_type === 'a2a' ? parseJson(values.mcp_config, {}) : {},
       execution_policy: {
         timeout_seconds: Math.max(1, Math.min(3600, Number(values.timeout_seconds) || 8)),
@@ -2649,8 +2840,15 @@ function schemaPropertyCount(schema: Record<string, unknown>): string {
 }
 
 function toolTypeLabel(tool: ToolRead): string {
+  if (tool.tool_type === 'data_query_source') return '数据源';
   if (tool.tool_type === 'data_query') return '数据查询';
-  return tool.tool_type === 'mcp' ? 'MCP 服务' : tool.tool_type === 'a2a' ? 'A2A Agent' : 'HTTP 接口';
+  return tool.tool_type === 'mcp' ? 'MCP' : tool.tool_type === 'a2a' ? 'A2A' : 'HTTP';
+}
+
+function toolTypeBadgeTone(tool: ToolRead): BadgeTone {
+  if (tool.tool_type === 'data_query_source' || tool.tool_type === 'data_query') return 'blue';
+  if (tool.tool_type === 'mcp' || tool.tool_type === 'a2a') return 'blue';
+  return 'gray';
 }
 
 function serverToFormValues(row: MCPServerRead): McpFormValues {

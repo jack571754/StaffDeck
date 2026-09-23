@@ -7,10 +7,13 @@ tenant-scoped access checks.
 
 from __future__ import annotations
 
+import re
+import time
 from typing import Any
 
 from sqlmodel import Session, select
 
+from app.data_query.connectors import get_connector
 from app.data_query.executor import QueryExecutor, invalidate_template_cache
 from app.data_query.intent_router import clear_intent_template_cache
 from app.data_query.models import (
@@ -21,9 +24,11 @@ from app.data_query.models import (
     QueryTemplate,
     QueryTemplateCreate,
     QueryTemplateUpdate,
+    QueryTemplateVersion,
 )
 from app.data_query.security import decrypt_config, encrypt_config
 from app.db.utils import utc_now
+
 
 # ---------------------------------------------------------------------------
 # Sensitive field definitions per data source type
@@ -73,6 +78,7 @@ def create_data_source(
         config_json=encrypted_config,
         read_only=request.read_only,
         status=request.status,
+        allowed_tables_json=list(request.allowed_tables_json or []),
         created_at=now,
         updated_at=now,
     )
@@ -113,6 +119,9 @@ def update_data_source(
         changed = True
     if request.status is not None and request.status != ds.status:
         ds.status = request.status
+        changed = True
+    if request.allowed_tables_json is not None:
+        ds.allowed_tables_json = list(request.allowed_tables_json)
         changed = True
 
     if request.config_json is not None:
@@ -276,6 +285,14 @@ def create_query_template(
         timeout_seconds=request.timeout_seconds,
         max_rows=request.max_rows,
         status=request.status,
+        tool_id=request.tool_id,
+        origin_nl=request.origin_nl,
+        business_notes=request.business_notes or "",
+        dimensions_json=list(request.dimensions_json or []),
+        metrics_json=list(request.metrics_json or []),
+        example_questions_json=list(request.example_questions_json or []),
+        evolution_version=request.evolution_version or 1,
+        generated_by=request.generated_by or "manual",
         created_at=now,
         updated_at=now,
     )
@@ -290,24 +307,123 @@ def update_query_template(
     db: Session,
     qt: QueryTemplate,
     request: QueryTemplateUpdate,
+    current_user_id: str | None = None,
 ) -> QueryTemplate:
     """Update an existing query template.
 
     If ``data_source_id`` changes, the new data source must exist and
     belong to the same tenant as the template.
 
+    When an active template has its query content, parameters, or data source
+    modified, an isolated draft copy is created to prevent mutating the
+    live production service, with versions tracked in ``QueryTemplateVersion``.
+
     Args:
         db: Active database session.
         qt: The template row to update.
         request: Update payload (partial fields accepted).
+        current_user_id: Optional ID of the user initiating the edit.
 
     Returns:
-        The updated ``QueryTemplate`` row.
+        The updated ``QueryTemplate`` row (or the new draft copy if active).
 
     Raises:
         ValueError: If a new ``data_source_id`` is not found for the tenant.
     """
+    # Active editing: fork to a draft copy if query definition changes
+    if qt.status == "active" and (
+        (request.query_content is not None and request.query_content != qt.query_content)
+        or (request.params_json is not None and request.params_json != qt.params_json)
+        or (request.output_config_json is not None and request.output_config_json != qt.output_config_json)
+        or (request.data_source_id is not None and request.data_source_id != qt.data_source_id)
+    ):
+        # 1. Snapshot the current active version if not already present
+        existing_v = db.exec(
+            select(QueryTemplateVersion).where(
+                QueryTemplateVersion.tenant_id == qt.tenant_id,
+                QueryTemplateVersion.template_id == qt.id,
+                QueryTemplateVersion.version == qt.evolution_version,
+            )
+        ).first()
+        if not existing_v:
+            v_snap = QueryTemplateVersion(
+                tenant_id=qt.tenant_id,
+                template_id=qt.id,
+                version=qt.evolution_version,
+                snapshot_json={
+                    "query_content": qt.query_content,
+                    "params_json": qt.params_json,
+                    "output_config_json": qt.output_config_json,
+                    "dimensions_json": qt.dimensions_json,
+                    "metrics_json": qt.metrics_json,
+                    "business_notes": qt.business_notes,
+                    "example_questions_json": qt.example_questions_json,
+                },
+                change_reason="initial",
+                created_by=current_user_id,
+                created_at=utc_now(),
+            )
+            db.add(v_snap)
+            db.commit()
+
+        # 2. Create new draft copy with incremented evolution_version
+        new_version = qt.evolution_version + 1
+        draft_name = f"{qt.name} (草稿 v{new_version})"
+        now = utc_now()
+        draft_qt = QueryTemplate(
+            tenant_id=qt.tenant_id,
+            name=draft_name,
+            description=request.description if request.description is not None else qt.description,
+            data_source_id=request.data_source_id or qt.data_source_id,
+            query_type=request.query_type or qt.query_type,
+            query_content=request.query_content if request.query_content is not None else qt.query_content,
+            params_json=list(request.params_json) if request.params_json is not None else list(qt.params_json),
+            output_config_json=dict(request.output_config_json) if request.output_config_json is not None else dict(qt.output_config_json),
+            cache_ttl=request.cache_ttl if request.cache_ttl is not None else qt.cache_ttl,
+            timeout_seconds=request.timeout_seconds if request.timeout_seconds is not None else qt.timeout_seconds,
+            max_rows=request.max_rows if request.max_rows is not None else qt.max_rows,
+            status="draft",
+            tool_id=request.tool_id or qt.tool_id,
+            origin_nl=request.origin_nl or qt.origin_nl,
+            business_notes=request.business_notes if request.business_notes is not None else qt.business_notes,
+            dimensions_json=list(request.dimensions_json) if request.dimensions_json is not None else list(qt.dimensions_json),
+            metrics_json=list(request.metrics_json) if request.metrics_json is not None else list(qt.metrics_json),
+            example_questions_json=list(request.example_questions_json) if request.example_questions_json is not None else list(qt.example_questions_json),
+            evolution_version=new_version,
+            generated_by=request.generated_by or "manual",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(draft_qt)
+        db.commit()
+        db.refresh(draft_qt)
+
+        # 3. Snapshot the new draft version
+        new_v_snap = QueryTemplateVersion(
+            tenant_id=qt.tenant_id,
+            template_id=qt.id,
+            version=new_version,
+            snapshot_json={
+                "query_content": draft_qt.query_content,
+                "params_json": draft_qt.params_json,
+                "output_config_json": draft_qt.output_config_json,
+                "dimensions_json": draft_qt.dimensions_json,
+                "metrics_json": draft_qt.metrics_json,
+                "business_notes": draft_qt.business_notes,
+                "example_questions_json": draft_qt.example_questions_json,
+                "draft_id": draft_qt.id,
+            },
+            change_reason="manual_edit",
+            created_by=current_user_id,
+            created_at=now,
+        )
+        db.add(new_v_snap)
+        db.commit()
+        clear_intent_template_cache(qt.tenant_id)
+        return draft_qt
+
     changed = False
+
 
     if request.name is not None and request.name != qt.name:
         qt.name = request.name
@@ -338,6 +454,30 @@ def update_query_template(
         changed = True
     if request.status is not None and request.status != qt.status:
         qt.status = request.status
+        changed = True
+    if request.tool_id is not None and request.tool_id != qt.tool_id:
+        qt.tool_id = request.tool_id
+        changed = True
+    if request.origin_nl is not None:
+        qt.origin_nl = request.origin_nl
+        changed = True
+    if request.business_notes is not None:
+        qt.business_notes = request.business_notes
+        changed = True
+    if request.dimensions_json is not None:
+        qt.dimensions_json = list(request.dimensions_json)
+        changed = True
+    if request.metrics_json is not None:
+        qt.metrics_json = list(request.metrics_json)
+        changed = True
+    if request.example_questions_json is not None:
+        qt.example_questions_json = list(request.example_questions_json)
+        changed = True
+    if request.evolution_version is not None:
+        qt.evolution_version = request.evolution_version
+        changed = True
+    if request.generated_by is not None:
+        qt.generated_by = request.generated_by
         changed = True
 
     if request.data_source_id is not None and request.data_source_id != qt.data_source_id:
@@ -453,3 +593,174 @@ def execute_query_by_id(
     if qt.status != "active":
         raise ValueError("Query template is not active")
     return test_query_template(db, qt, params)
+
+
+# ---------------------------------------------------------------------------
+# M2: Schema refresh, ad-hoc execution & version management
+# ---------------------------------------------------------------------------
+
+
+def refresh_schema_cache(db: Session, ds: DataSource) -> dict[str, Any]:
+    """Scan and refresh the cached table and column metadata for a data source."""
+    connector = get_connector(ds)
+    tables = connector.list_tables()
+    tables_dict: dict[str, Any] = {}
+    for t in tables:
+        tname = str(t.get("name") or "")
+        try:
+            cols = connector.describe_table(tname)
+        except Exception:
+            cols = []
+        tables_dict[tname] = {
+            "comment": str(t.get("comment") or ""),
+            "row_count_estimate": int(t.get("row_count_estimate") or 0),
+            "columns": cols,
+        }
+    now = utc_now()
+    schema_cache = {
+        "tables": tables_dict,
+        "refreshed_at": now.isoformat(),
+    }
+    ds.schema_cache_json = schema_cache
+    ds.schema_refreshed_at = now
+    db.add(ds)
+    db.commit()
+    db.refresh(ds)
+    return schema_cache
+
+
+def execute_adhoc_query(
+    db: Session,
+    ds_id: str,
+    tenant_id: str,
+    query_content: str,
+    query_type: str = "sql",
+    params: dict[str, Any] | None = None,
+) -> QueryExecuteResult:
+    """Execute an ad-hoc query against a data source with limit and timeout safety."""
+    ds = get_data_source(db, ds_id, tenant_id)
+    if not ds:
+        raise ValueError("Data source not found for this tenant")
+    connector = get_connector(ds)
+    params = params or {}
+    start_time = time.monotonic()
+
+    if ds.type == "mysql":
+        from app.data_query.connectors.mysql_connector import _is_sql_allowed
+        if not _is_sql_allowed(query_content):
+            raise ValueError(
+                "SQL statement rejected: only SELECT and WITH...SELECT "
+                "queries are allowed in read-only adhoc test"
+            )
+        # Check if LIMIT exists; if not, wrap safely with subquery
+        if not re.search(r"\bLIMIT\b", query_content, re.IGNORECASE):
+            wrapped_sql = f"SELECT * FROM ({query_content}) AS _adhoc_subq LIMIT 50"
+        else:
+            wrapped_sql = query_content
+        q_res = connector.execute(wrapped_sql, params, timeout=30, max_rows=50)
+    else:
+        q_res = connector.execute(query_content, params, timeout=30, max_rows=50)
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000.0
+    return QueryExecuteResult(
+        template_id="adhoc",
+        columns=q_res.columns,
+        rows=q_res.rows,
+        row_count=q_res.row_count,
+        execution_time_ms=round(elapsed_ms, 2),
+        cached=False,
+    )
+
+
+def list_template_versions(
+    db: Session,
+    template_id: str,
+    tenant_id: str,
+) -> list[QueryTemplateVersion]:
+    """Return version history for a query template, descending by version."""
+    return list(
+        db.exec(
+            select(QueryTemplateVersion).where(
+                QueryTemplateVersion.tenant_id == tenant_id,
+                QueryTemplateVersion.template_id == template_id,
+            ).order_by(QueryTemplateVersion.version.desc())
+        ).all()
+    )
+
+
+def rollback_template_version(
+    db: Session,
+    template_id: str,
+    version: int,
+    tenant_id: str,
+    user_id: str | None = None,
+) -> QueryTemplate:
+    """Roll back to a historic version by creating an approved/reviewable draft."""
+    qt = get_query_template(db, template_id, tenant_id)
+    if not qt:
+        raise ValueError("Query template not found")
+    v_snap = db.exec(
+        select(QueryTemplateVersion).where(
+            QueryTemplateVersion.tenant_id == tenant_id,
+            QueryTemplateVersion.template_id == template_id,
+            QueryTemplateVersion.version == version,
+        )
+    ).first()
+    if not v_snap:
+        raise ValueError(f"Version {version} not found for template {template_id}")
+
+    snapshot = v_snap.snapshot_json or {}
+    new_version = qt.evolution_version + 1
+    now = utc_now()
+    draft_name = f"{qt.name} (回滚至 v{version} 草稿)"
+    draft_qt = QueryTemplate(
+        tenant_id=tenant_id,
+        name=draft_name,
+        description=qt.description,
+        data_source_id=qt.data_source_id,
+        query_type=qt.query_type,
+        query_content=snapshot.get("query_content", qt.query_content),
+        params_json=list(snapshot.get("params_json", qt.params_json)),
+        output_config_json=dict(snapshot.get("output_config_json", qt.output_config_json)),
+        cache_ttl=qt.cache_ttl,
+        timeout_seconds=qt.timeout_seconds,
+        max_rows=qt.max_rows,
+        status="draft",
+        tool_id=qt.tool_id,
+        origin_nl=qt.origin_nl,
+        business_notes=snapshot.get("business_notes", qt.business_notes),
+        dimensions_json=list(snapshot.get("dimensions_json", qt.dimensions_json)),
+        metrics_json=list(snapshot.get("metrics_json", qt.metrics_json)),
+        example_questions_json=list(snapshot.get("example_questions_json", qt.example_questions_json)),
+        evolution_version=new_version,
+        generated_by="manual",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(draft_qt)
+    db.commit()
+    db.refresh(draft_qt)
+
+    rollback_snap = QueryTemplateVersion(
+        tenant_id=tenant_id,
+        template_id=qt.id,
+        version=new_version,
+        snapshot_json={
+            "query_content": draft_qt.query_content,
+            "params_json": draft_qt.params_json,
+            "output_config_json": draft_qt.output_config_json,
+            "dimensions_json": draft_qt.dimensions_json,
+            "metrics_json": draft_qt.metrics_json,
+            "business_notes": draft_qt.business_notes,
+            "example_questions_json": draft_qt.example_questions_json,
+            "rollback_from_version": version,
+            "draft_id": draft_qt.id,
+        },
+        change_reason=f"rollback_to_v{version}",
+        created_by=user_id,
+        created_at=now,
+    )
+    db.add(rollback_snap)
+    db.commit()
+    return draft_qt
+

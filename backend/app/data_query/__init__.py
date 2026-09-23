@@ -14,6 +14,7 @@ from app.data_query.models import (
     QueryTemplateCreate,
     QueryTemplateRead,
     QueryTemplateUpdate,
+    QueryTemplateVersion,
 )
 from app.data_query.security import (
     decrypt_config,
@@ -33,6 +34,7 @@ __all__ = [
     "QueryTemplateCreate",
     "QueryTemplateRead",
     "QueryTemplateUpdate",
+    "QueryTemplateVersion",
     "decrypt_config",
     "decrypt_value",
     "encrypt_config",

@@ -214,6 +214,115 @@ class MySQLConnector(BaseConnector):
             row_count=len(rows),
         )
 
+    def list_tables(self) -> list[dict[str, Any]]:
+        """List tables from information_schema for the configured database."""
+        self._connect()
+        assert self._conn is not None
+        cfg = self._get_decrypted_config()
+        db_name = cfg.get("database", "")
+        allowed_tables = set(getattr(self._data_source, "allowed_tables_json", []) or [])
+
+        query = (
+            "SELECT TABLE_NAME as name, TABLE_COMMENT as comment, TABLE_ROWS as row_count_estimate "
+            "FROM information_schema.tables "
+            "WHERE TABLE_SCHEMA = %s "
+            "ORDER BY TABLE_NAME"
+        )
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.execute(query, (db_name,))
+                raw_rows = cursor.fetchall() or []
+        except Exception as exc:
+            raise MySQLError(f"Failed to list MySQL tables: {exc}") from exc
+
+        tables: list[dict[str, Any]] = []
+        for row in raw_rows:
+            name = str(row.get("name") or "")
+            if allowed_tables and name not in allowed_tables:
+                continue
+            tables.append({
+                "name": name,
+                "comment": str(row.get("comment") or ""),
+                "row_count_estimate": int(row.get("row_count_estimate") or 0),
+            })
+        return tables
+
+    def describe_table(self, table: str) -> list[dict[str, Any]]:
+        """Return column definitions from information_schema for *table*."""
+        if not re.match(r"^[A-Za-z0-9_]+$", table):
+            raise ValueError(f"Invalid table identifier: {table!r}")
+        allowed_tables = set(getattr(self._data_source, "allowed_tables_json", []) or [])
+        if allowed_tables and table not in allowed_tables:
+            raise ValueError(f"Table {table!r} is not in the allowed tables list")
+
+        self._connect()
+        assert self._conn is not None
+        cfg = self._get_decrypted_config()
+        db_name = cfg.get("database", "")
+
+        query = (
+            "SELECT COLUMN_NAME as name, DATA_TYPE as data_type, COLUMN_TYPE as column_type, "
+            "IS_NULLABLE as is_nullable, COLUMN_COMMENT as comment "
+            "FROM information_schema.columns "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+            "ORDER BY ORDINAL_POSITION"
+        )
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.execute(query, (db_name, table))
+                raw_rows = cursor.fetchall() or []
+        except Exception as exc:
+            raise MySQLError(f"Failed to describe table {table}: {exc}") from exc
+
+        columns: list[dict[str, Any]] = []
+        for row in raw_rows:
+            nullable_str = str(row.get("is_nullable") or "").strip().upper()
+            columns.append({
+                "name": str(row.get("name") or ""),
+                "data_type": str(row.get("data_type") or ""),
+                "column_type": str(row.get("column_type") or ""),
+                "is_nullable": nullable_str == "YES",
+                "comment": str(row.get("comment") or ""),
+            })
+        return columns
+
+    def preview_table(self, table: str, limit: int = 20) -> QueryResult:
+        """Fetch up to 50 sample rows from *table* safely."""
+        if not re.match(r"^[A-Za-z0-9_]+$", table):
+            raise ValueError(f"Invalid table identifier: {table!r}")
+        allowed_tables = set(getattr(self._data_source, "allowed_tables_json", []) or [])
+        if allowed_tables and table not in allowed_tables:
+            raise ValueError(f"Table {table!r} is not in the allowed tables list")
+
+        safe_limit = min(max(1, limit), 50)
+        query = f"SELECT * FROM `{table}` LIMIT {safe_limit}"
+        return self.execute(query, {}, timeout=30, max_rows=safe_limit)
+
+    def explain(self, sql: str, params: dict[str, Any]) -> QueryResult:
+        """Run EXPLAIN on a SELECT/WITH query for dry-run analysis."""
+        if not _is_sql_allowed(sql):
+            raise SQLNotAllowedError(
+                "Only SELECT and WITH...SELECT statements can be explained"
+            )
+        self._connect(timeout=30)
+        assert self._conn is not None
+
+        converted_query, _ = _convert_params(f"EXPLAIN {sql}")
+        try:
+            with self._conn.cursor() as cursor:
+                cursor.execute(converted_query, params)
+                raw_rows = cursor.fetchall() or []
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        except Exception as exc:
+            raise MySQLError(f"MySQL EXPLAIN failed: {exc}") from exc
+
+        rows = [dict(row) for row in raw_rows]
+        return QueryResult(
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+        )
+
     def close(self) -> None:
         """Close the underlying pymysql connection if open."""
         if self._conn is not None:
@@ -223,3 +332,4 @@ class MySQLConnector(BaseConnector):
                 pass
             self._conn = None
         super().close()
+

@@ -15,6 +15,8 @@ from sqlmodel import Session, select
 
 from app.data_query import service
 from app.data_query.models import (
+    AdhocTestRequest,
+    ColumnMeta,
     DataSourceCreate,
     DataSourceRead,
     DataSourceUpdate,
@@ -24,7 +26,11 @@ from app.data_query.models import (
     QueryTemplateCreate,
     QueryTemplateRead,
     QueryTemplateUpdate,
+    QueryTemplateVersionRead,
+    TablePreviewResult,
+    TableSummary,
 )
+
 from app.db import get_session
 from app.db.models import User
 from app.security.auth import ensure_current_user_tenant, get_current_user
@@ -75,10 +81,14 @@ def _data_source_read(ds) -> DataSourceRead:
         type=ds.type,
         read_only=ds.read_only,
         status=ds.status,
+        allowed_tables_json=list(getattr(ds, "allowed_tables_json", []) or []),
+        schema_cache_json=dict(getattr(ds, "schema_cache_json", {}) or {}),
+        schema_refreshed_at=getattr(ds, "schema_refreshed_at", None),
         last_test_at=ds.last_test_at,
         created_at=ds.created_at,
         updated_at=ds.updated_at,
     )
+
 
 
 def _get_data_source_or_404(
@@ -262,10 +272,11 @@ def update_query_template(
     _ensure_tenant_admin(tid, current_user)
     qt = _get_query_template_or_404(db, qt_id, tid)
     try:
-        qt = service.update_query_template(db, qt, request)
+        qt = service.update_query_template(db, qt, request, current_user_id=str(current_user.id))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return QueryTemplateRead.model_validate(qt)
+
 
 
 @router.delete("/query-templates/{qt_id}", status_code=204)
@@ -298,6 +309,180 @@ def test_query_template(
         return service.test_query_template(db, qt, params)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/query-templates/adhoc-test", response_model=QueryExecuteResult)
+def adhoc_test_query(
+    request: AdhocTestRequest,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> QueryExecuteResult:
+    """Execute an ad-hoc query without persisting a template (admin only)."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
+    try:
+        return service.execute_adhoc_query(
+            db,
+            request.data_source_id,
+            tid,
+            request.query_content,
+            request.query_type,
+            request.params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/query-templates/{qt_id}/versions", response_model=list[QueryTemplateVersionRead])
+def list_query_template_versions(
+    qt_id: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[QueryTemplateVersionRead]:
+    """Return version history for a query template."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    _get_query_template_or_404(db, qt_id, tid)
+    versions = service.list_template_versions(db, qt_id, tid)
+    return [
+        QueryTemplateVersionRead(
+            id=v.id,
+            tenant_id=v.tenant_id,
+            template_id=v.template_id,
+            version=v.version,
+            snapshot_json=v.snapshot_json,
+            change_reason=v.change_reason,
+            created_by=v.created_by,
+            created_at=v.created_at,
+        )
+        for v in versions
+    ]
+
+
+@router.post("/query-templates/{qt_id}/versions/{version}/rollback", response_model=QueryTemplateRead)
+def rollback_query_template_version(
+    qt_id: str,
+    version: int,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> QueryTemplateRead:
+    """Roll back a query template to a historic version (generates a draft copy)."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
+    try:
+        draft_qt = service.rollback_template_version(
+            db, qt_id, version, tid, user_id=str(current_user.id)
+        )
+        return QueryTemplateRead.model_validate(draft_qt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ===================================================================
+# Data source schema exploration & preview endpoints
+# ===================================================================
+
+
+@router.get("/data-sources/{ds_id}/tables", response_model=list[TableSummary])
+def list_data_source_tables(
+    ds_id: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[TableSummary]:
+    """List tables available in a data source."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    ds = _get_data_source_or_404(db, ds_id, tid)
+    connector = service.get_connector(ds)
+    try:
+        tables = connector.list_tables()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list tables: {exc}") from exc
+    return [
+        TableSummary(
+            name=str(t.get("name") or ""),
+            comment=str(t.get("comment") or ""),
+            row_count_estimate=int(t.get("row_count_estimate") or 0),
+        )
+        for t in tables
+    ]
+
+
+@router.get("/data-sources/{ds_id}/tables/{table}", response_model=list[ColumnMeta])
+def describe_data_source_table(
+    ds_id: str,
+    table: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> list[ColumnMeta]:
+    """Return columns and metadata for a specific table."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    ds = _get_data_source_or_404(db, ds_id, tid)
+    connector = service.get_connector(ds)
+    try:
+        cols = connector.describe_table(table)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to describe table: {exc}") from exc
+    return [
+        ColumnMeta(
+            name=str(c.get("name") or ""),
+            data_type=str(c.get("data_type") or ""),
+            column_type=str(c.get("column_type") or ""),
+            is_nullable=bool(c.get("is_nullable", True)),
+            comment=str(c.get("comment") or ""),
+        )
+        for c in cols
+    ]
+
+
+@router.get("/data-sources/{ds_id}/tables/{table}/preview", response_model=TablePreviewResult)
+def preview_data_source_table(
+    ds_id: str,
+    table: str,
+    limit: int = Query(default=20, ge=1, le=50),
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> TablePreviewResult:
+    """Fetch sample rows for a table (capped at 50 rows)."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    ds = _get_data_source_or_404(db, ds_id, tid)
+    connector = service.get_connector(ds)
+    try:
+        res = connector.preview_table(table, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to preview table: {exc}") from exc
+    return TablePreviewResult(
+        table=table,
+        columns=res.columns,
+        rows=res.rows,
+        row_count=res.row_count,
+    )
+
+
+@router.post("/data-sources/{ds_id}/schema/refresh")
+def refresh_data_source_schema(
+    ds_id: str,
+    tenant_id: str = Query(default=""),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Scan and refresh schema metadata cache for a data source."""
+    tid = _resolve_tenant(db, tenant_id, current_user)
+    _ensure_tenant_admin(tid, current_user)
+    ds = _get_data_source_or_404(db, ds_id, tid)
+    try:
+        return service.refresh_schema_cache(db, ds)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh schema: {exc}") from exc
+
 
 
 # ===================================================================

@@ -32,7 +32,9 @@ interface BaseForm {
   type: 'mysql' | 'http_api';
   read_only: boolean;
   status: 'active' | 'inactive';
+  allowed_tables: string;
 }
+
 
 interface MysqlForm {
   host: string;
@@ -55,7 +57,9 @@ const DEFAULT_BASE: BaseForm = {
   type: 'mysql',
   read_only: true,
   status: 'active',
+  allowed_tables: '',
 };
+
 
 const DEFAULT_MYSQL: MysqlForm = {
   host: '127.0.0.1',
@@ -93,7 +97,9 @@ export default function DataSourceDialog({
         type: dataSource.type as 'mysql' | 'http_api',
         read_only: dataSource.read_only,
         status: dataSource.status as 'active' | 'inactive',
+        allowed_tables: (dataSource.allowed_tables_json || []).join(', '),
       });
+
       // config_json is not returned by the API for security reasons
       setMysqlForm(DEFAULT_MYSQL);
       setHttpForm(DEFAULT_HTTP);
@@ -167,6 +173,11 @@ export default function DataSourceDialog({
     const configJson = buildConfigJson();
     if (!configJson) return;
 
+    const allowedTables = baseForm.allowed_tables
+      .split(/[,，\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     setSaving(true);
     try {
       if (isEdit && dataSource) {
@@ -177,6 +188,7 @@ export default function DataSourceDialog({
           config_json: configJson,
           read_only: baseForm.read_only,
           status: baseForm.status,
+          allowed_tables_json: allowedTables,
         });
       } else {
         await dataSourcesApi.create({
@@ -186,9 +198,11 @@ export default function DataSourceDialog({
           config_json: configJson,
           read_only: baseForm.read_only,
           status: baseForm.status,
+          allowed_tables_json: allowedTables,
         });
       }
       notify.success(isEdit ? '保存成功' : '创建成功');
+
       onSaved();
       onOpenChange(false);
     } catch (error) {
@@ -235,6 +249,17 @@ export default function DataSourceDialog({
                 onChange={(e) => updateBase('description', e.target.value)}
               />
             </LabeledField>
+
+            {baseForm.type === 'mysql' && (
+              <LabeledField label="数据表白名单（逗号分隔，选填）">
+                <Input
+                  value={baseForm.allowed_tables}
+                  placeholder="如 orders, order_items（留空表示允许全部表）"
+                  onChange={(e) => updateBase('allowed_tables', e.target.value)}
+                />
+              </LabeledField>
+            )}
+
 
             <div className="grid grid-cols-2 gap-[12px]">
               <LabeledField label="类型">

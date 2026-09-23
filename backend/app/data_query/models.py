@@ -36,6 +36,9 @@ class DataSource(SQLModel, table=True):
     config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     read_only: bool = Field(default=True)
     status: str = Field(default="active", max_length=20, index=True)
+    allowed_tables_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    schema_cache_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    schema_refreshed_at: datetime | None = Field(default=None)
     last_test_at: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -48,6 +51,7 @@ class DataSourceCreate(SQLModel):
     config_json: dict[str, Any] = Field(default_factory=dict)
     read_only: bool = True
     status: str = "active"
+    allowed_tables_json: list[str] = Field(default_factory=list)
 
 
 class DataSourceUpdate(SQLModel):
@@ -57,6 +61,7 @@ class DataSourceUpdate(SQLModel):
     config_json: dict[str, Any] | None = None
     read_only: bool | None = None
     status: str | None = None
+    allowed_tables_json: list[str] | None = None
 
 
 class DataSourceRead(SQLModel):
@@ -69,9 +74,13 @@ class DataSourceRead(SQLModel):
     type: str
     read_only: bool
     status: str
+    allowed_tables_json: list[str] = Field(default_factory=list)
+    schema_cache_json: dict[str, Any] = Field(default_factory=dict)
+    schema_refreshed_at: datetime | None = None
     last_test_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +116,14 @@ class QueryTemplate(SQLModel, table=True):
     # Maximum number of rows to return
     max_rows: int = Field(default=1000)
     status: str = Field(default="draft", max_length=20, index=True)
+    tool_id: str | None = Field(default=None, index=True)
+    origin_nl: str | None = Field(default=None)
+    business_notes: str = Field(default="")
+    dimensions_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    metrics_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    example_questions_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    evolution_version: int = Field(default=1)
+    generated_by: str = Field(default="manual")
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -123,6 +140,14 @@ class QueryTemplateCreate(SQLModel):
     timeout_seconds: int = 30
     max_rows: int = 1000
     status: str = "draft"
+    tool_id: str | None = None
+    origin_nl: str | None = None
+    business_notes: str = ""
+    dimensions_json: list[str] = Field(default_factory=list)
+    metrics_json: list[str] = Field(default_factory=list)
+    example_questions_json: list[str] = Field(default_factory=list)
+    evolution_version: int = 1
+    generated_by: str = "manual"
 
 
 class QueryTemplateUpdate(SQLModel):
@@ -137,6 +162,14 @@ class QueryTemplateUpdate(SQLModel):
     timeout_seconds: int | None = None
     max_rows: int | None = None
     status: str | None = None
+    tool_id: str | None = None
+    origin_nl: str | None = None
+    business_notes: str | None = None
+    dimensions_json: list[str] | None = None
+    metrics_json: list[str] | None = None
+    example_questions_json: list[str] | None = None
+    evolution_version: int | None = None
+    generated_by: str | None = None
 
 
 class QueryTemplateRead(SQLModel):
@@ -153,8 +186,31 @@ class QueryTemplateRead(SQLModel):
     timeout_seconds: int
     max_rows: int
     status: str
+    tool_id: str | None = None
+    origin_nl: str | None = None
+    business_notes: str = ""
+    dimensions_json: list[str] = Field(default_factory=list)
+    metrics_json: list[str] = Field(default_factory=list)
+    example_questions_json: list[str] = Field(default_factory=list)
+    evolution_version: int = 1
+    generated_by: str = "manual"
     created_at: datetime
     updated_at: datetime
+
+
+class QueryTemplateVersion(SQLModel, table=True):
+    """Snapshot of a QueryTemplate at a specific evolution version."""
+
+    __tablename__ = "query_template_versions"
+
+    id: str = Field(default_factory=lambda: new_id("qtv"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    template_id: str = Field(index=True)
+    version: int = Field(default=1)
+    snapshot_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    change_reason: str = Field(default="initial")
+    created_by: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 # ---------------------------------------------------------------------------
@@ -181,3 +237,58 @@ class QueryExecuteResult(SQLModel):
     # Execution stats
     execution_time_ms: float = 0.0
     cached: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Schema exploration & Data preview (non-table DTOs)
+# ---------------------------------------------------------------------------
+
+
+class TableSummary(SQLModel):
+    """Summary of a database table."""
+
+    name: str
+    comment: str = ""
+    row_count_estimate: int = 0
+
+
+class ColumnMeta(SQLModel):
+    """Metadata of a table column."""
+
+    name: str
+    data_type: str
+    column_type: str = ""
+    is_nullable: bool = True
+    comment: str = ""
+
+
+class TablePreviewResult(SQLModel):
+    """Result of previewing a sample of table data."""
+
+    table: str
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+
+
+class AdhocTestRequest(SQLModel):
+    """Request payload for executing an ad-hoc query without saving."""
+
+    data_source_id: str
+    query_content: str
+    query_type: str = "sql"
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class QueryTemplateVersionRead(SQLModel):
+    """Public read schema for template version snapshot."""
+
+    id: str
+    tenant_id: str
+    template_id: str
+    version: int
+    snapshot_json: dict[str, Any] = Field(default_factory=dict)
+    change_reason: str = "initial"
+    created_by: str | None = None
+    created_at: datetime
+

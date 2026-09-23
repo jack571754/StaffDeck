@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.db.models import (
@@ -540,7 +541,7 @@ def is_tool_visible_for_agent(
         if binding and is_bound_resource_visible_for_agent(db, tenant_id, "tool", row, binding):
             return include_inactive or (binding.status == "active" and _tool_runtime_enabled(db, row))
 
-        if (row.tool_type or "http") == "data_query":
+        if (row.tool_type or "http") in ("data_query", "data_query_source"):
             return _is_data_query_tool_authorized_for_agent(
                 db, tenant_id, agent.id, row, include_inactive=include_inactive
             )
@@ -549,7 +550,7 @@ def is_tool_visible_for_agent(
     # 全局/广场视角（agent is None 或 agent.is_overall 为 True）
     if is_open_gallery_resource(db, tenant_id, "tool", row):
         return include_inactive or _tool_runtime_enabled(db, row)
-    if (row.tool_type or "http") == "data_query":
+    if (row.tool_type or "http") in ("data_query", "data_query_source"):
         return _is_data_query_tool_active_in_tenant(
             db, tenant_id, row, include_inactive=include_inactive
         )
@@ -564,6 +565,14 @@ def _extract_data_query_template_id(row: Tool) -> str | None:
     return str(template_id).strip() if template_id else None
 
 
+def _extract_data_source_id(row: Tool) -> str | None:
+    if getattr(row, "data_source_id", None):
+        return str(row.data_source_id).strip()
+    config = row.config_json if isinstance(row.config_json, dict) else {}
+    ds_id = config.get("data_source_id")
+    return str(ds_id).strip() if ds_id else None
+
+
 def _is_data_query_tool_authorized_for_agent(
     db: Session,
     tenant_id: str,
@@ -574,13 +583,20 @@ def _is_data_query_tool_authorized_for_agent(
     if not include_inactive and not _tool_runtime_enabled(db, row):
         return False
     from app.data_query.authorization import authorized_data_source_ids
-    from app.data_query.models import QueryTemplate
+    from app.data_query.models import DataSource, QueryTemplate
 
     active_source_ids = authorized_data_source_ids(
         db, tenant_id, agent_id, include_inactive=include_inactive
     )
     if not active_source_ids:
         return False
+
+    if (row.tool_type or "http") == "data_query_source":
+        ds_id = _extract_data_source_id(row)
+        if not ds_id or ds_id not in active_source_ids:
+            return False
+        ds = db.get(DataSource, ds_id)
+        return bool(ds and ds.tenant_id == tenant_id and (include_inactive or ds.status == "active"))
 
     template_id = _extract_data_query_template_id(row)
     if not template_id:
@@ -603,6 +619,13 @@ def _is_data_query_tool_active_in_tenant(
     if not include_inactive and not _tool_runtime_enabled(db, row):
         return False
     from app.data_query.models import DataSource, QueryTemplate
+
+    if (row.tool_type or "http") == "data_query_source":
+        ds_id = _extract_data_source_id(row)
+        if not ds_id:
+            return False
+        ds = db.get(DataSource, ds_id)
+        return bool(ds and ds.tenant_id == tenant_id and (include_inactive or ds.status == "active"))
 
     template_id = _extract_data_query_template_id(row)
     if not template_id:
@@ -636,6 +659,7 @@ def _append_source_authorized_data_query_tools(
     )
     if not active_source_ids:
         return
+    visible_ids = {row.id for row in visible}
     template_ids = {
         row.id
         for row in db.exec(
@@ -646,20 +670,27 @@ def _append_source_authorized_data_query_tools(
             )
         ).all()
     }
-    if not template_ids:
-        return
-    visible_ids = {row.id for row in visible}
     data_query_rows = db.exec(
-        select(Tool).where(Tool.tenant_id == tenant_id, Tool.tool_type == "data_query")
+        select(Tool).where(
+            Tool.tenant_id == tenant_id,
+            Tool.tool_type.in_(["data_query", "data_query_source"]),
+        )
     ).all()
     for row in data_query_rows:
         if row.id in visible_ids:
             continue
         if not include_inactive and not _tool_runtime_enabled(db, row):
             continue
-        template_id = _extract_data_query_template_id(row)
-        if template_id and template_id in template_ids:
-            visible.append(row)
+        if (row.tool_type or "http") == "data_query_source":
+            ds_id = _extract_data_source_id(row)
+            if ds_id and ds_id in active_source_ids:
+                visible.append(row)
+                visible_ids.add(row.id)
+        else:
+            template_id = _extract_data_query_template_id(row)
+            if template_id and template_id in template_ids:
+                visible.append(row)
+                visible_ids.add(row.id)
 
 
 def _tool_runtime_enabled(db: Session, row: Tool) -> bool:
@@ -940,19 +971,21 @@ def ensure_knowledge_base_version(
     db: Session, kb: KnowledgeBase, version: str | None = None
 ) -> KnowledgeBaseVersion:
     normalized_version = version or _current_knowledge_version(kb)
+    tenant_id = str(kb.tenant_id)
+    kb_id = str(kb.id)
     row = db.exec(
         select(KnowledgeBaseVersion).where(
-            KnowledgeBaseVersion.tenant_id == kb.tenant_id,
-            KnowledgeBaseVersion.knowledge_base_id == kb.id,
+            KnowledgeBaseVersion.tenant_id == tenant_id,
+            KnowledgeBaseVersion.knowledge_base_id == kb_id,
             KnowledgeBaseVersion.version == normalized_version,
         )
     ).first()
     if row:
         return row
     row = KnowledgeBaseVersion(
-        id=f"kbver_{kb.id}_{_safe_version_id(normalized_version)}",
-        tenant_id=kb.tenant_id,
-        knowledge_base_id=kb.id,
+        id=f"kbver_{kb_id}_{_safe_version_id(normalized_version)}",
+        tenant_id=tenant_id,
+        knowledge_base_id=kb_id,
         version=normalized_version,
         name=kb.name,
         description=kb.description,
@@ -960,9 +993,23 @@ def ensure_knowledge_base_version(
         capability_scope=kb.capability_scope,
         metadata_json=dict(kb.metadata_json or {}),
     )
-    db.add(row)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
+    except IntegrityError:
+        existing = db.exec(
+            select(KnowledgeBaseVersion).where(
+                KnowledgeBaseVersion.tenant_id == tenant_id,
+                KnowledgeBaseVersion.knowledge_base_id == kb_id,
+                KnowledgeBaseVersion.version == normalized_version,
+            )
+        ).first()
+        if existing:
+            return existing
+        raise
     return row
+
 
 
 def _apply_knowledge_version_metadata(

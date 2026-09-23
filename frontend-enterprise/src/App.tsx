@@ -70,6 +70,7 @@ import ToolsPage, {
   ToolNewPage,
   ToolTestPage,
 } from "./pages/ToolsPage";
+import ToolDetailPage from "./pages/ToolDetailPage";
 import DataQueryPage from "./pages/data-query/DataQueryPage";
 import QueryTemplateEditorPage from "./pages/data-query/QueryTemplateEditorPage";
 import { useIsMobile } from "./hooks/use-mobile";
@@ -817,6 +818,12 @@ function Shell({
                 path="/enterprise/tools/:toolId/test"
                 element={
                   <ToolTestPage currentUser={auth.user} onLogout={onLogout} />
+                }
+              />
+              <Route
+                path="/enterprise/tools/:toolId"
+                element={
+                  <ToolDetailPage currentUser={auth.user} onLogout={onLogout} />
                 }
               />
               <Route

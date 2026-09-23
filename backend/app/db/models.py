@@ -786,8 +786,8 @@ class Tool(SQLModel, table=True):
     description: Optional[str] = None
     bucket: str = Field(default="未分桶", index=True)
     tool_type: str = Field(default="http", index=True)
-    method: str
-    url: str
+    method: str = Field(default="POST")
+    url: str = Field(default="")
     headers_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     auth_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     config_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
@@ -795,6 +795,7 @@ class Tool(SQLModel, table=True):
     output_schema: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     allowed_skills_json: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     mcp_server_id: Optional[str] = Field(default=None, index=True)
+    data_source_id: Optional[str] = Field(default=None, index=True)
     capability_scope: str = Field(default="general", index=True)
     capability_scope_inherited: bool = True
     enabled: bool = True

@@ -42,6 +42,7 @@ from app.db.models import (
     AgentUsage,
     GeneralSkill,
     KnowledgeBase,
+    KnowledgeBaseVersion,
     KnowledgeBucket,
     KnowledgeChunk,
     KnowledgeConcept,
@@ -1811,3 +1812,54 @@ def _test_session() -> Session:
     )
     SQLModel.metadata.create_all(engine)
     return Session(engine)
+
+
+def test_ensure_knowledge_base_version_handles_concurrent_integrity_conflict(monkeypatch) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        kb = KnowledgeBase(
+            id="kb_test_conflict",
+            tenant_id="tenant_demo",
+            name="测试并发",
+            status="active",
+        )
+        db.add(kb)
+        db.commit()
+
+        # Pre-insert version row in database to simulate concurrent transaction committing it first
+        concurrent_row = KnowledgeBaseVersion(
+            id="kbver_kb_test_conflict_1_0_0",
+            tenant_id=kb.tenant_id,
+            knowledge_base_id=kb.id,
+            version="1.0.0",
+            name="并发已创建版本",
+            status="active",
+        )
+        with Session(engine) as concurrent_db:
+            concurrent_db.add(concurrent_row)
+            concurrent_db.commit()
+
+        # Simulate race where initial select misses (returns None) as if concurrent insert happened right after select
+        orig_exec = db.exec
+        call_count = [0]
+
+        def _racing_exec(*args, **kwargs):
+            call_count[0] += 1
+            res = orig_exec(*args, **kwargs)
+            if call_count[0] == 1:
+                class _EmptyResult:
+                    def first(self):
+                        return None
+                return _EmptyResult()
+            return res
+
+        monkeypatch.setattr(db, "exec", _racing_exec)
+
+        recovered = ensure_knowledge_base_version(db, kb, "1.0.0")
+        assert recovered.id == "kbver_kb_test_conflict_1_0_0"
+        assert recovered.name == "并发已创建版本"
