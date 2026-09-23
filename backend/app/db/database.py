@@ -728,14 +728,6 @@ def _migrate_default_model_output_limit(conn, tables: set[str]) -> None:
 
 
 def _migrate_data_query_integration_schema(conn, inspector, tables: set[str]) -> None:
-    if "tools" in tables:
-        tool_columns = {column["name"] for column in inspector.get_columns("tools")}
-        if "data_source_id" not in tool_columns:
-            conn.execute(text("ALTER TABLE tools ADD COLUMN data_source_id VARCHAR"))
-            conn.execute(
-                text("CREATE INDEX IF NOT EXISTS ix_tools_data_source_id ON tools (data_source_id)")
-            )
-
     if "data_sources" in tables:
         ds_columns = {column["name"] for column in inspector.get_columns("data_sources")}
         if "allowed_tables_json" not in ds_columns:

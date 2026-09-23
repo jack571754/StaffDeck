@@ -181,7 +181,7 @@ export type KnowledgeSearchResponse = {
   evidence_pack: KnowledgeSearchEvidence[];
 };
 
-export type AgentResourceType = 'skill' | 'general_skill' | 'knowledge_base' | 'tool' | 'data_source';
+export type AgentResourceType = 'skill' | 'general_skill' | 'knowledge_base' | 'tool';
 
 export type AgentResourceBindingRead = {
   id: string;
@@ -406,12 +406,11 @@ export type ToolRead = {
   description?: string;
   capability_scope?: CapabilityScope;
   bucket: string;
-  tool_type: 'http' | 'a2a' | 'mcp' | 'data_query' | 'data_query_source' | string;
+  tool_type: 'http' | 'a2a' | 'mcp' | string;
   method: string;
   url: string;
   headers: Record<string, unknown>;
   auth: Record<string, unknown>;
-  config?: Record<string, unknown>;
   mcp_config: Record<string, unknown>;
   execution_policy?: {
     timeout_seconds: number;
@@ -429,7 +428,6 @@ export type ToolRead = {
   output_schema: Record<string, unknown>;
   allowed_skills: string[];
   mcp_server_id?: string | null;
-  data_source_id?: string | null;
   enabled: boolean;
   metadata?: Record<string, unknown>;
   created_at: string;
