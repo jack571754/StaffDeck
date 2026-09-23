@@ -7,6 +7,8 @@ execution timing.
 
 from __future__ import annotations
 
+from datetime import date, datetime
+from decimal import Decimal
 import hashlib
 import time
 from typing import Any
@@ -15,6 +17,18 @@ from sqlmodel import Session
 
 from app.data_query.connectors import QueryResult, get_connector
 from app.data_query.models import DataSource, QueryExecuteResult, QueryTemplate
+
+
+def _clean_value(val: Any) -> Any:
+    if isinstance(val, Decimal):
+        return float(val) if val % 1 else int(val)
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    return val
+
+
+def _clean_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: _clean_value(v) for k, v in row.items()}
 
 # ---------------------------------------------------------------------------
 # Parameter validation
@@ -266,7 +280,7 @@ class QueryExecutor:
                 return QueryExecuteResult(
                     template_id=template.id,
                     columns=cached.columns,
-                    rows=cached.rows,
+                    rows=[_clean_row(r) for r in cached.rows],
                     row_count=cached.row_count,
                     execution_time_ms=0.0,
                     cached=True,
@@ -302,7 +316,7 @@ class QueryExecutor:
         return QueryExecuteResult(
             template_id=template.id,
             columns=result.columns,
-            rows=result.rows,
+            rows=[_clean_row(r) for r in result.rows],
             row_count=result.row_count,
             execution_time_ms=round(elapsed_ms, 3),
             cached=False,
