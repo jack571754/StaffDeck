@@ -407,6 +407,9 @@ def test_group_topic_uses_thread_id_for_session_and_reply() -> None:
         "im.chat.member.bot.added_v1",
         "im.chat.member.bot.deleted_v1",
         "im.chat.access_event.bot_p2p_chat_entered_v1",
+        "im.message.reaction.created_v1",
+        "im.message.reaction.deleted_v1",
+        "im.message.message_read_v1",
     ],
 )
 def test_subscribed_lifecycle_events_are_acknowledged_as_noop(event_type: str) -> None:

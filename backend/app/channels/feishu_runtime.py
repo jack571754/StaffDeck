@@ -15,7 +15,6 @@ from app.channels.service_feishu_inbox import StageDisposition, stage_feishu_inb
 from app.db.models import ChannelBinding
 from feishu_connector_worker import SDK_CONTRACT_VERSION
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -273,12 +272,16 @@ def _build_event_dispatcher(handler_class, receive):
         .register_p2_im_message_receive_v1(receive)
         .register_p2_im_chat_member_bot_added_v1(ignore_lifecycle_event)
         .register_p2_im_chat_member_bot_deleted_v1(ignore_lifecycle_event)
+        .register_p2_im_message_reaction_created_v1(ignore_lifecycle_event)
+        .register_p2_im_message_reaction_deleted_v1(ignore_lifecycle_event)
+        .register_p2_im_message_message_read_v1(ignore_lifecycle_event)
         .register_p2_customized_event(
             "im.chat.access_event.bot_p2p_chat_entered_v1",
             ignore_lifecycle_event,
         )
         .build()
     )
+
 
 
 def run_feishu_runtime(spec, control, watchdog) -> None:

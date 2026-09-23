@@ -11,6 +11,7 @@ from app.core.harness_session_lease import HarnessSessionLeaseStore
 from app.core.task_frame_store import TaskFrameClaimConflict
 from app.db.models import (
     ChatSession,
+    HarnessInvocationRecord,
     HarnessRunRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
@@ -158,3 +159,88 @@ def test_heartbeat_stop_joins_promptly() -> None:
 
     assert time.monotonic() - started < 5
     assert heartbeat._thread is None
+
+
+def _backdate_run(db: Session, frame_id: str, *, created_at) -> None:
+    run = db.exec(
+        select(HarnessRunRecord).where(
+            HarnessRunRecord.task_frame_record_id == frame_id
+        )
+    ).first()
+    run.created_at = created_at
+    run.updated_at = created_at
+    db.add(run)
+    db.commit()
+
+
+def test_heartbeat_loop_stops_without_run_progress() -> None:
+    """执行长期无任何动作进展时，心跳必须停止续租，让孤儿回收可以接管。
+
+    回归背景：2026-09-22 定时任务执行因模型长思考/空响应重试在第一个动作上
+    卡住，心跳无条件续租使僵尸 run 永远显示"执行中"，孤儿回收永不触发。
+    """
+    engine = _engine()
+    with Session(engine) as db:
+        frame_id = _seed(db, lease_seconds=30)
+        _backdate_run(db, frame_id, created_at=utc_now() - timedelta(seconds=60))
+
+    heartbeat = _heartbeat(
+        engine,
+        frame_id,
+        interval_seconds=0.05,
+        stall_threshold_seconds=0.1,
+    )
+    before = _leases(engine, frame_id)
+
+    heartbeat.start()
+    deadline = time.monotonic() + 5
+    while heartbeat.stalled is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    heartbeat.stop()
+
+    assert heartbeat.stalled is True
+    assert heartbeat._thread is None
+    after = _leases(engine, frame_id)
+    assert after["frame"] == before["frame"], "stalled 心跳不得续租"
+    assert after["run"] == before["run"], "stalled 心跳不得续租"
+
+
+def test_heartbeat_keeps_renewing_with_recent_invocation_progress() -> None:
+    engine = _engine()
+    with Session(engine) as db:
+        frame_id = _seed(db, lease_seconds=30)
+        run = db.exec(
+            select(HarnessRunRecord).where(
+                HarnessRunRecord.task_frame_record_id == frame_id
+            )
+        ).first()
+        db.add(
+            HarnessInvocationRecord(
+                tenant_id=TENANT,
+                session_id=SESSION_ID,
+                task_id=run.task_id,
+                run_id=run.id,
+                call_id="call-1",
+                tool_name="read_file",
+                request_digest="digest-1",
+                status="completed",
+                finished_at=utc_now(),
+            )
+        )
+        db.commit()
+
+    heartbeat = _heartbeat(
+        engine,
+        frame_id,
+        interval_seconds=0.05,
+        stall_threshold_seconds=0.5,
+    )
+    before = _leases(engine, frame_id)
+
+    heartbeat.start()
+    time.sleep(0.25)
+    heartbeat.stop()
+
+    assert heartbeat.stalled is None
+    after = _leases(engine, frame_id)
+    assert after["frame"] > before["frame"], "有进展的心跳必须继续续租"

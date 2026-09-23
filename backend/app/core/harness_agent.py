@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import is_dataclass, replace
@@ -24,6 +25,8 @@ from app.harness.errors import HarnessExecutionError
 from app.llm import LLMClient, LLMError
 from app.observability.spans import llm_operation
 from app.session.slot_policy import strip_router_generated_message_slots
+
+logger = logging.getLogger(__name__)
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "harness_agent_prompt.md"
 MAX_SUCCESSFUL_KNOWLEDGE_SEARCHES_PER_TASK = 2
@@ -227,21 +230,35 @@ class HarnessTaskAgent:
                         # Persist a stable link between this LLM span and the Harness
                         # iteration that consumes it.  Timing projections must not
                         # infer this relationship from overlapping wall-clock windows.
-                        with llm_operation(
-                            "harness.task_action",
-                            task_frame_id=requirement.task_frame_id,
-                            iteration=iteration,
-                            protocol_attempt=protocol_attempt + 1,
-                        ):
-                            client = _deadline_llm_client(
-                                model_config,
-                                step_deadline_monotonic,
-                            )
-                            raw = _generate_harness_action_json(
-                                client,
-                                system_prompt,
-                                payload,
-                            )
+                        try:
+                            with llm_operation(
+                                "harness.task_action",
+                                task_frame_id=requirement.task_frame_id,
+                                iteration=iteration,
+                                protocol_attempt=protocol_attempt + 1,
+                            ):
+                                client = _deadline_llm_client(
+                                    model_config,
+                                    step_deadline_monotonic,
+                                )
+                                raw = _generate_harness_action_json(
+                                    client,
+                                    system_prompt,
+                                    payload,
+                                )
+                        except LLMError as exc:
+                            if (
+                                getattr(exc, "retryable", False)
+                                and protocol_attempt == 0
+                                and not _deadline_expired(step_deadline_monotonic)
+                            ):
+                                logger.warning(
+                                    "Retryable LLM error in harness action generation; retrying: %s",
+                                    exc,
+                                )
+                                time.sleep(1.0)
+                                continue
+                            raise
                         try:
                             actions = _harness_actions_from_raw(raw)
                             action = actions[0]
@@ -330,14 +347,24 @@ class HarnessTaskAgent:
                             "error": str(exc),
                         },
                     )
+                if isinstance(exc, LLMError):
+                    code_suffix = f"（{exc.code}）" if exc.code else ""
+                    reply_fragment = f"模型服务调用异常{code_suffix}：{exc}"
+                    task_summary = "模型服务调用失败。"
+                    error_payload = {"code": "LLM_CALL_FAILED", "message": str(exc)}
+                else:
+                    reply_fragment = "当前任务的执行模型没有返回有效动作。"
+                    task_summary = "Harness 动作解析失败。"
+                    error_payload = {"code": "HARNESS_ACTION_INVALID", "message": str(exc)}
+
                 return finish(TaskExecutionResult(
                     task_frame_id=requirement.task_frame_id,
                     status="failed",
-                    reply_fragment="当前任务的执行模型没有返回有效动作。",
-                    task_summary="Harness 动作解析失败。",
+                    reply_fragment=reply_fragment,
+                    task_summary=task_summary,
                     capability_results=capability_results,
                     action_count=iteration,
-                    error={"code": "HARNESS_ACTION_INVALID", "message": str(exc)},
+                    error=error_payload,
                 ))
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
@@ -991,11 +1018,20 @@ def _step_timeout_result(
     trace_sink: TraceSink | None,
 ) -> TaskExecutionResult:
     limit_text = f"{timeout_seconds} 秒" if timeout_seconds else "配置的时间"
-    error = {
-        "code": "SOP_STEP_TIMEOUT",
-        "message": f"当前 SOP 单步运行超过 {limit_text}，已停止继续执行。",
-        "timeout_seconds": timeout_seconds,
-    }
+    if requirement.kind == "sop":
+        error = {
+            "code": "SOP_STEP_TIMEOUT",
+            "message": f"当前 SOP 单步运行超过 {limit_text}，已停止继续执行。",
+            "timeout_seconds": timeout_seconds,
+        }
+    else:
+        # conversation frame 没有 step 超时概念；deadline 来自定时任务注入的
+        # turn 预算（服务层按调度周期计算），超时报独立的错误码便于观测。
+        error = {
+            "code": "TURN_BUDGET_TIMEOUT",
+            "message": f"本轮任务执行超过 {limit_text}，已停止继续执行。",
+            "timeout_seconds": timeout_seconds,
+        }
     if trace_sink:
         trace_sink(
             "harness_step_timeout",

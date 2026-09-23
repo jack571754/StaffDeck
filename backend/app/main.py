@@ -41,6 +41,10 @@ from app.core.harness_recovery import (
     start_harness_recovery_sweeper,
     stop_harness_recovery_sweeper,
 )
+from app.core.platform_compat import (
+    install_windows_loop_exception_handler,
+    patch_windows_proactor_connection_lost,
+)
 from app.data_query.api import router as data_query_router
 from app.db import engine, init_db
 from app.db.seed import seed_demo_data
@@ -61,6 +65,8 @@ from app.version import app_version
 
 settings = get_settings()
 
+patch_windows_proactor_connection_lost()
+
 app = FastAPI(
     title=settings.app_name,
     version=app_version(),
@@ -80,6 +86,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    install_windows_loop_exception_handler()
     try:
         acquire_runtime_instance_lock()
     except RuntimeInstanceLockError as exc:

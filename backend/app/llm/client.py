@@ -5,8 +5,10 @@ from collections.abc import Iterator, Mapping
 import copy
 import hashlib
 import json
+import logging
 import math
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -38,6 +40,8 @@ from app.llm.stage_protocol import (
 from app.observability.spans import current_llm_operation, llm_span_attributes, start_llm_call
 from app.security.encryption import decrypt_secret
 
+logger = logging.getLogger(__name__)
+
 
 class LLMError(Exception):
     """Raised when an LLM provider request or response normalization fails."""
@@ -55,6 +59,7 @@ class LLMError(Exception):
         retryable: bool = False,
     ) -> None:
         super().__init__(message)
+        self.message = message
         self.code = code or (
             message if message.startswith("MODEL_") and " " not in message else None
         )
@@ -255,6 +260,23 @@ class LLMClient:
                     ):
                         request_messages = _without_image_parts(request_messages)
                         request["messages"] = request_messages
+                        continue
+                    protocol_error = (
+                        exc if isinstance(exc, ProtocolCallError) else _protocol_call_error(exc)
+                    )
+                    if (
+                        getattr(protocol_error, "retryable", False)
+                        and not _response_format_unsupported(str(exc))
+                        and attempt < empty_response_retries
+                    ):
+                        logger.warning(
+                            "Transient LLM call error (%s: %s); retrying attempt %s/%s",
+                            getattr(protocol_error, "code", "UNKNOWN"),
+                            getattr(protocol_error, "message", str(exc)),
+                            attempt + 1,
+                            empty_response_retries,
+                        )
+                        time.sleep(min(1.5**attempt, 5.0))
                         continue
                     raise
                 content = _completion_message_content(completion)

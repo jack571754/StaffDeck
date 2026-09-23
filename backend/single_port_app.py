@@ -13,8 +13,10 @@ from starlette.types import Scope
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from app import paths
+from app.core.platform_compat import patch_windows_proactor_connection_lost
 from app.main import app
 
+patch_windows_proactor_connection_lost()
 
 logger = logging.getLogger("staffdeck.static")
 ROOT_DIR = paths.resource_dir()
@@ -125,7 +127,7 @@ def _pilotdeck_proxy_timeout() -> httpx.Timeout:
 
 
 @app.middleware("http")
-async def pilotdeck_host_proxy(request: Request, call_next):  # noqa: ANN001
+async def pilotdeck_host_proxy(request: Request, call_next):
     """Route the PilotDeck virtual host or /pilotdeck prefix through this process."""
     upstream_path = _pilotdeck_proxy_path(
         request.headers.get("host", ""),

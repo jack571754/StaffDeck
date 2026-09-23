@@ -6,6 +6,11 @@ from __future__ import annotations
 OPERATION_EMPTY_RESPONSE_RETRIES: dict[str, int] = {
     "knowledge.document_route": 0,
     "knowledge.bucket_route": 0,
+    # Harness actions run under a turn budget derived from the schedule
+    # interval. A streak of reasoning-only empty responses must return the
+    # remaining budget to the next scheduled run instead of burning it on
+    # retries, so cap them at one.
+    "harness.task_action": 1,
 }
 
 def operation_output_tokens(operation: str, configured_tokens: int) -> int:

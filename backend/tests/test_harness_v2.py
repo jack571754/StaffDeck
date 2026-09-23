@@ -2191,7 +2191,7 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
     assert reference["sandbox_path"] == (
         "/workspace/.harness/tool-results/hcall-large.json"
     )
-    assert set(reference) == {"kind", "sandbox_path", "size", "sha256"}
+    assert set(reference) == {"kind", "sandbox_path", "size", "sha256", "usage"}
     assert json.loads(read_result["data"]["content"]) == large_data
     assert small_result["data"] == {"ok": True}
     assert sink_result["data"] == {"accepted": True}

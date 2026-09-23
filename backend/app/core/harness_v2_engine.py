@@ -507,6 +507,13 @@ class HarnessV2Engine:
                 )
             ),
         )
+        # 定时任务注入的单轮总预算（turn_budget_seconds）：整个 turn 的
+        # wall-clock deadline，在所有 frame 间共享，防止慢执行无限占用。
+        turn_deadline_monotonic = (
+            time.monotonic() + request.turn_budget_seconds
+            if request.turn_budget_seconds
+            else None
+        )
         execution_payloads: list[dict[str, object]] = []
         execution_results: list[TaskExecutionResult] = []
         last_step_result = StepAgentResult()
@@ -603,6 +610,7 @@ class HarnessV2Engine:
                     *self.store.referenced_session_results(row),
                 ],
                 remaining_turn_actions,
+                turn_deadline_monotonic=turn_deadline_monotonic,
             )
             remaining_turn_actions = max(
                 0,
@@ -824,6 +832,7 @@ class HarnessV2Engine:
         memory_context: list[dict[str, object]],
         prior_frame_results: list[dict[str, Any]],
         max_actions: int,
+        turn_deadline_monotonic: float | None = None,
     ) -> tuple[TaskExecutionResult, StepAgentResult]:
         self.store.mark_running(row)
         agent_loop = self.store.ensure_agent_loop(row)
@@ -875,11 +884,15 @@ class HarnessV2Engine:
 
         while remaining_actions > 0:
             self._raise_if_cancelled(request, session)
-            step_deadline_monotonic = (
-                time.monotonic() + step_timeout_seconds
-                if step_timeout_seconds is not None
-                else None
-            )
+            if step_timeout_seconds is not None:
+                step_deadline_monotonic = time.monotonic() + step_timeout_seconds
+            elif turn_deadline_monotonic is not None:
+                # conversation frame 没有 step 超时；定时任务注入的 turn 预算
+                # 是本轮执行的总时长上限，超时由 agent 按 TURN_BUDGET_TIMEOUT 收尾。
+                step_deadline_monotonic = turn_deadline_monotonic
+                step_timeout_seconds = request.turn_budget_seconds
+            else:
+                step_deadline_monotonic = None
             frame.target_step_id = row.step_id or session.active_step_id
             manifest = self.manifests.build(
                 request.tenant_id,
@@ -1644,9 +1657,10 @@ def _is_recoverable_action_protocol_failure(result: TaskExecutionResult) -> bool
     """Keep a SOP AgentLoop resumable when only the model action envelope is invalid."""
 
     error = result.error if isinstance(result.error, dict) else {}
-    return result.status == "failed" and str(error.get("code") or "") == (
-        "HARNESS_ACTION_INVALID"
-    )
+    return result.status == "failed" and str(error.get("code") or "") in {
+        "HARNESS_ACTION_INVALID",
+        "LLM_CALL_FAILED",
+    }
 
 
 def _defer_failed_step_after_completed_checkpoint(

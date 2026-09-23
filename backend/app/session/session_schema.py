@@ -238,6 +238,10 @@ class ChatTurnRequest(BaseModel):
     # server-only and is applied only after the current employee binding has
     # been verified, so pinning a version never bypasses capability access.
     forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
+    # Server-only total budget in seconds for this turn. Interval scheduled tasks
+    # inject it so the harness enforces a wall-clock deadline instead of letting
+    # one slow turn outlive its scheduling period (forbid skips, lease fights).
+    turn_budget_seconds: int | None = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
 

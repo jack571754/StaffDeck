@@ -1162,6 +1162,13 @@ def test_knowledge_router_does_not_retry_empty_control_plane_responses():
     assert operation_empty_response_retries("response.generate", 2) == 2
 
 
+def test_harness_task_action_limits_empty_response_retries():
+    # Harness actions run under a turn budget derived from the schedule
+    # interval; a streak of reasoning-only empty responses must not burn the
+    # remaining budget on retries — cap them at one.
+    assert operation_empty_response_retries("harness.task_action", 2) == 1
+
+
 def test_user_visible_response_uses_configured_output_budget():
     client = object.__new__(LLMClient)
     client.client = _FakeOpenAIClient()

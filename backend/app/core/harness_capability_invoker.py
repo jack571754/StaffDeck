@@ -225,10 +225,30 @@ class HarnessCapabilityInvoker:
             raise
         try:
             self._raise_if_cancelled()
-            if descriptor.kind == "internal":
-                result = self._invoke_internal(name, arguments)
-            elif descriptor.kind == "file":
-                result = self._invoke_file(name, arguments, call_id=call_id)
+            if descriptor.kind in {"internal", "file"}:
+                # 内建工具参数同样支持 sandbox_json_file 句柄：模型可能把大结果
+                # 引用直接传进 argv/content 等 string 形参（与外部工具路径一致）。
+                try:
+                    arguments = self._resolve_json_tool_result_references(
+                        arguments,
+                        schema=(
+                            descriptor.input_schema
+                            if isinstance(descriptor.input_schema, dict)
+                            else None
+                        ),
+                    )
+                except HarnessExecutionError as exc:
+                    result = _failure(
+                        exc.error.code,
+                        exc.error.message,
+                        retryable=exc.error.retryable,
+                        details=dict(exc.error.details),
+                    )
+                else:
+                    if descriptor.kind == "internal":
+                        result = self._invoke_internal(name, arguments)
+                    else:
+                        result = self._invoke_file(name, arguments, call_id=call_id)
             elif descriptor.kind == "general_skill":
                 result = self._invoke_general_skill(
                     descriptor.capability_id,
@@ -353,7 +373,7 @@ class HarnessCapabilityInvoker:
         )
         if configured is False:
             return None
-        if (tool.tool_type or "http") == "data_query" and configured is not True:
+        if (tool.tool_type or "http") in ("data_query", "data_query_source") and configured is not True:
             return None
         if configured is not True and not ToolReplayPolicy.default_replay_enabled(
             str(tool.method or "")
@@ -1244,11 +1264,19 @@ class HarnessCapabilityInvoker:
             )
         stored_data = dict(stored.data or {})
         relative_path = str(stored_data.get("path") or "").strip()
+        sandbox_path = _sandbox_path(relative_path)
         reference = {
             "kind": _SANDBOX_JSON_FILE_KIND,
-            "sandbox_path": _sandbox_path(relative_path),
+            "sandbox_path": sandbox_path,
             "size": stored_data.get("size"),
             "sha256": stored_data.get("sha256"),
+            # 句柄是模型看到的唯一表示；不附使用说明时模型会把它原样塞进
+            # 字符串参数（2026-09-22 播报任务 argv.1 schema 失败的根因之一）。
+            "usage": (
+                "完整 JSON 结果已保存到沙箱文件。需要内容时用 read_file 读取 "
+                f"{sandbox_path}；或把 {sandbox_path} 字符串作为文件路径参数传给工具"
+                "（如 run_skill_script 的 --text-file）。禁止把本对象原样作为字符串参数传递。"
+            ),
         }
         payload["data"] = reference
         app_descriptor = payload.get("mcp_app")
