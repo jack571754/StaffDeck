@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import type { ScheduledTaskRead, ScheduledTaskRunRead } from '../../types';
 import {
+  buildSchedule,
+  INITIAL_VALUES,
   matchesRunFilter,
   RUN_STATUS_BADGE,
   scheduledTaskSopOptions,
@@ -272,5 +274,46 @@ describe('scheduled task SOP selection', () => {
     expect(next.app_name).toBe('');
     expect(next.chat_ids).toEqual([]);
     expect(next.mobiles).toEqual(['13800138000']);
+  });
+
+  it('buildSchedule handles daily multiple time slots with sorting and deduplication', () => {
+    const built = buildSchedule({
+      ...INITIAL_VALUES,
+      schedule_type: 'daily',
+      times: ['20:00', '09:00', '13:00', '09:00'],
+      time: '09:00',
+    });
+
+    expect(built).toEqual({
+      times: ['09:00', '13:00', '20:00'],
+      time: '09:00',
+    });
+  });
+
+  it('taskToFormValues restores times array from task schedule', () => {
+    const values = taskToFormValues({
+      ...taskWithNotify({}),
+      schedule_type: 'daily',
+      schedule: {
+        times: ['09:00', '13:00', '20:00'],
+        time: '09:00',
+      },
+    });
+
+    expect(values.times).toEqual(['09:00', '13:00', '20:00']);
+    expect(values.time).toBe('09:00');
+  });
+
+  it('taskToFormValues falls back to single time when times is missing', () => {
+    const values = taskToFormValues({
+      ...taskWithNotify({}),
+      schedule_type: 'daily',
+      schedule: {
+        time: '18:30',
+      },
+    });
+
+    expect(values.times).toEqual(['18:30']);
+    expect(values.time).toBe('18:30');
   });
 });

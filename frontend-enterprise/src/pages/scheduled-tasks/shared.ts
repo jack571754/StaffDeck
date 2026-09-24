@@ -50,6 +50,7 @@ export type TaskFormValues = {
   schedule_type: 'once' | 'daily' | 'weekly' | 'monthly' | 'interval';
   interval_minutes?: number;
   time: string;
+  times: string[];
   run_at: string;
   weekdays: number[];
   day_of_month: number;
@@ -67,6 +68,7 @@ export const INITIAL_VALUES: TaskFormValues = {
   schedule_type: 'daily',
   interval_minutes: 1,
   time: '09:00',
+  times: ['09:00'],
   run_at: '',
   weekdays: [0],
   day_of_month: 1,
@@ -178,7 +180,15 @@ const SCHEDULE_BUILDERS: Record<
     time: values.time || '09:00',
     day_of_month: values.day_of_month || 1,
   }),
-  daily: (values) => ({ time: values.time || '09:00' }),
+  daily: (values) => {
+    const rawTimes = values.times?.length ? values.times : [values.time || '09:00'];
+    const times = Array.from(new Set(rawTimes.filter(Boolean))).sort();
+    const validTimes = times.length ? times : ['09:00'];
+    return {
+      times: validTimes,
+      time: validTimes[0],
+    };
+  },
 };
 const SCHEDULE_FORMATTERS: Record<
   TaskFormValues['schedule_type'],
@@ -199,7 +209,15 @@ const SCHEDULE_FORMATTERS: Record<
     return `每周 ${days} ${schedule.time || '09:00'}`;
   },
   monthly: (_row, schedule) => `每月 ${schedule.day_of_month || 1} 号 ${schedule.time || '09:00'}`,
-  daily: (_row, schedule) => `每天 ${schedule.time || '09:00'}`,
+  daily: (_row, schedule) => {
+    const times = Array.isArray(schedule.times) && schedule.times.length
+      ? schedule.times
+      : [schedule.time || '09:00'];
+    if (times.length > 1) {
+      return `每天 ${times.length} 次 (${times.join('、')})`;
+    }
+    return `每天 ${times[0] || '09:00'}`;
+  },
 };
 
 export function buildSchedule(values: TaskFormValues): Record<string, unknown> {
@@ -230,6 +248,9 @@ export function taskToFormValues(row: ScheduledTaskRead): TaskFormValues {
   const openIds = Array.isArray(feishuNotify.open_ids)
     ? feishuNotify.open_ids.map(String).filter(Boolean)
     : [];
+  const rawTimes = Array.isArray(schedule.times) ? schedule.times.map(String).filter(Boolean) : [];
+  const primaryTime = String(schedule.time || rawTimes[0] || '09:00');
+  const times = rawTimes.length > 0 ? Array.from(new Set(rawTimes)).sort() : [primaryTime];
 
   return {
     title: row.title,
@@ -237,7 +258,8 @@ export function taskToFormValues(row: ScheduledTaskRead): TaskFormValues {
     description: row.description || '',
     schedule_type: normalizeScheduleType(row.schedule_type),
     interval_minutes: Number(mins),
-    time: String(schedule.time || '09:00'),
+    time: primaryTime,
+    times,
     run_at: toDatetimeLocal(String(schedule.run_at || row.next_run_at || '')),
     weekdays: Array.isArray(schedule.weekdays) ? schedule.weekdays.map((item) => Number(item)) : [0],
     day_of_month: Number(schedule.day_of_month || 1),

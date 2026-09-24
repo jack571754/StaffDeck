@@ -1222,11 +1222,21 @@ def compute_next_run_at(task: ScheduledTask, after: datetime | None = None) -> d
         seconds = int((task.schedule_json or {}).get("interval_seconds") or 60)
         return _to_utc_naive(after_local + timedelta(seconds=seconds))
     if task.schedule_type == "daily":
-        candidate = datetime.combine(after_local.date(), _parse_time(str(schedule.get("time") or DEFAULT_TASK_TIME)))
-        candidate = candidate.replace(tzinfo=_tz(task.timezone))
-        if candidate <= after_local:
-            candidate += timedelta(days=1)
-        return _to_utc_naive(candidate)
+        raw_times = schedule.get("times") or [schedule.get("time") or DEFAULT_TASK_TIME]
+        times = _normalize_times(raw_times)
+        today = after_local.date()
+        best: datetime | None = None
+        for t_str in times:
+            t = _parse_time(t_str)
+            candidate = datetime.combine(today, t).replace(tzinfo=_tz(task.timezone))
+            if candidate > after_local:
+                best = candidate
+                break
+        if best is None:
+            tomorrow = today + timedelta(days=1)
+            first_t = _parse_time(times[0])
+            best = datetime.combine(tomorrow, first_t).replace(tzinfo=_tz(task.timezone))
+        return _to_utc_naive(best)
     if task.schedule_type == "weekly":
         weekdays = _normalize_weekdays(schedule.get("weekdays") or [after_local.weekday()])
         target_time = _parse_time(str(schedule.get("time") or DEFAULT_TASK_TIME))
@@ -1282,7 +1292,12 @@ def normalize_schedule(schedule_type: str, schedule: dict[str, Any], timezone: s
             raise HTTPException(status_code=400, detail="一次性自动任务需要填写执行时间")
         return {"run_at": _to_local(parsed, timezone).isoformat()}
     if schedule_type == "daily":
-        return {"time": _format_time(_parse_time(str(raw.get("time") or DEFAULT_TASK_TIME)))}
+        raw_times = raw.get("times") or [raw.get("time") or DEFAULT_TASK_TIME]
+        times = _normalize_times(raw_times)
+        return {
+            "times": times,
+            "time": times[0],
+        }
     if schedule_type == "weekly":
         return {
             "time": _format_time(_parse_time(str(raw.get("time") or DEFAULT_TASK_TIME))),
@@ -1307,7 +1322,15 @@ def build_rrule(schedule_type: str, schedule: dict[str, Any]) -> str | None:
     if schedule_type == "once":
         return None
     if schedule_type == "daily":
-        return f"FREQ=DAILY;BYHOUR={int(hour)};BYMINUTE={int(minute)};BYSECOND=0"
+        raw_times = schedule.get("times") or [schedule.get("time") or DEFAULT_TASK_TIME]
+        times = _normalize_times(raw_times)
+        minutes = {t.split(":", 1)[1] for t in times}
+        if len(minutes) == 1:
+            hours = ",".join(str(int(t.split(":", 1)[0])) for t in times)
+            m = int(times[0].split(":", 1)[1])
+            return f"FREQ=DAILY;BYHOUR={hours};BYMINUTE={m};BYSECOND=0"
+        h, m_str = times[0].split(":", 1)
+        return f"FREQ=DAILY;BYHOUR={int(h)};BYMINUTE={int(m_str)};BYSECOND=0"
     if schedule_type == "weekly":
         byday = ",".join(["MO", "TU", "WE", "TH", "FR", "SA", "SU"][int(day)] for day in schedule.get("weekdays", [0]))
         return f"FREQ=WEEKLY;BYDAY={byday};BYHOUR={int(hour)};BYMINUTE={int(minute)};BYSECOND=0"
@@ -1443,6 +1466,27 @@ def _parse_time(value: str) -> time:
 
 def _format_time(value: time) -> str:
     return f"{value.hour:02d}:{value.minute:02d}"
+
+
+def _normalize_times(value: Any) -> list[str]:
+    if not value:
+        return [DEFAULT_TASK_TIME]
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [str(value)]
+    parsed_times: list[time] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        parsed_times.append(_parse_time(text))
+    if not parsed_times:
+        return [DEFAULT_TASK_TIME]
+    unique_sorted = sorted(set(parsed_times))
+    return [_format_time(t) for t in unique_sorted]
 
 
 def _tz(value: str) -> ZoneInfo:

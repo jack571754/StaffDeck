@@ -109,6 +109,41 @@ function ScheduledTaskEditorPage({
   const [appsError, setAppsError] = useState('');
   const [mobileInput, setMobileInput] = useState('');
   const [webhookInput, setWebhookInput] = useState('');
+  const [newTimeInput, setNewTimeInput] = useState('13:00');
+
+  const dailyTimes = values.times && values.times.length > 0 ? values.times : [values.time || '09:00'];
+
+  function setDailyTimes(nextTimes: string[]) {
+    const sorted = Array.from(new Set(nextTimes.filter(Boolean))).sort();
+    const finalTimes = sorted.length > 0 ? sorted : ['09:00'];
+    setValues((prev) => ({
+      ...prev,
+      times: finalTimes,
+      time: finalTimes[0],
+    }));
+  }
+
+  function addDailyTime(timeToAdd?: string) {
+    const t = (timeToAdd || newTimeInput).trim();
+    if (!t) return;
+    if (dailyTimes.includes(t)) {
+      notify.error(`时段 ${t} 已在列表中`);
+      return;
+    }
+    setDailyTimes([...dailyTimes, t]);
+  }
+
+  function removeDailyTime(t: string) {
+    if (dailyTimes.length <= 1) {
+      notify.error('请至少保留一个执行时段');
+      return;
+    }
+    setDailyTimes(dailyTimes.filter((item) => item !== t));
+  }
+
+  function applyTimePreset(preset: string[]) {
+    setDailyTimes(preset);
+  }
   const [chatsReloadToken, setChatsReloadToken] = useState(0);
   const [testingNotify, setTestingNotify] = useState(false);
   const [testResult, setTestResult] = useState<{
@@ -471,6 +506,10 @@ function ScheduledTaskEditorPage({
       if (!values.interval_minutes || values.interval_minutes < 1) {
         nextErrors.interval_minutes = '执行间隔至少为 1 分钟';
       }
+    } else if (values.schedule_type === 'daily') {
+      if (!values.times?.length && !values.time) {
+        nextErrors.time = '请至少配置一个执行时段';
+      }
     } else if (!values.time) {
       nextErrors.time = '请填写执行时间';
     }
@@ -561,34 +600,46 @@ function ScheduledTaskEditorPage({
         title={isEdit ? '编辑定时任务' : '新建空白定时任务'}
         description="保存后到点会拉起一个新的执行记录，并交给当前员工按 SOP、技能、资料和工具执行。"
       />
-      <div className="flex justify-end gap-[12px] mt-[20px] mb-[16px]">
-        <Button
-          variant="outline"
-          onClick={() => navigate('/enterprise/scheduled-tasks')}
-          className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-4 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
-        >
-          <IconArrowRight className="size-3.5 rotate-180" />
-          返回定时任务
-        </Button>
-        {isEdit && (
+      {/* Sticky Action Bar */}
+      <div className="sticky top-[-22px] z-30 -mx-[48px] max-[900px]:-mx-[16px] px-[48px] max-[900px]:px-[16px] py-[12px] my-[16px] bg-[var(--background)]/90 backdrop-blur-md border-b border-[#eceef1] flex flex-wrap items-center justify-between gap-[12px] shadow-2xs">
+        <div className="flex items-center gap-[8px] min-w-0">
+          <span className="text-[14px] font-medium text-[#18181a] truncate">
+            {values.title.trim() || (isEdit ? '编辑定时任务' : '新建空白定时任务')}
+          </span>
+          <span className="inline-flex items-center rounded-md bg-[#f1f3f7] px-[6px] py-[1px] text-[11px] font-medium text-[#5a6275]">
+            {values.status === 'active' ? '启用' : '已暂停'}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-[12px] shrink-0">
           <Button
-            type="button"
             variant="outline"
-            onClick={() => void handleDuplicate()}
-            disabled={saving}
-            className="h-8 gap-1.5 rounded-[10px] border-[0.5px] border-[#3370ff] bg-white px-4 text-[12px] font-medium text-[#3370ff] hover:bg-[#f0f6ff]"
+            onClick={() => navigate('/enterprise/scheduled-tasks')}
+            className="h-8 gap-1 rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-4 text-[12px] font-normal text-[#757f9c] hover:border-[#cbd3e6] hover:bg-white hover:text-[#18181a]"
           >
-            <Copy className="size-3.5" />
-            复制任务
+            <IconArrowRight className="size-3.5 rotate-180" />
+            返回定时任务
           </Button>
-        )}
-        <Button
-          onClick={() => void save()}
-          disabled={saving}
-          className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]"
-        >
-          保存
-        </Button>
+          {isEdit && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void handleDuplicate()}
+              disabled={saving}
+              className="h-8 gap-1.5 rounded-[10px] border-[0.5px] border-[#3370ff] bg-white px-4 text-[12px] font-medium text-[#3370ff] hover:bg-[#f0f6ff]"
+            >
+              <Copy className="size-3.5" />
+              复制任务
+            </Button>
+          )}
+          <Button
+            onClick={() => void save()}
+            disabled={saving}
+            className="h-8 gap-1 rounded-[10px] bg-[#18181a] px-5 text-[12px] font-normal text-white hover:bg-[#303030]"
+          >
+            保存
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 items-start gap-[20px] lg:grid-cols-2">
@@ -735,9 +786,16 @@ function ScheduledTaskEditorPage({
               <Label className={FIELD_LABEL_CLASS}>调度类型</Label>
               <Select
                 value={values.schedule_type}
-                onValueChange={(value) =>
-                  update('schedule_type', value as TaskFormValues['schedule_type'])
-                }
+                onValueChange={(value) => {
+                  const nextType = value as TaskFormValues['schedule_type'];
+                  setValues((prev) => {
+                    const next = { ...prev, schedule_type: nextType };
+                    if (nextType === 'daily' && (!next.times || next.times.length === 0)) {
+                      next.times = [next.time || '09:00'];
+                    }
+                    return next;
+                  });
+                }}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
@@ -791,6 +849,94 @@ function ScheduledTaskEditorPage({
                   onChange={(event) => update('run_at', event.target.value)}
                 />
                 {errors.run_at && <p className={FIELD_ERROR_CLASS}>{errors.run_at}</p>}
+              </div>
+            ) : scheduleType === 'daily' ? (
+              <div className="flex flex-col gap-[10px]">
+                <div className="flex items-center justify-between">
+                  <Label className={FIELD_LABEL_CLASS}>执行时段（支持每日多时段推送）</Label>
+                  <span className="text-[12px] text-[#858b9c]">
+                    每日共 {dailyTimes.length} 次
+                  </span>
+                </div>
+
+                {/* Configured Time Badges */}
+                <div className="flex flex-wrap items-center gap-[8px]">
+                  {dailyTimes.map((t) => (
+                    <span
+                      key={t}
+                      className="inline-flex items-center gap-[6px] rounded-[8px] border border-[#d8dce6] bg-[#f8f9fb] px-[10px] py-[5px] text-[13px] font-medium text-[#18181a] shadow-2xs"
+                    >
+                      <span>{t}</span>
+                      {dailyTimes.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => removeDailyTime(t)}
+                          className="text-[#9ea3b5] hover:text-[#d20b0b] transition-colors"
+                          title="移除该时段"
+                        >
+                          <X className="size-[13px]" />
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                </div>
+
+                {/* Add New Time */}
+                <div className="flex items-center gap-[8px]">
+                  <Input
+                    type="time"
+                    className="w-[140px]"
+                    value={newTimeInput}
+                    onChange={(e) => setNewTimeInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        addDailyTime();
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => addDailyTime()}
+                    className="gap-[4px]"
+                  >
+                    <Plus className="size-[13px]" />
+                    <span>添加时段</span>
+                  </Button>
+                </div>
+
+                {/* Quick Presets */}
+                <div className="flex flex-wrap items-center gap-[6px] pt-[2px]">
+                  <span className="text-[12px] text-[#858b9c]">快捷模板:</span>
+                  <button
+                    type="button"
+                    onClick={() => applyTimePreset(['09:00', '13:00', '20:00'])}
+                    className="rounded-[6px] bg-[#f1f3f7] px-[8px] py-[3px] text-[12px] text-[#4f566b] transition-colors hover:bg-[#e4e7ed] hover:text-[#18181a]"
+                  >
+                    早中晚三频 (09:00, 13:00, 20:00)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => applyTimePreset(['09:30', '18:30'])}
+                    className="rounded-[6px] bg-[#f1f3f7] px-[8px] py-[3px] text-[12px] text-[#4f566b] transition-colors hover:bg-[#e4e7ed] hover:text-[#18181a]"
+                  >
+                    上下班双报 (09:30, 18:30)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => applyTimePreset(['09:00', '12:00', '15:00', '18:00'])}
+                    className="rounded-[6px] bg-[#f1f3f7] px-[8px] py-[3px] text-[12px] text-[#4f566b] transition-colors hover:bg-[#e4e7ed] hover:text-[#18181a]"
+                  >
+                    工作四频 (09:00, 12:00, 15:00, 18:00)
+                  </button>
+                </div>
+
+                <p className="text-[12px] leading-[18px] text-[#858b9c]">
+                  设置后，数字员工每天将在 {dailyTimes.join('、')} 自动唤醒并执行，每次执行生成独立运行记录并向飞书推送。
+                </p>
+                {errors.time && <p className={FIELD_ERROR_CLASS}>{errors.time}</p>}
               </div>
             ) : (
               <div className="flex flex-col gap-[6px]">

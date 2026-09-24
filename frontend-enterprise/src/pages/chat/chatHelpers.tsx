@@ -2188,7 +2188,13 @@ export function formatDraftSchedule(draft: ScheduledTaskDraftRead): string {
       ? `一次性 ${formatted}`
       : '一次性';
   }
-  return `每天 ${schedule.time || '09:00'}`;
+  const times = Array.isArray(schedule.times) && schedule.times.length
+    ? schedule.times
+    : [schedule.time || '09:00'];
+  if (times.length > 1) {
+    return `每天 ${times.length} 次 (${times.join('、')})`;
+  }
+  return `每天 ${times[0] || '09:00'}`;
 }
 
 export function scheduleTypeLabel(type: ScheduledTaskDraftRead['schedule_type']): string {
