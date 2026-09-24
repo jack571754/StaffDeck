@@ -112,12 +112,74 @@ function tokenizeMarkdown(code: string): CodeToken[] {
   return tokens;
 }
 
+const SQL_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'ILIKE', 'IS', 'NULL', 'AS',
+  'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'ON', 'USING',
+  'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'NULLS', 'FIRST', 'LAST',
+  'LIMIT', 'OFFSET', 'UNION', 'ALL', 'INTERSECT', 'EXCEPT', 'DISTINCT',
+  'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE', 'TRUNCATE',
+  'CREATE', 'ALTER', 'DROP', 'TABLE', 'VIEW', 'INDEX', 'WITH', 'RECURSIVE',
+  'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'OVER', 'PARTITION', 'WINDOW',
+  'BETWEEN', 'EXISTS', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT',
+]);
+
+const SQL_BUILTINS = new Set([
+  'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROUND', 'FLOOR', 'CEIL', 'ABS',
+  'CONCAT', 'CONCAT_WS', 'SUBSTR', 'SUBSTRING', 'LENGTH', 'TRIM', 'LOWER', 'UPPER', 'REPLACE',
+  'DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'NOW', 'CURDATE', 'CURTIME',
+  'DATEDIFF', 'DATE_ADD', 'DATE_SUB', 'STR_TO_DATE', 'DATE_FORMAT',
+  'COALESCE', 'IFNULL', 'NULLIF', 'IF', 'CAST', 'CONVERT',
+  'RANK', 'DENSE_RANK', 'ROW_NUMBER', 'NTILE', 'LEAD', 'LAG',
+]);
+
+export function tokenizeSql(code: string): CodeToken[] {
+  const tokens: CodeToken[] = [];
+  const pattern = /(--.*$|\/\*[\s\S]*?\*\/|'(?:''|\\'|[^'])*'|"(?:""|\\"|[^"])*"|`[^`]*`|:[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|@\w+|\b\d+(?:\.\d+)?\b|\b[A-Za-z_]\w*\b|[+\-*/%=<>!&|^~]+|[(),.;])/gm;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(code)) !== null) {
+    appendPlain(tokens, code.slice(cursor, match.index));
+    const value = match[0];
+    let type: TokenType = 'plain';
+
+    if (value.startsWith('--') || value.startsWith('/*')) {
+      type = 'comment';
+    } else if (value.startsWith("'") || value.startsWith('"')) {
+      type = 'string';
+    } else if (value.startsWith('`') || value.startsWith(':') || value.startsWith('{') || value.startsWith('@')) {
+      type = 'property';
+    } else if (/^\d/.test(value)) {
+      type = 'number';
+    } else {
+      const upper = value.toUpperCase();
+      if (upper === 'TRUE' || upper === 'FALSE' || upper === 'NULL') {
+        type = 'boolean';
+      } else if (SQL_KEYWORDS.has(upper)) {
+        type = 'keyword';
+      } else if (SQL_BUILTINS.has(upper)) {
+        type = 'builtin';
+      } else if (/^[+\-*/%=<>!&|^~]+$/.test(value)) {
+        type = 'operator';
+      } else if (/^[(),.;]$/.test(value)) {
+        type = 'punctuation';
+      }
+    }
+
+    tokens.push({ text: value, type });
+    cursor = pattern.lastIndex;
+  }
+  appendPlain(tokens, code.slice(cursor));
+  return tokens;
+}
+
 function tokenize(code: string, language?: string): CodeToken[] {
   const normalized = (language || '').toLowerCase();
   if (['text', 'txt', 'log', 'stdout', 'stderr', 'plain'].includes(normalized)) return [{ text: code, type: 'plain' }];
   if (normalized.includes('json')) return tokenizeJson(code);
   if (normalized.includes('python') || normalized === 'py') return tokenizePython(code);
   if (normalized.includes('markdown') || normalized === 'md') return tokenizeMarkdown(code);
+  if (normalized.includes('sql') || normalized === 'pgsql') return tokenizeSql(code);
   return tokenizePython(code);
 }
 
