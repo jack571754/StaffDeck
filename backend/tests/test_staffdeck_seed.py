@@ -386,3 +386,34 @@ def test_staffdeck_seed_archives_legacy_default_agent() -> None:
         assert row.metadata_json.get("hidden_from_staffdeck") is True
         assert row.metadata_json.get("is_default_employee") is True
         assert "agent_tenant_demo_default" not in listed_ids
+
+
+def test_staffdeck_seed_preserves_archived_and_unpublished_employee_states() -> None:
+    with _seeded_session() as db:
+        finance_agent = db.exec(
+            select(AgentProfile).where(
+                AgentProfile.tenant_id == "tenant_demo",
+                AgentProfile.name == "财务",
+            )
+        ).one()
+
+        # Simulate user taking employee offline and unpublishing from gallery
+        finance_agent.status = "archived"
+        meta = dict(finance_agent.metadata_json or {})
+        meta["published_to_gallery"] = False
+        meta["gallery_unpublished_at"] = "2026-09-24T16:00:00Z"
+        meta["gallery_unpublished_by"] = "admin"
+        finance_agent.metadata_json = meta
+        db.add(finance_agent)
+        db.commit()
+
+        # Simulate subsequent service restart
+        seed_demo_data(db)
+        db.commit()
+
+        reloaded = db.get(AgentProfile, finance_agent.id)
+        assert reloaded is not None
+        assert reloaded.status == "archived"
+        assert reloaded.metadata_json.get("published_to_gallery") is False
+        assert reloaded.metadata_json.get("gallery_unpublished_by") == "admin"
+

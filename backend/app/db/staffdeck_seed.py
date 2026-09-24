@@ -64,6 +64,11 @@ USER_EDITABLE_AGENT_METADATA_KEYS = {
     "avatar_preset",
     "avatar_text",
     "avatar_tone",
+    "published_to_gallery",
+    "gallery_published_at",
+    "gallery_published_by",
+    "gallery_unpublished_at",
+    "gallery_unpublished_by",
 }
 
 JsonDict = dict[str, Any]
@@ -157,7 +162,7 @@ def _seed_agents(session: Session, rows: Iterable[JsonDict], id_maps: dict[str, 
             "description": row.get("description"),
             "persona_prompt": row.get("persona_prompt"),
             "is_overall": bool(row.get("is_overall", False)),
-            "status": row.get("status") or "active",
+            "status": existing.status if existing and existing.status else (row.get("status") or "active"),
             "metadata_json": metadata,
         }
         if existing:
@@ -918,8 +923,9 @@ def _sync_seed_agents_to_current_admin(
             continue
         metadata = dict(agent.metadata_json or {})
         metadata.update(admin_metadata)
-        metadata["published_to_gallery"] = True
-        metadata["gallery_published_by"] = admin.username
+        if metadata.get("published_to_gallery") is not False:
+            metadata["published_to_gallery"] = True
+            metadata["gallery_published_by"] = admin.username
         metadata["seed_source"] = SEED_SOURCE
         metadata["managed_by_seed"] = True
         agent.metadata_json = metadata
