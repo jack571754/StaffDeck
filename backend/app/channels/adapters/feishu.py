@@ -228,7 +228,12 @@ class FeishuAdapter:
             except ValueError as exc:
                 raise FeishuTransientError("飞书消息响应格式无效") from exc
             if response.status_code >= 400:
-                raise FeishuPermanentError(f"飞书拒绝消息请求 HTTP {response.status_code}")
+                code = data.get("code")
+                msg = data.get("msg") or data.get("error", {}).get("message") or ""
+                detail = f" (code={code}: {msg})" if (code is not None or msg) else ""
+                if code == 230013:
+                    detail += "（机器人对该用户不可用：通常是因为在飞书开放平台修改可用范围或权限后，尚未在【版本管理与发布】中创建并发布新版本；或者让该用户在飞书客户端先向机器人发一条消息）"
+                raise FeishuPermanentError(f"飞书拒绝消息请求 HTTP {response.status_code}{detail}")
             code = int(data.get("code", -1))
             if code in _TOKEN_INVALID_CODES and attempt == 0:
                 force_refresh = self._tokens.invalidate(binding, expected_token=token)

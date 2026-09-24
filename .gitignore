@@ -43,6 +43,7 @@ backend/skill_agent_loop.db*
 backend/connector-locks/
 *.sqlite
 *.sqlite3
+*.db
 *.db-shm
 *.db-wal
 npm-debug.log*

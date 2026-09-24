@@ -7,10 +7,10 @@ without LLM hallucination, context limits, or sandbox timeouts.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.api.mock import FeishuAppNotifyRequest, feishu_app_notify
 from app.data_query.service import execute_query_by_id
@@ -48,14 +48,15 @@ def build_sales_feishu_card(
     rows: list[dict[str, Any]],
     title: str = "",
     template: str = "blue",
+    is_first_push: bool = False,
 ) -> dict[str, Any]:
     """基于实时销售查询结果行构建原生飞书卡片 2.0：
 
     1. 顶部指标汇总栏 (column_set): 今日净销、达播净销、运营端净销
-    2. 整体销售播报摘要
-    3. 中间板块（店铺正负增量动态排行 Top 5）
+    2. 整体销售播报摘要（当日首次推送时增量置为 0.00万，不对比前一日数据）
+    3. 中间板块（店铺正负增量动态排行 Top 5；当日首次推送时置灰提示暂无排行）
     4. 品牌与渠道明细表格 (table): 7 列自适应宽度
-    5. 24小时时段环比柱状图 (chart): 今日 vs 昨日 24 时段走势对比
+    5. 24小时时段走势柱状图 (chart): 当日首次推送时仅展示今日累计走势，不对比昨日
     """
     brand_rows: list[tuple[str, dict[str, Any]]] = []
     hourly_rows: list[dict[str, Any]] = []
@@ -93,9 +94,9 @@ def build_sales_feishu_card(
     tot_net = float(summary_row.get("净销_万") or 0) if summary_row else 0.0
     tot_ops = float(summary_row.get("运营净销_万") or 0) if summary_row else 0.0
     tot_live = float(summary_row.get("达播净销_万") or 0) if summary_row else 0.0
-    tot_diff = float(summary_row.get("环比增量_万") or 0) if summary_row else 0.0
-    tot_ops_diff = float(summary_row.get("运营增量_万") or 0) if summary_row else 0.0
-    tot_live_diff = float(summary_row.get("达播增量_万") or 0) if summary_row else 0.0
+    tot_diff = 0.0 if is_first_push else (float(summary_row.get("环比增量_万") or 0) if summary_row else 0.0)
+    tot_ops_diff = 0.0 if is_first_push else (float(summary_row.get("运营增量_万") or 0) if summary_row else 0.0)
+    tot_live_diff = 0.0 if is_first_push else (float(summary_row.get("达播增量_万") or 0) if summary_row else 0.0)
 
     update_time = None
     if summary_row:
@@ -195,10 +196,19 @@ def build_sales_feishu_card(
         {
             "tag": "markdown",
             "content": (
-                f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{tot_net:.2f}万**"
-                f"（较上一时刻增量 {_fmt_diff_styled(tot_diff, is_core=True)}，"
-                f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 {_fmt_diff_styled(tot_ops_diff, is_core=True)}；"
-                f"达播端 **{tot_live:.2f}万**，较上一时刻增量 {_fmt_diff_styled(tot_live_diff, is_core=True)}），各渠道运行平稳。"
+                (
+                    f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{tot_net:.2f}万**"
+                    f"（当日首次播报，增量计为 <font color='grey'>0.00万</font>，不对比前一日数据），"
+                    f"其中运营端 **{tot_ops:.2f}万**（增量 <font color='grey'>0.00万</font>）；"
+                    f"达播端 **{tot_live:.2f}万**（增量 <font color='grey'>0.00万</font>），各渠道运行平稳。"
+                )
+                if is_first_push
+                else (
+                    f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{tot_net:.2f}万**"
+                    f"（较上一时刻增量 {_fmt_diff_styled(tot_diff, is_core=True)}，"
+                    f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 {_fmt_diff_styled(tot_ops_diff, is_core=True)}；"
+                    f"达播端 **{tot_live:.2f}万**，较上一时刻增量 {_fmt_diff_styled(tot_live_diff, is_core=True)}），各渠道运行平稳。"
+                )
             ),
             "text_align": "left",
             "text_size": "normal",
@@ -206,7 +216,7 @@ def build_sales_feishu_card(
     ]
 
     # Dynamic Top 5 shops
-    if pos_increment_shops or neg_increment_shops:
+    if not is_first_push and (pos_increment_shops or neg_increment_shops):
         pos_lines = []
         for i, s in enumerate(pos_increment_shops[:5], 1):
             name = s.get("item") or s.get("平台店铺") or "未知店铺"
@@ -269,20 +279,33 @@ def build_sales_feishu_card(
                 ],
             },
         ])
+    elif is_first_push:
+        elements.extend([
+            {
+                "tag": "markdown",
+                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行**\n<font color='grey'>*(当日首次播报，增量统一计为 0.00万，不展示上一时刻店铺增量排行)*</font>",
+                "text_align": "left",
+                "text_size": "normal",
+            },
+            {"tag": "hr"},
+        ])
 
     # Table rows
     table_rows: list[dict[str, Any]] = []
     for display_name, r in brand_rows:
         is_core_row = display_name in ("电商整体", "可复美整体", "可丽金整体")
         brand_label = f"**{display_name}**" if is_core_row else display_name
+        net_diff_val = 0.0 if is_first_push else r.get("环比增量_万")
+        ops_diff_val = 0.0 if is_first_push else r.get("运营增量_万")
+        live_diff_val = 0.0 if is_first_push else r.get("达播增量_万")
         table_rows.append({
             "brand": brand_label,
             "net_sales": _fmt_val_styled(r.get("净销_万"), is_core=is_core_row),
-            "net_diff": _fmt_diff_styled(r.get("环比增量_万"), is_core=is_core_row),
+            "net_diff": _fmt_diff_styled(net_diff_val, is_core=is_core_row),
             "ops_net_sales": _fmt_val_styled(r.get("运营净销_万"), is_core=is_core_row),
-            "ops_diff": _fmt_diff_styled(r.get("运营增量_万"), is_core=is_core_row),
+            "ops_diff": _fmt_diff_styled(ops_diff_val, is_core=is_core_row),
             "live_net_sales": _fmt_val_styled(r.get("达播净销_万"), is_core=is_core_row),
-            "live_diff": _fmt_diff_styled(r.get("达播增量_万"), is_core=is_core_row),
+            "live_diff": _fmt_diff_styled(live_diff_val, is_core=is_core_row),
         })
 
     elements.extend([
@@ -317,19 +340,27 @@ def build_sales_feishu_card(
     # 24h Hourly chart
     if hourly_rows:
         chart_values = []
-        for hr in hourly_rows:
-            h_str = str(hr.get("item", ""))
-            v_today = float(hr.get("运营净销_万") or 0)
-            v_yest = float(hr.get("运营增量_万") or 0)
-            chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
-            chart_values.append({"hour": h_str, "type": "昨日", "value": v_yest})
+        if is_first_push:
+            for hr in hourly_rows:
+                h_str = str(hr.get("item", ""))
+                v_today = float(hr.get("运营净销_万") or 0)
+                chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
+            chart_title = "24小时时段走势（今日累计，万元）"
+        else:
+            for hr in hourly_rows:
+                h_str = str(hr.get("item", ""))
+                v_today = float(hr.get("运营净销_万") or 0)
+                v_yest = float(hr.get("运营增量_万") or 0)
+                chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
+                chart_values.append({"hour": h_str, "type": "昨日", "value": v_yest})
+            chart_title = "24小时时段走势环比（今日 vs 昨日，万元）"
 
         elements.append({
             "tag": "chart",
             "chart_spec": {
                 "type": "bar",
                 "title": {
-                    "text": "24小时时段走势环比（今日 vs 昨日，万元）",
+                    "text": chart_title,
                 },
                 "data": {
                     "values": chart_values,
@@ -413,6 +444,65 @@ def _build_generic_feishu_card(
     }
 
 
+def is_task_first_push_today(
+    task: ScheduledTask,
+    run: ScheduledTaskRun | None,
+    db: Session,
+) -> bool:
+    """判断当前任务执行是否为当日首次推送。
+
+    判定规则：
+    1. 任务 metadata 或 pipeline 步骤参数中若显式指定 is_first_push，以显式配置为准；
+    2. 若计划为 daily 多时段（如 ["08:00", "17:00", "23:58"]），且当前计划执行时间 scheduled_for 匹配当天的首个时段（如 08:00），视为当日首次推送；
+    3. 查询在本地时区（Asia/Shanghai，UTC+8）下当天此前是否已有状态为 succeeded 的执行记录。若无，则视为当日首次推送。
+    """
+    metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
+    if "is_first_push" in metadata:
+        return bool(metadata["is_first_push"])
+
+    for step in (task.pipeline_steps_json or []):
+        if isinstance(step, dict) and isinstance(step.get("params"), dict) and "is_first_push" in step["params"]:
+            return bool(step["params"]["is_first_push"])
+
+    cst = timezone(timedelta(hours=8))
+    now_cst = datetime.now(cst)
+    today_cst_str = now_cst.strftime("%Y-%m-%d")
+
+    schedule_cfg = task.schedule_json if isinstance(task.schedule_json, dict) else {}
+    times = schedule_cfg.get("times")
+    if isinstance(times, list) and times:
+        first_time = str(times[0]).strip()
+        sched_for = run.scheduled_for if run and run.scheduled_for else None
+        if sched_for:
+            sched_for_cst = (
+                sched_for.replace(tzinfo=UTC).astimezone(cst)
+                if sched_for.tzinfo is None
+                else sched_for.astimezone(cst)
+            )
+            if sched_for_cst.strftime("%H:%M") == first_time:
+                return True
+
+    current_run_id = run.id if run else ""
+    runs = db.exec(
+        select(ScheduledTaskRun).where(
+            ScheduledTaskRun.scheduled_task_id == task.id,
+            ScheduledTaskRun.status == "succeeded",
+            ScheduledTaskRun.id != current_run_id,
+        )
+    ).all()
+
+    succeeded_today = [
+        r for r in runs
+        if r.created_at and (
+            r.created_at.replace(tzinfo=UTC).astimezone(cst)
+            if r.created_at.tzinfo is None
+            else r.created_at.astimezone(cst)
+        ).strftime("%Y-%m-%d") == today_cst_str
+    ]
+
+    return len(succeeded_today) == 0
+
+
 def execute_pipeline_scheduled_task(
     db: Session,
     task: ScheduledTask,
@@ -430,6 +520,13 @@ def execute_pipeline_scheduled_task(
     steps = task.pipeline_steps_json or []
     query_rows: list[dict[str, Any]] = []
     step_results: list[dict[str, Any]] = []
+    is_first_push = is_task_first_push_today(task, run, db)
+    if is_first_push:
+        logger.info(
+            "Task %s (run %s) identified as FIRST push of today. Increment logic set to 0.00万.",
+            task.id,
+            run.id,
+        )
 
     try:
         # Step 1: Execute query steps
@@ -440,21 +537,32 @@ def execute_pipeline_scheduled_task(
                 if not template_id:
                     raise ValueError(f"流水线步骤 {idx} 缺少 template_id")
                 params = dict(step.get("params") or {})
+                params["is_first_push"] = is_first_push
                 query_res = execute_query_by_id(db, template_id, task.tenant_id, params)
                 query_rows = query_res.rows
+                if is_first_push:
+                    for row in query_rows:
+                        if "环比增量_万" in row:
+                            row["环比增量_万"] = 0.0
+                        if "运营增量_万" in row:
+                            row["运营增量_万"] = 0.0
+                        if "达播增量_万" in row:
+                            row["达播增量_万"] = 0.0
                 step_results.append({
                     "step": idx,
                     "type": "query",
                     "template_id": template_id,
                     "rows_count": len(query_rows),
                     "execution_time_ms": query_res.execution_time_ms,
+                    "is_first_push": is_first_push,
                 })
                 logger.info(
-                    "Pipeline step %d (query): template %s returned %d rows in %.2fms",
+                    "Pipeline step %d (query): template %s returned %d rows in %.2fms (is_first_push=%s)",
                     idx,
                     template_id,
                     len(query_rows),
                     query_res.execution_time_ms,
+                    is_first_push,
                 )
 
             elif step_type in ("skill_notify", "feishu_notify", "notify"):
@@ -470,7 +578,7 @@ def execute_pipeline_scheduled_task(
                     })
                     continue
 
-                card_payload = build_sales_feishu_card(query_rows, title=task.title)
+                card_payload = build_sales_feishu_card(query_rows, title=task.title, is_first_push=is_first_push)
                 notify_req = FeishuAppNotifyRequest(
                     scheduled_task_id=task.id,
                     tenant_id=task.tenant_id,
@@ -497,8 +605,9 @@ def execute_pipeline_scheduled_task(
         run.error = None
         has_push = any(s.get("type") in ("skill_notify", "feishu_notify", "notify") and s.get("status") != "skipped" for s in step_results)
         push_summary = "已成功装配并推送至飞书" if has_push else "飞书消息通知未启用（已跳过推送）"
+        push_first_note = "（当日首次推送，增量置为0）" if is_first_push else ""
         run.result_summary = (
-            f"流水线执行成功：共完成 {len(steps)} 个阶段，"
+            f"流水线执行成功{push_first_note}：共完成 {len(steps)} 个阶段，"
             f"查询到 {len(query_rows)} 条数据记录，{push_summary}。"
         )
         run.trace_json = {

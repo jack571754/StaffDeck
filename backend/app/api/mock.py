@@ -634,20 +634,20 @@ def feishu_app_notify(
 
     # 1. 若来自定时任务上下文且未传显式目标，自动继承任务中配置的飞书通知目标
     task_notify: dict[str, Any] = {}
+    has_explicit_targets = bool(
+        request.chat_id
+        or request.chat_ids
+        or request.webhook_url
+        or request.webhooks
+        or request.mobiles
+        or request.open_ids
+        or request.emails
+    )
     if request.scheduled_task_id:
         task = db.get(ScheduledTask, request.scheduled_task_id)
         if task and isinstance(task.metadata_json, dict):
             raw_fn = task.metadata_json.get("feishu_notify")
             if isinstance(raw_fn, dict):
-                has_explicit_targets = bool(
-                    request.chat_id
-                    or request.chat_ids
-                    or request.webhook_url
-                    or request.webhooks
-                    or request.mobiles
-                    or request.open_ids
-                    or request.emails
-                )
                 if raw_fn.get("enabled") is False and not has_explicit_targets:
                     return {
                         "ok": True,
@@ -658,7 +658,8 @@ def feishu_app_notify(
                         "sent": [],
                         "failed": [],
                     }
-                task_notify = raw_fn
+                if not has_explicit_targets:
+                    task_notify = raw_fn
 
     # 规范化目标列表
     chat_ids_to_send: list[str] = []
@@ -668,7 +669,7 @@ def feishu_app_notify(
         c = cid.strip()
         if c and c not in chat_ids_to_send:
             chat_ids_to_send.append(c)
-    if not chat_ids_to_send and task_notify:
+    if not has_explicit_targets and not chat_ids_to_send and task_notify:
         for cid in task_notify.get("chat_ids") or []:
             c = str(cid).strip()
             if c and c not in chat_ids_to_send:
@@ -685,7 +686,7 @@ def feishu_app_notify(
         w = wh.strip()
         if w and w not in webhooks_to_send:
             webhooks_to_send.append(w)
-    if not webhooks_to_send and task_notify:
+    if not has_explicit_targets and not webhooks_to_send and task_notify:
         for wh in task_notify.get("webhooks") or []:
             w = str(wh).strip()
             if w and w not in webhooks_to_send:
@@ -696,14 +697,14 @@ def feishu_app_notify(
                 webhooks_to_send.append(w)
 
     open_ids_to_send = [oid.strip() for oid in request.open_ids if oid.strip()]
-    if not open_ids_to_send and task_notify:
+    if not has_explicit_targets and not open_ids_to_send and task_notify:
         for oid in task_notify.get("open_ids") or []:
             o = str(oid).strip()
             if o and o not in open_ids_to_send:
                 open_ids_to_send.append(o)
 
     raw_mobiles = [m.strip() for m in request.mobiles if str(m).strip()]
-    if not raw_mobiles and task_notify:
+    if not has_explicit_targets and not raw_mobiles and task_notify:
         for m in task_notify.get("mobiles") or []:
             ms = str(m).strip()
             if ms and ms not in raw_mobiles:
@@ -877,11 +878,20 @@ def feishu_app_notify(
                         "error": str(exc),
                     })
 
-    return {
+    err_detail = None
+    if not sent_results and failed_results:
+        err_detail = "；".join(f"{f.get('error')}" for f in failed_results)
+    elif failed_results:
+        err_detail = f"部分发送失败：{len(failed_results)} 个通道未送达"
+
+    res: dict[str, Any] = {
         "ok": len(sent_results) > 0,
         "sent_count": len(sent_results),
         "failed_count": len(failed_results),
         "sent": sent_results,
         "failed": failed_results,
     }
+    if err_detail:
+        res["error"] = err_detail
+    return res
 

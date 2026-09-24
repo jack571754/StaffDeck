@@ -160,3 +160,88 @@ def test_list_feishu_recipients_resolution():
     assert "张三" in res[0]["display_name"]
 
 
+def test_duplicate_scheduled_task_with_reset_recipients():
+    db = _test_session()
+    _seed(db)
+    creator = db.get(User, "user_admin")
+    assert creator is not None
+
+    req = ScheduledTaskCreateRequest(
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+        title="销售播报原任务",
+        prompt="原任务Prompt",
+        schedule_type="interval",
+        schedule={"unit": "hours", "interval": 1},
+        metadata={
+            "feishu_notify": {
+                "enabled": True,
+                "binding_id": "bind_1",
+                "chat_ids": ["oc_chat1"],
+                "chat_names": ["销售数据群"],
+                "mobiles": ["13800000000"],
+                "open_ids": ["ou_test12345678"],
+                "webhooks": ["https://open.feishu.cn/open-apis/bot/v2/hook/abc"],
+            },
+        },
+    )
+    original = create_scheduled_task(db, req, creator)
+
+    # When reset_recipients is True, all recipients are cleared to prevent cross-contamination
+    dup = duplicate_scheduled_task(db, original, creator, reset_recipients=True)
+    meta = dup.metadata_json or {}
+    feishu = meta.get("feishu_notify") or {}
+    assert feishu.get("binding_id") == "bind_1"
+    assert feishu.get("chat_ids") == []
+    assert feishu.get("open_ids") == []
+    assert feishu.get("mobiles") == []
+    assert feishu.get("webhooks") == []
+
+
+def test_feishu_app_notify_strict_target_isolation():
+    """Verify that when explicit targets are provided, empty targets do NOT resurrect from task_notify."""
+    from app.channels.adapters.feishu import FeishuAdapter
+
+    db = _test_session()
+    _seed(db)
+    creator = db.get(User, "user_admin")
+
+    req_task = ScheduledTaskCreateRequest(
+        tenant_id="tenant_demo",
+        agent_id="agent_demo",
+        title="原有任务",
+        prompt="测试",
+        schedule_type="interval",
+        schedule={"unit": "hours", "interval": 1},
+        metadata={
+            "feishu_notify": {
+                "enabled": True,
+                "binding_id": "bind_1",
+                "chat_ids": ["oc_old_chat"],
+                "open_ids": ["ou_old_user"],
+                "webhooks": ["https://open.feishu.cn/open-apis/bot/v2/hook/old_hook"],
+            },
+        },
+    )
+    task = create_scheduled_task(db, req_task, creator)
+
+    # Caller explicitly provides open_ids=["ou_new_user"], no webhooks, no chat_ids
+    with patch.object(FeishuAdapter, "create_card", return_value="om_new"):
+        notify_req = FeishuAppNotifyRequest(
+            scheduled_task_id=task.id,
+            tenant_id="tenant_demo",
+            binding_id="bind_1",
+            open_ids=["ou_new_user"],
+            card={"type": "template", "data": {}},
+        )
+        res = feishu_app_notify(notify_req, db=db)
+        assert res.get("ok") is True
+        assert res.get("sent_count") == 1
+        sent_targets = [s["identifier"] for s in res.get("sent", [])]
+        assert sent_targets == ["ou_new_user"]
+        # Must NOT include the task's old targets!
+        assert "ou_old_user" not in sent_targets
+        assert "oc_old_chat" not in sent_targets
+
+
+

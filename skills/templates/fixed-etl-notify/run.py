@@ -123,7 +123,7 @@ def resolve_notification_target(
         webhook_url = os.getenv(f"STAFFDECK_TASK_{target_task_id.upper()}_WEBHOOK", "")
     elif target_agent_id and os.getenv(f"STAFFDECK_AGENT_{target_agent_id.upper()}_WEBHOOK"):
         webhook_url = os.getenv(f"STAFFDECK_AGENT_{target_agent_id.upper()}_WEBHOOK", "")
-    else:
+    elif not target_task_id:
         root_url = str(CONFIG.get("webhook_url") or CONFIG.get("default_webhook_url") or "").strip()
         if root_url.startswith(("http://", "https://")):
             webhook_url = root_url
@@ -181,7 +181,7 @@ FEISHU_WEBHOOK_URL = resolve_webhook_url()
 
 
 def init_dedup_db() -> None:
-    """初始化轻量指纹去重表。"""
+    """初始化轻量指纹去重表与每日首次推送状态表。"""
     with sqlite3.connect(DEDUP_DB_PATH) as conn:
         conn.execute(
             """
@@ -193,6 +193,40 @@ def init_dedup_db() -> None:
                 pushed_at DATETIME
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pushed_daily_sessions (
+                push_date TEXT PRIMARY KEY,
+                task_id TEXT,
+                pushed_at DATETIME
+            )
+            """
+        )
+        conn.commit()
+
+
+def check_is_first_push_today(task_id: str = "") -> bool:
+    """检查今天本地日期是否尚未有推送记录。"""
+    init_dedup_db()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DEDUP_DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM pushed_daily_sessions WHERE push_date = ? AND (task_id = ? OR task_id = '' OR ? = '')",
+            (today_str, task_id, task_id),
+        )
+        return cur.fetchone() is None
+
+
+def record_daily_pushed(task_id: str = "") -> None:
+    """记录本日已完成首次推送。"""
+    init_dedup_db()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DEDUP_DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pushed_daily_sessions VALUES (?, ?, ?)",
+            (today_str, task_id, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
 
@@ -322,6 +356,7 @@ def push_feishu_card(
     total_checked: int,
     mode: str = "audit",
     dry_run: bool = False,
+    is_first_push: bool = False,
     agent_id: str | None = None,
     task_id: str | None = None,
     task_title: str | None = None,
@@ -423,7 +458,7 @@ def push_feishu_card(
     regular_items = [x for x in items if x not in pos_shops and x not in neg_shops]
 
     shop_card_elements = []
-    if pos_shops or neg_shops:
+    if not is_first_push and (pos_shops or neg_shops):
         pos_lines = []
         for i, s in enumerate(pos_shops[:5], 1):
             name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
@@ -487,6 +522,16 @@ def push_feishu_card(
             },
             {"tag": "hr"},
         ])
+    elif is_first_push and (pos_shops or neg_shops or any(str(x.get("category") or "") == "大盘" for x in items)):
+        shop_card_elements.extend([
+            {
+                "tag": "markdown",
+                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行**\n<font color='grey'>*(当日首次播报，增量统一计为 0.00万，不展示上一时刻店铺增量排行)*</font>",
+                "text_align": "left",
+                "text_size": "normal",
+            },
+            {"tag": "hr"},
+        ])
 
     card_elements = [
         {
@@ -525,16 +570,34 @@ def push_feishu_card(
     )
     if summary_item:
         tot_net = float(summary_item.get("净销_万") or 0)
-        tot_diff = float(summary_item.get("环比增量_万") or 0)
         tot_ops = float(summary_item.get("运营净销_万") or 0)
-        tot_ops_diff = float(summary_item.get("运营增量_万") or 0)
         tot_live = float(summary_item.get("达播净销_万") or 0)
-        tot_live_diff = float(summary_item.get("达播增量_万") or 0)
         now_time = str(summary_item.get("数据更新时间") or datetime.now(timezone.utc).strftime("%m-%d %H:%M"))
 
-        diff_str = f"+{tot_diff:.2f}万" if tot_diff > 0 else f"{tot_diff:.2f}万"
-        ops_diff_str = f"+{tot_ops_diff:.2f}万" if tot_ops_diff > 0 else f"{tot_ops_diff:.2f}万"
-        live_diff_str = f"+{tot_live_diff:.2f}万" if tot_live_diff > 0 else f"{tot_live_diff:.2f}万"
+        if is_first_push:
+            tot_diff = 0.0
+            tot_ops_diff = 0.0
+            tot_live_diff = 0.0
+            summary_content = (
+                f"📢 **整体销售播报**：截止 {now_time}，电商整体净销 **{tot_net:.2f}万**"
+                f"（当日首次播报，增量计为 <font color='grey'>0.00万</font>，不对比前一日数据），"
+                f"其中运营端 **{tot_ops:.2f}万**（增量 <font color='grey'>0.00万</font>）；"
+                f"达播端 **{tot_live:.2f}万**（增量 <font color='grey'>0.00万</font>），各渠道运行平稳。"
+            )
+        else:
+            tot_diff = float(summary_item.get("环比增量_万") or 0)
+            tot_ops_diff = float(summary_item.get("运营增量_万") or 0)
+            tot_live_diff = float(summary_item.get("达播增量_万") or 0)
+
+            diff_str = f"+{tot_diff:.2f}万" if tot_diff > 0 else f"{tot_diff:.2f}万"
+            ops_diff_str = f"+{tot_ops_diff:.2f}万" if tot_ops_diff > 0 else f"{tot_ops_diff:.2f}万"
+            live_diff_str = f"+{tot_live_diff:.2f}万" if tot_live_diff > 0 else f"{tot_live_diff:.2f}万"
+            summary_content = (
+                f"📢 **整体销售播报**：截止 {now_time}，电商整体净销 **{tot_net:.2f}万**"
+                f"（较上一时刻增量 <font color='{'green' if tot_diff >= 0 else 'red'}'>**{diff_str}**</font>，"
+                f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 <font color='{'green' if tot_ops_diff >= 0 else 'red'}'>**{ops_diff_str}**</font>；"
+                f"达播端 **{tot_live:.2f}万**，较上一时刻增量 <font color='{'green' if tot_live_diff >= 0 else 'red'}'>**{live_diff_str}**</font>），各渠道运行平稳。"
+            )
 
         card_elements.insert(
             0,
@@ -542,12 +605,7 @@ def push_feishu_card(
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": (
-                        f"📢 **整体销售播报**：截止 {now_time}，电商整体净销 **{tot_net:.2f}万**"
-                        f"（较上一时刻增量 <font color='{'green' if tot_diff >= 0 else 'red'}'>**{diff_str}**</font>，"
-                        f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 <font color='{'green' if tot_ops_diff >= 0 else 'red'}'>**{ops_diff_str}**</font>；"
-                        f"达播端 **{tot_live:.2f}万**，较上一时刻增量 <font color='{'green' if tot_live_diff >= 0 else 'red'}'>**{live_diff_str}**</font>），各渠道运行平稳。"
-                    ),
+                    "content": summary_content,
                 },
             },
         )
@@ -651,6 +709,7 @@ def push_feishu_card(
                             item.get("_identifier", ""),
                             str(item.get("current_price") or item.get("price") or ""),
                         )
+                    record_daily_pushed(task_id or "")
                     sent_cnt = resp_json.get("sent_count", 0)
                     failed_cnt = resp_json.get("failed_count", 0)
                     msg = f"成功发送至 {sent_cnt} 个目标"
@@ -671,6 +730,7 @@ def push_feishu_card(
                     item.get("_identifier", ""),
                     str(item.get("current_price") or item.get("price") or ""),
                 )
+            record_daily_pushed(task_id or "")
             return {"push_status": "success", "pushed_count": len(items)}
         return {"push_status": "failed", "message": f"飞书返回 HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:  # noqa: BLE001
@@ -695,12 +755,14 @@ def main() -> None:
     parser.add_argument("--binding-id", default=os.getenv("FEISHU_NOTIFY_BINDING_ID", ""), help="指定推送使用的飞书应用（定时任务通常无需传入，由服务端按 --task-id 解析）")
     parser.add_argument("--notify-users", default="", help="需要@通知的飞书人员列表（英文逗号隔开，格式如 'ou_xxx:张三,ou_yyy:李四' 或 'ou_xxx'）")
     parser.add_argument("--mention-all", action="store_true", help="是否在飞书群中 @所有人")
+    parser.add_argument("--first-push", action="store_true", help="强制当日首次推送模式（增量置为0，不对比前一日）")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     try:
         # 1. 取数
         rows = fetch_from_query_template(args.template_id, dry_run=args.dry_run)
+        is_first = bool(args.first_push or check_is_first_push_today(args.task_id))
         # 2. 处理 & 去重
         items, skipped_count = process_records(rows, mode=args.mode)
         # 3. 推送
@@ -709,6 +771,7 @@ def main() -> None:
             total_checked=len(rows),
             mode=args.mode,
             dry_run=args.dry_run,
+            is_first_push=is_first,
             agent_id=args.agent_id,
             task_id=args.task_id,
             task_title=args.task_title,
@@ -733,6 +796,7 @@ def main() -> None:
             "total_checked": len(rows),
             "new_items": len(items),
             "skipped_duplicates": skipped_count,
+            "is_first_push": is_first,
             "agent_id": args.agent_id or "default",
             "task_id": args.task_id or "",
             "task_title": args.task_title or "",

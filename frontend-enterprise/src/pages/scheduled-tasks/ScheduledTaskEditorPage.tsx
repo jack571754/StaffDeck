@@ -256,13 +256,31 @@ function ScheduledTaskEditorPage({
     if (!taskId) return;
     try {
       const duplicated = await api.post<ScheduledTaskRead>(
-        `/api/enterprise/scheduled-tasks/${taskId}/duplicate?tenant_id=${TENANT_ID}`,
+        `/api/enterprise/scheduled-tasks/${taskId}/duplicate?tenant_id=${TENANT_ID}&reset_recipients=true`,
       );
-      notify.success(`已复制任务 "${duplicated.title}"，状态默认为暂停`);
+      notify.success(`已复制任务 "${duplicated.title}"，推送目标已独立重置`);
       navigate(`/enterprise/scheduled-tasks/${duplicated.id}/edit`);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '复制任务失败');
     }
+  }
+
+  function handleClearNotifyTargets() {
+    setValues((prev) => ({
+      ...prev,
+      feishu_notify: {
+        ...prev.feishu_notify,
+        chat_ids: [],
+        chat_names: [],
+        webhooks: [],
+        mobiles: [],
+        open_ids: [],
+        chat_id: '',
+        chat_name: '',
+        webhook_url: '',
+      },
+    }));
+    notify.info('已清空当前任务的所有推送目标，请按需单独配置');
   }
 
   async function handleTestNotify() {
@@ -1027,27 +1045,43 @@ function ScheduledTaskEditorPage({
                 <h3 className="text-[14px] font-semibold text-[#18181a] flex items-center gap-2">
                   飞书消息通知配置
                   <span className="rounded-full bg-[#e8f0ff] px-2 py-0.5 text-[11px] font-medium text-[#3370ff]">
-                    多目标直发 · 企业应用 & Webhook
+                    独立配置 · 任务隔离
                   </span>
                 </h3>
                 <p className="text-[12px] text-[#858b9c]">
-                  支持同时勾选多个企业应用群聊、添加多个群机器人 Webhook 地址，并可按手机号精准私信直达多位责任人。
+                  每个定时任务独立配置推送目标（群聊、责任人、Webhook），任务间互不影响。
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-[12px]">
               {values.feishu_notify.enabled && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={testingNotify}
-                  onClick={handleTestNotify}
-                  className="flex items-center gap-1.5 text-[12px] text-[#3370ff] border-[#3370ff]/30 hover:bg-[#3370ff]/5 cursor-pointer"
-                >
-                  <Send className={cn('size-3.5', testingNotify && 'animate-spin')} />
-                  {testingNotify ? '正在测试推送...' : '发送测试推送'}
-                </Button>
+                <>
+                  {((values.feishu_notify.chat_ids || []).length > 0 ||
+                    (values.feishu_notify.webhooks || []).length > 0 ||
+                    (values.feishu_notify.mobiles || []).length > 0 ||
+                    (values.feishu_notify.open_ids || []).length > 0) && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleClearNotifyTargets}
+                      className="text-[12px] text-[#858b9c] hover:text-[#d20b0b] cursor-pointer"
+                    >
+                      清空推送目标
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={testingNotify}
+                    onClick={handleTestNotify}
+                    className="flex items-center gap-1.5 text-[12px] text-[#3370ff] border-[#3370ff]/30 hover:bg-[#3370ff]/5 cursor-pointer"
+                  >
+                    <Send className={cn('size-3.5', testingNotify && 'animate-spin')} />
+                    {testingNotify ? '正在测试推送...' : '发送测试推送'}
+                  </Button>
+                </>
               )}
               <div className="flex items-center gap-[8px]">
                 <Switch
@@ -1326,6 +1360,9 @@ function ScheduledTaskEditorPage({
                         >
                           <UserCheck className="size-3 text-[#3370ff]" />
                           {getRecipientLabel(openId)}
+                          <span className="text-[10px] bg-[#d0e2ff] px-1.5 py-0.2 rounded text-[#1a56db]">
+                            直接私聊
+                          </span>
                           <button
                             type="button"
                             onClick={() => removeRecipient(openId)}
@@ -1338,10 +1375,13 @@ function ScheduledTaskEditorPage({
                       {(values.feishu_notify.mobiles || []).map((mobile) => (
                         <span
                           key={mobile}
-                          className="inline-flex items-center gap-[6px] rounded-full bg-[#f4f5f7] px-[10px] py-[3px] text-[12px] font-medium text-[#4e5969]"
+                          className="inline-flex items-center gap-[6px] rounded-full bg-[#fff7e6] border border-[#ffd591] px-[10px] py-[3px] text-[12px] font-medium text-[#d46b08]"
                         >
-                          <Smartphone className="size-3 text-[#4e5969]" />
+                          <Smartphone className="size-3 text-[#d46b08]" />
                           {mobile}
+                          <span className="text-[10px] bg-[#ffe7ba] px-1.5 py-0.2 rounded text-[#d46b08]">
+                            需通讯录权限
+                          </span>
                           <button
                             type="button"
                             onClick={() => removeRecipient(mobile)}
@@ -1383,9 +1423,19 @@ function ScheduledTaskEditorPage({
                       添加责任人
                     </Button>
                   </div>
-                  <p className="text-[12px] leading-[18px] text-[#858b9c]">
-                    支持直接输入飞书用户的 OpenID (以 <code>ou_</code> 开头，推荐，无需通讯录手机号权限) 或手机号 (通过飞书应用反查)。
-                  </p>
+
+                  <div className="rounded-[8px] bg-[#fffbe6] border border-[#ffe58f] p-[10px] text-[12px] text-[#ad6800] flex flex-col gap-1.5">
+                    <p className="font-medium flex items-center gap-1">
+                      <AlertCircle className="size-3.5 shrink-0" />
+                      手机号推送提示（飞书权限说明）：
+                    </p>
+                    <p className="leading-[18px]">
+                      通过手机号私聊需飞书自建应用开通敏感权限 <code>contact:user.phone:readonly</code>。若未开通，飞书官方会拒绝返回用户标识。
+                    </p>
+                    <p className="leading-[18px] text-[#593800]">
+                      <strong>💡 免权限 20 秒直达方案：</strong>让该责任人在飞书中搜索机器人（或应用名称）发送任意私聊（如发“你好”），系统即可自动识别并在上方的「快捷添加系统已绑定用户」中出现，点击 <strong>+</strong> 即可 100% 稳定私聊推送！
+                    </p>
+                  </div>
                 </div>
               </div>
 

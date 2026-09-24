@@ -155,9 +155,9 @@ export default function ScheduledTasksTab() {
   async function duplicate(row: ScheduledTaskRead) {
     try {
       const duplicated = await api.post<ScheduledTaskRead>(
-        `/api/enterprise/scheduled-tasks/${row.id}/duplicate?tenant_id=${TENANT_ID}`,
+        `/api/enterprise/scheduled-tasks/${row.id}/duplicate?tenant_id=${TENANT_ID}&reset_recipients=true`,
       );
-      notify.success(`已复制任务 "${duplicated.title}"，状态默认为暂停`);
+      notify.success(`已复制任务 "${duplicated.title}"，推送目标已独立重置`);
       await load();
       navigate(`/enterprise/scheduled-tasks/${duplicated.id}/edit`);
     } catch (error) {

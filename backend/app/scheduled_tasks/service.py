@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import copy
 import re
 import socket
 import threading
@@ -292,6 +293,8 @@ def duplicate_scheduled_task(
     db: Session,
     source: ScheduledTask,
     user_id: str | User,
+    *,
+    reset_recipients: bool = False,
 ) -> ScheduledTask:
     """Create a paused duplicate copy of an existing scheduled task."""
     now = utc_now()
@@ -303,6 +306,18 @@ def duplicate_scheduled_task(
         new_title = f"{base_title}{copy_suffix}"
 
     creator_id = getattr(user_id, "id", None) or str(user_id)
+
+    meta = copy.deepcopy(source.metadata_json) if isinstance(source.metadata_json, dict) else {}
+    if reset_recipients and isinstance(meta.get("feishu_notify"), dict):
+        fn = meta["feishu_notify"]
+        fn["chat_ids"] = []
+        fn["chat_names"] = []
+        fn["webhooks"] = []
+        fn["mobiles"] = []
+        fn["open_ids"] = []
+        fn["chat_id"] = ""
+        fn["chat_name"] = ""
+        fn["webhook_url"] = ""
 
     new_task = ScheduledTask(
         tenant_id=source.tenant_id,
@@ -321,9 +336,9 @@ def duplicate_scheduled_task(
         max_runs=source.max_runs,
         end_at=source.end_at,
         source_session_id=None,
-        metadata_json=dict(source.metadata_json or {}),
+        metadata_json=meta,
         execution_mode=source.execution_mode or "agent",
-        pipeline_steps_json=list(source.pipeline_steps_json or []),
+        pipeline_steps_json=copy.deepcopy(source.pipeline_steps_json) if source.pipeline_steps_json else [],
         run_count=0,
         next_run_at=None,
         lease_owner=None,
@@ -1053,6 +1068,7 @@ def automatic_task_message(task: ScheduledTask) -> str:
                 webhooks.append(w)
 
         mobiles = [str(m).strip() for m in notify.get("mobiles", []) if str(m).strip()]
+        open_ids = [str(o).strip() for o in notify.get("open_ids", []) if str(o).strip()]
 
         info_lines = ["\n\n【系统预设飞书推送配置】"]
         binding_id = str(notify.get("binding_id") or "").strip()
@@ -1080,6 +1096,10 @@ def automatic_task_message(task: ScheduledTask) -> str:
                 for i, h in enumerate(webhooks)
             ]
             info_lines.append(f"- 目标群机器人 (Webhook): {', '.join(masked_hooks)}")
+
+        if open_ids:
+            joined_open_ids = ", ".join(open_ids)
+            info_lines.append(f"- 责任人 OpenID (私聊直达): {joined_open_ids}")
 
         if mobiles:
             joined_mobiles = ", ".join(mobiles)

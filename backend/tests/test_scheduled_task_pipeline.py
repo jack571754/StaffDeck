@@ -17,7 +17,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from app.data_query.models import QueryExecuteResult
 from app.db.models import AgentProfile, ScheduledTaskRun, Tenant, User, new_id, utc_now
-from app.scheduled_tasks.pipeline import build_sales_feishu_card
+from app.scheduled_tasks.pipeline import build_sales_feishu_card, is_task_first_push_today
 from app.scheduled_tasks.schema import ScheduledTaskCreateRequest
 from app.scheduled_tasks.service import (
     _execute_prepared_scheduled_task,
@@ -216,7 +216,7 @@ def test_execute_pipeline_scheduled_task_success() -> None:
             assert "流水线执行成功" in res_run.result_summary
             assert res_run.trace_json["execution_mode"] == "pipeline"
             assert res_run.trace_json["steps_count"] == 2
-            mock_query.assert_called_once_with(db, "qt_50f463a815af4801", "tenant_demo", {"end_date": "今天"})
+            mock_query.assert_called_once_with(db, "qt_50f463a815af4801", "tenant_demo", {"end_date": "今天", "is_first_push": True})
             mock_notify.assert_called_once()
 
 
@@ -298,3 +298,103 @@ def test_scheduled_task_read_includes_pipeline_mode() -> None:
         assert read.execution_mode == "pipeline"
         assert len(read.pipeline_steps) == 1
         assert read.pipeline_steps[0]["template_id"] == "qt_50f463a815af4801"
+
+
+def test_build_sales_feishu_card_first_push() -> None:
+    rows = _sample_sales_rows()
+    card = build_sales_feishu_card(rows, title="实时销售播报 · 当日首次推送", is_first_push=True)
+    elements = card["card"]["body"]["elements"]
+
+    # 1. 顶部汇总栏指标的增量全为 0.00万
+    top_colset = next(e for e in elements if e.get("tag") == "column_set" and len(e.get("columns", [])) == 3)
+    for col in top_colset["columns"]:
+        text = col["elements"][0]["content"]
+        assert "0.00万" in text
+        assert "+58.20万" not in text
+        assert "+26.10万" not in text
+
+    # 2. 播报文本应显示当日首次播报且增量计为0，且不对比前一日数据
+    summary_el = next(e for e in elements if "整体销售播报" in str(e.get("content", "")))
+    assert "当日首次播报，增量计为 <font color='grey'>0.00万</font>，不对比前一日数据" in summary_el["content"]
+    assert "较上一时刻增量" not in summary_el["content"]
+
+    # 3. 店铺正负增量排行应提示当日首次播报置灰信息，不展示正负增量柱
+    assert not any(e.get("tag") == "column_set" and e.get("flex_mode") == "bisect" and "正增量领跑" in str(e) for e in elements)
+    first_push_tip = next(e for e in elements if "不展示上一时刻店铺增量排行" in str(e.get("content", "")))
+    assert first_push_tip is not None
+
+    # 4. 表格中各渠道的增量必须全部置为 0.00万
+    table_el = next(e for e in elements if e.get("tag") == "table")
+    for r in table_el["rows"]:
+        assert r["net_diff"] == "<font color='grey'>0.00万</font>"
+        assert r["ops_diff"] == "<font color='grey'>0.00万</font>"
+        assert r["live_diff"] == "<font color='grey'>0.00万</font>"
+
+    # 5. 24小时走势图不对比昨日，标题为“24小时时段走势（今日累计，万元）”且仅有“今日”序列
+    chart_el = next(e for e in elements if e.get("tag") == "chart")
+    assert chart_el["chart_spec"]["title"]["text"] == "24小时时段走势（今日累计，万元）"
+    chart_values = chart_el["chart_spec"]["data"]["values"]
+    assert all(item["type"] == "今日" for item in chart_values)
+    assert not any(item["type"] == "昨日" for item in chart_values)
+
+
+def test_is_task_first_push_today_detection() -> None:
+    with _test_session() as db:
+        _seed(db)
+        user = db.get(User, "user_demo")
+
+        req = ScheduledTaskCreateRequest(
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            title="实时销售播报（每日多时段）",
+            prompt="查询并播报实时销售",
+            schedule_type="daily",
+            schedule={"times": ["08:00", "17:00", "23:58"]},
+            execution_mode="pipeline",
+            pipeline_steps=[{"type": "query", "template_id": "qt_50f463a815af4801"}],
+        )
+        task = create_scheduled_task(db, req, user)
+
+        # 1. 首次执行（今日尚无成功记录）-> 判定为首次推送
+        run1 = ScheduledTaskRun(
+            id=new_id("run"),
+            tenant_id=task.tenant_id,
+            scheduled_task_id=task.id,
+            agent_id=task.agent_id,
+            user_id=user.id,
+            scheduled_for=utc_now(),
+            status="running",
+            started_at=utc_now(),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.add(run1)
+        db.commit()
+        db.refresh(run1)
+
+        assert is_task_first_push_today(task, run1, db) is True
+
+        # 2. 将 run1 状态标记为 succeeded
+        run1.status = "succeeded"
+        run1.finished_at = utc_now()
+        db.add(run1)
+        db.commit()
+
+        # 3. 当日第二次执行（如下午 17:00 的 run2）-> 判定为非首次推送
+        run2 = ScheduledTaskRun(
+            id=new_id("run"),
+            tenant_id=task.tenant_id,
+            scheduled_task_id=task.id,
+            agent_id=task.agent_id,
+            user_id=user.id,
+            scheduled_for=utc_now(),
+            status="running",
+            started_at=utc_now(),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+        )
+        db.add(run2)
+        db.commit()
+        db.refresh(run2)
+
+        assert is_task_first_push_today(task, run2, db) is False

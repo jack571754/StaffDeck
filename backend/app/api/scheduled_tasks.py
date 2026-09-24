@@ -171,7 +171,7 @@ def test_draft_scheduled_task_notify(
     fn_cfg = request.feishu_notify or {}
     card_content = build_test_feishu_card(request.title or "定时任务")
     notify_req = FeishuAppNotifyRequest(
-        scheduled_task_id=request.task_id,
+        scheduled_task_id=None,  # 显式测试草稿配置，绝不回退或继承已有任务数据库中的旧推送目标
         tenant_id=request.tenant_id,
         webhooks=list(fn_cfg.get("webhooks") or []),
         mobiles=list(fn_cfg.get("mobiles") or []),
@@ -288,13 +288,14 @@ def run_enterprise_scheduled_task_now(
 def duplicate_enterprise_scheduled_task(
     task_id: str,
     tenant_id: str = Query(...),
+    reset_recipients: bool = Query(True, description="是否清空飞书推送目标（群聊、人员、Webhook），避免新任务污染原任务人员"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> ScheduledTaskRead:
     row = _get_task(db, tenant_id, task_id, current_user)
     if row.status == "archived":
         raise HTTPException(status_code=400, detail="已归档的自动任务不能复制")
-    duplicated = duplicate_scheduled_task(db, row, current_user.id)
+    duplicated = duplicate_scheduled_task(db, row, current_user.id, reset_recipients=reset_recipients)
     return scheduled_task_read(duplicated)
 
 
