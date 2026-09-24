@@ -398,3 +398,124 @@ def test_is_task_first_push_today_detection() -> None:
         db.refresh(run2)
 
         assert is_task_first_push_today(task, run2, db) is False
+
+
+def test_card_renderers_registry() -> None:
+    from app.scheduled_tasks.renderers import (
+        build_generic_feishu_card,
+        build_sales_feishu_card,
+        get_card_renderer,
+    )
+
+    assert get_card_renderer("sales_card") is build_sales_feishu_card
+    assert get_card_renderer("sales_card_v2") is build_sales_feishu_card
+    assert get_card_renderer("generic_table") is build_generic_feishu_card
+    # Unknown renderer falls back to generic_table
+    assert get_card_renderer("non_existent_custom_renderer") is build_generic_feishu_card
+    # None falls back to sales_card for backward compatibility
+    assert get_card_renderer(None) is build_sales_feishu_card
+
+    # Generic card rendering
+    sample_rows = [
+        {"order_id": "OD1001", "refund_reason": "七天无理由", "amount": 128.5, "status": "待审核"},
+        {"order_id": "OD1002", "refund_reason": "商品破损", "amount": 299.0, "status": "已同意"},
+    ]
+    generic_card = build_generic_feishu_card(
+        sample_rows,
+        title="🚨 售后退款实时监控",
+        at_users=[{"id": "ou_test_user_1", "name": "售后主管"}],
+    )
+    assert generic_card["msg_type"] == "interactive"
+    card_body = generic_card["card"]["body"]
+    table_element = next(el for el in card_body["elements"] if el.get("tag") == "table")
+    assert len(table_element["columns"]) == 4
+    assert len(table_element["rows"]) == 2
+    assert generic_card["card"]["header"]["title"]["content"] == "🚨 售后退款实时监控"
+
+
+def test_pipeline_execution_with_generic_renderer_and_dynamic_title() -> None:
+    from app.db.models import Message
+
+    with _test_session() as db:
+        tenant, user, agent = _seed(db)
+        task = create_scheduled_task(
+            db,
+            ScheduledTaskCreateRequest(
+                tenant_id=tenant.id,
+                agent_id=agent.id,
+                title="售后退款异常监控巡检",
+                prompt="每10分钟监控售后退款异常",
+                schedule_type="interval",
+                schedule={"minutes": 10},
+                execution_mode="pipeline",
+                pipeline_steps=[
+                    {"type": "query", "template_id": "qt_refund_monitor"},
+                    {"type": "notify", "renderer": "generic_table"},
+                ],
+                metadata={
+                    "feishu_notify": {
+                        "enabled": True,
+                        "webhooks": ["https://open.feishu.cn/open-apis/bot/v2/hook/mock"],
+                    }
+                },
+            ),
+            user,
+        )
+
+        from app.db.models import ChatSession
+        session = ChatSession(
+            id=new_id("session"),
+            tenant_id=tenant.id,
+            agent_id=agent.id,
+            user_id=user.id,
+            channel="scheduled_task",
+            title=f"定时任务: {task.title}",
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+        run = ScheduledTaskRun(
+            id=new_id("schedrun"),
+            tenant_id=tenant.id,
+            scheduled_task_id=task.id,
+            agent_id=agent.id,
+            user_id=user.id,
+            session_id=session.id,
+            status="pending",
+            scheduled_for=utc_now(),
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        mock_rows = [
+            {"refund_id": "RF1001", "shop_name": "天猫旗舰店", "amount": 349.0},
+            {"refund_id": "RF1002", "shop_name": "抖音直营店", "amount": 199.0},
+        ]
+        mock_query_result = QueryExecuteResult(
+            template_id="qt_refund_monitor",
+            columns=["refund_id", "shop_name", "amount"],
+            rows=mock_rows,
+            execution_time_ms=15.2,
+        )
+
+        with (
+            patch("app.scheduled_tasks.pipeline.execute_query_by_id", return_value=mock_query_result),
+            patch("app.scheduled_tasks.pipeline.feishu_app_notify", return_value={"ok": True, "sent_count": 1}) as mock_notify,
+        ):
+            finished_run = _execute_prepared_scheduled_task(db, task, run, manual=True)
+
+        assert finished_run.status == "succeeded"
+        assert mock_notify.called
+        call_arg = mock_notify.call_args[0][0]
+        # Verify card payload is generic table
+        card_elements = call_arg.card["card"]["body"]["elements"]
+        assert any(el.get("tag") == "table" for el in card_elements)
+
+        # Verify dynamic title in assistant message (NOT hardcoded 实时销售播报)
+        from sqlmodel import select
+        asst_msg = db.exec(select(Message).where(Message.session_id == session.id, Message.role == "assistant")).first()
+        assert asst_msg is not None
+        assert "售后退款异常监控巡检流水线执行成功" in asst_msg.content
+        assert "实时销售播报流水线执行成功" not in asst_msg.content

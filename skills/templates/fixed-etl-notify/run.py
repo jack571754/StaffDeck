@@ -49,6 +49,20 @@ try:
 except Exception:  # noqa: BLE001, S110
     pass
 
+# 共享卡片渲染模块（消除 run.py 与 pipeline.py 代码重复与漂移）
+try:
+    for candidate_backend in [
+        CURRENT_DIR.parents[2] / "backend" if len(CURRENT_DIR.parents) >= 3 else None,
+        Path(r"d:\project\02-开源项目\StaffDeck\backend"),
+        Path.cwd() / "backend",
+    ]:
+        if candidate_backend and candidate_backend.exists() and str(candidate_backend) not in sys.path:
+            sys.path.insert(0, str(candidate_backend))
+    from app.scheduled_tasks.renderers.sales_card import build_sales_feishu_card
+    HAS_SHARED_SALES_CARD = True
+except Exception:  # noqa: BLE001
+    HAS_SHARED_SALES_CARD = False
+
 CONFIG: dict[str, Any] = {}
 if CONFIG_PATH.exists():
     try:
@@ -106,7 +120,7 @@ def resolve_notification_target(
     if target_agent_id:
         agent_cfg = agent_routes.get(target_agent_id) or {}
         if not agent_cfg:
-            for _, r_val in agent_routes.items():
+            for r_val in agent_routes.values():
                 if isinstance(r_val, dict) and str(r_val.get("agent_name") or "") == target_agent_id:
                     agent_cfg = r_val
                     break
@@ -430,239 +444,116 @@ def push_feishu_card(
             ),
         }
 
-    # 格式化卡片明细
-    max_items = int(CONFIG.get("max_display_items") or 15)
-    lines: list[str] = []
-    for item in items[:max_items]:
-        name = str(item.get("product_name") or item.get("name") or item.get("_identifier") or "明细项")
-        channel = item.get("_channel", "全渠道")
-        curr = item.get("current_price") or item.get("price") or item.get("净销_万")
-        base = item.get("baseline_price") or item.get("base_price")
+    if mode == "broadcast" and HAS_SHARED_SALES_CARD:
+        payload = build_sales_feishu_card(
+            items,
+            title=task_title or "📊 实时销售播报",
+            is_first_push=is_first_push,
+            at_users=target_users,
+            should_at_all=should_at_all,
+        )
+    else:
+        # 格式化巡检/通用卡片明细
+        max_items = int(CONFIG.get("max_display_items") or 15)
+        lines: list[str] = []
+        for item in items[:max_items]:
+            name = str(item.get("product_name") or item.get("name") or item.get("_identifier") or "明细项")
+            channel = item.get("_channel", "全渠道")
+            curr = item.get("current_price") or item.get("price") or item.get("净销_万")
+            base = item.get("baseline_price") or item.get("base_price")
 
-        if base:
-            diff_rate = item.get("diff_rate", 0)
-            lines.append(
-                f"• **[{channel}]** {name} | 现价: <font color='red'>¥{curr}</font> "
-                f"(基准价: ¥{base}，低 {diff_rate}%)"
-            )
-        else:
-            lines.append(f"• **[{channel}]** {name}: **{curr}**")
+            if base:
+                diff_rate = item.get("diff_rate", 0)
+                lines.append(
+                    f"• **[{channel}]** {name} | 现价: <font color='red'>¥{curr}</font> "
+                    f"(基准价: ¥{base}，低 {diff_rate}%)"
+                )
+            else:
+                lines.append(f"• **[{channel}]** {name}: **{curr}**")
 
-    content_text = "\n".join(lines)
-    card_title = "🚨 业务合规异动巡检预警" if mode == "audit" else "📊 实时业务播报战报"
-    header_color = "red" if mode == "audit" else "blue"
+        content_text = "\n".join(lines)
+        card_title = "🚨 业务合规异动巡检预警" if mode == "audit" else "📊 实时业务播报战报"
+        header_color = "red" if mode == "audit" else "blue"
 
-    # 分离正负增量Top5店铺与普通明细
-    pos_shops = [x for x in items if str(x.get("category") or x.get("_channel") or "") in ("店铺正增量Top5", "正增量Top5")]
-    neg_shops = [x for x in items if str(x.get("category") or x.get("_channel") or "") in ("店铺负增量Top5", "负增量Top5")]
-    regular_items = [x for x in items if x not in pos_shops and x not in neg_shops]
-
-    shop_card_elements = []
-    if not is_first_push and (pos_shops or neg_shops):
-        pos_lines = []
-        for i, s in enumerate(pos_shops[:5], 1):
-            name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
-            net = float(s.get("净销_万") or s.get("price") or 0)
-            diff = float(s.get("环比增量_万") or s.get("diff_amount") or 0)
-            pos_lines.append(f"{i}. **{name}**\n   增量: <font color='green'>**+{diff:.2f}万**</font> | 净销: {net:.2f}万")
-
-        neg_lines = []
-        for i, s in enumerate(neg_shops[:5], 1):
-            name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
-            net = float(s.get("净销_万") or s.get("price") or 0)
-            diff = float(s.get("环比增量_万") or s.get("diff_amount") or 0)
-            diff_str = f"{diff:.2f}万" if diff < 0 else f"-{abs(diff):.2f}万"
-            neg_lines.append(f"{i}. **{name}**\n   增量: <font color='red'>**{diff_str}**</font> | 净销: {net:.2f}万")
-
-        if not neg_lines:
-            neg_lines = ["*(其余活跃店铺增量均为正或持平)*"]
-
-        shop_card_elements.extend([
+        card_elements = [
             {
-                "tag": "markdown",
-                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行（较上一时刻 Top 5）**",
-                "text_align": "left",
-                "text_size": "normal",
-            },
-            {
-                "tag": "column_set",
-                "flex_mode": "bisect",
-                "background_style": "grey",
-                "horizontal_spacing": "12px",
-                "columns": [
+                "tag": "div",
+                "fields": [
                     {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "vertical_align": "top",
-                        "vertical_spacing": "4px",
-                        "elements": [
-                            {
-                                "tag": "markdown",
-                                "content": "📈 <font color='green'>**正增量领跑 Top 5**</font>\n" + ("\n".join(pos_lines) if pos_lines else "暂无"),
-                                "text_size": "normal",
-                            }
-                        ],
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**执行时间**\n{datetime.now(timezone.utc).strftime('%H:%M:%S')} (UTC)",
+                        },
                     },
                     {
-                        "tag": "column",
-                        "width": "weighted",
-                        "weight": 1,
-                        "vertical_align": "top",
-                        "vertical_spacing": "4px",
-                        "elements": [
-                            {
-                                "tag": "markdown",
-                                "content": "📉 <font color='red'>**负增量预警 Top 5**</font>\n" + "\n".join(neg_lines),
-                                "text_size": "normal",
-                            }
-                        ],
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**巡检记录数**\n{total_checked} 条",
+                        },
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**本次推送**\n<font color='{header_color}'>**{len(items)}** 条</font>",
+                        },
                     },
                 ],
             },
             {"tag": "hr"},
-        ])
-    elif is_first_push and (pos_shops or neg_shops or any(str(x.get("category") or "") == "大盘" for x in items)):
-        shop_card_elements.extend([
-            {
-                "tag": "markdown",
-                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行**\n<font color='grey'>*(当日首次播报，增量统一计为 0.00万，不展示上一时刻店铺增量排行)*</font>",
-                "text_align": "left",
-                "text_size": "normal",
-            },
-            {"tag": "hr"},
-        ])
+        ]
 
-    card_elements = [
-        {
-            "tag": "div",
-            "fields": [
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**执行时间**\n{datetime.now(timezone.utc).strftime('%H:%M:%S')} (UTC)",
-                    },
-                },
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**巡检记录数**\n{total_checked} 条",
-                    },
-                },
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**本次推送**\n<font color='{header_color}'>**{len(items)}** 条</font>",
-                    },
-                },
-            ],
-        },
-        {"tag": "hr"},
-    ]
+        if items:
+            card_elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**明细清单：**\n{content_text}"},
+            })
 
-    # 播报模式下的整体汇总文案（含运营端与达播端各自上一时刻增量）
-    summary_item = next(
-        (x for x in items if str(x.get("category") or "") == "大盘" and str(x.get("item") or "") == "电商整体"),
-        None,
-    )
-    if summary_item:
-        tot_net = float(summary_item.get("净销_万") or 0)
-        tot_ops = float(summary_item.get("运营净销_万") or 0)
-        tot_live = float(summary_item.get("达播净销_万") or 0)
-        now_time = str(summary_item.get("数据更新时间") or datetime.now(timezone.utc).strftime("%m-%d %H:%M"))
+        # 插入通知人员 / @关注人 (Mention)
+        at_tags: list[str] = []
+        if should_at_all:
+            at_tags.append('<at id="all">所有人</at>')
+        for u in target_users:
+            uid = str(u.get("id") or u.get("open_id") or "").strip()
+            uname = str(u.get("name") or "").strip()
+            if not uid:
+                continue
+            if "@" in uid and not uid.startswith("ou_"):
+                at_tags.append(f'<at email="{uid}">{uname or uid}</at>')
+            else:
+                at_tags.append(f'<at id="{uid}">{uname or uid}</at>')
 
-        if is_first_push:
-            tot_diff = 0.0
-            tot_ops_diff = 0.0
-            tot_live_diff = 0.0
-            summary_content = (
-                f"📢 **整体销售播报**：截止 {now_time}，电商整体净销 **{tot_net:.2f}万**"
-                f"（当日首次播报，增量计为 <font color='grey'>0.00万</font>，不对比前一日数据），"
-                f"其中运营端 **{tot_ops:.2f}万**（增量 <font color='grey'>0.00万</font>）；"
-                f"达播端 **{tot_live:.2f}万**（增量 <font color='grey'>0.00万</font>），各渠道运行平稳。"
-            )
-        else:
-            tot_diff = float(summary_item.get("环比增量_万") or 0)
-            tot_ops_diff = float(summary_item.get("运营增量_万") or 0)
-            tot_live_diff = float(summary_item.get("达播增量_万") or 0)
-
-            diff_str = f"+{tot_diff:.2f}万" if tot_diff > 0 else f"{tot_diff:.2f}万"
-            ops_diff_str = f"+{tot_ops_diff:.2f}万" if tot_ops_diff > 0 else f"{tot_ops_diff:.2f}万"
-            live_diff_str = f"+{tot_live_diff:.2f}万" if tot_live_diff > 0 else f"{tot_live_diff:.2f}万"
-            summary_content = (
-                f"📢 **整体销售播报**：截止 {now_time}，电商整体净销 **{tot_net:.2f}万**"
-                f"（较上一时刻增量 <font color='{'green' if tot_diff >= 0 else 'red'}'>**{diff_str}**</font>，"
-                f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 <font color='{'green' if tot_ops_diff >= 0 else 'red'}'>**{ops_diff_str}**</font>；"
-                f"达播端 **{tot_live:.2f}万**，较上一时刻增量 <font color='{'green' if tot_live_diff >= 0 else 'red'}'>**{live_diff_str}**</font>），各渠道运行平稳。"
-            )
-
-        card_elements.insert(
-            0,
-            {
+        if at_tags:
+            card_elements.append({
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": summary_content,
+                    "content": f"🔔 **通知负责人**：{' '.join(at_tags)}",
                 },
-            },
-        )
+            })
 
-    # 插入中间板块
-    if shop_card_elements:
-        card_elements.extend(shop_card_elements)
-
-    if regular_items:
         card_elements.append({
-            "tag": "div",
-            "text": {"tag": "lark_md", "content": f"**明细清单：**\n{content_text}"},
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": "已开启状态指纹去重，已通知的相同记录今日不会重复推送。",
+                }
+            ],
         })
 
-    # 插入通知人员 / @关注人 (Mention)
-    at_tags: list[str] = []
-    if should_at_all:
-        at_tags.append('<at id="all">所有人</at>')
-    for u in target_users:
-        uid = str(u.get("id") or u.get("open_id") or "").strip()
-        uname = str(u.get("name") or "").strip()
-        if not uid:
-            continue
-        if "@" in uid and not uid.startswith("ou_"):
-            at_tags.append(f'<at email="{uid}">{uname or uid}</at>')
-        else:
-            at_tags.append(f'<at id="{uid}">{uname or uid}</at>')
-
-    if at_tags:
-        card_elements.append({
-            "tag": "div",
-            "text": {
-                "tag": "lark_md",
-                "content": f"🔔 **通知负责人**：{' '.join(at_tags)}",
+        payload = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {
+                    "title": {"tag": "plain_text", "content": card_title},
+                    "template": header_color,
+                },
+                "elements": card_elements,
             },
-        })
-
-    card_elements.append({
-        "tag": "note",
-        "elements": [
-            {
-                "tag": "plain_text",
-                "content": "已开启状态指纹去重，已通知的相同记录今日不会重复推送。",
-            }
-        ],
-    })
-
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": card_title},
-                "template": header_color,
-            },
-            "elements": card_elements,
-        },
-    }
+        }
 
     try:
         # 分支 A: 统一通过出站中心派发 (支持多群、多Webhook与多手机号)
