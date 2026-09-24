@@ -35,6 +35,8 @@ graph TD
     B --> B8["app/channels"];
     B --> B9["app/tools / knowledge / llm"];
 
+    B4 --> B4a["scheduled_tasks/renderers (飞书卡片注册表)"];
+
     click B "./backend/CLAUDE.md" "查看 backend 模块文档"
     click C "./frontend-enterprise/CLAUDE.md" "查看 frontend-enterprise 模块文档"
     click D "./skills/CLAUDE.md" "查看 skills 模块文档"
@@ -44,6 +46,7 @@ graph TD
     click B1 "./backend/app/core/CLAUDE.md" "查看 core 模块文档"
     click B2 "./backend/app/capabilities/CLAUDE.md" "查看 capabilities 模块文档"
     click B4 "./backend/app/scheduled_tasks/CLAUDE.md" "查看 scheduled_tasks 模块文档"
+    click B4a "./backend/app/scheduled_tasks/CLAUDE.md" "查看 scheduled_tasks 模块文档"
     click B5 "./backend/app/data_query/CLAUDE.md" "查看 data_query 模块文档"
 ```
 
@@ -54,7 +57,8 @@ graph TD
 | backend | `backend/` | Python / FastAPI / SQLModel / SQLite | 接口、Agent 运行时、存储、渠道与任务 Worker | [backend/CLAUDE.md](backend/CLAUDE.md) |
 | — core | `backend/app/core/` | Python | Harness v2 内核：Turn 规划、TaskFrame、能力清单/渐进披露、能力调用、上下文投影、恢复 | [core](backend/app/core/CLAUDE.md) |
 | — capabilities | `backend/app/capabilities/` | Python | 能力契约端口/适配器、注册表与不可变快照、本地知识/技能包实现 | [capabilities](backend/app/capabilities/CLAUDE.md) |
-| — scheduled_tasks | `backend/app/scheduled_tasks/` | Python | 定时/周期任务：草稿、调度、租约、Harness v2 成功判定 | [scheduled_tasks](backend/app/scheduled_tasks/CLAUDE.md) |
+| — scheduled_tasks | `backend/app/scheduled_tasks/` | Python | 定时/周期任务：草稿、调度、租约、Harness v2 成功判定、pipeline 通道 | [scheduled_tasks](backend/app/scheduled_tasks/CLAUDE.md) |
+| — renderers | `backend/app/scheduled_tasks/renderers/` | Python | 飞书卡片渲染器注册表（销售卡 2.0 / 通用表）与数值格式化工具 | [renderers](backend/app/scheduled_tasks/CLAUDE.md) |
 | — data_query | `backend/app/data_query/` | Python | 数据查询中心：数据源、查询模板、MySQL/HTTP 连接器、AES-GCM 加密 | [data_query](backend/app/data_query/CLAUDE.md) |
 | frontend-enterprise | `frontend-enterprise/` | TS / React 18 / Vite 8 / Tailwind 4 / Vitest | StaffDeck 企业工作台（chat / dashboard / data-query / scheduled-tasks）| [frontend-enterprise/CLAUDE.md](frontend-enterprise/CLAUDE.md) |
 | skills | `skills/` | SKILL.md 定义 | 面向 Agent 的技能包：staffdeck-API 系列 + 固定流程模板 | [skills/CLAUDE.md](skills/CLAUDE.md) |
@@ -70,7 +74,8 @@ graph TD
 | 模型能看到/调用哪些能力 | `backend/app/core/capability_manifest.py`（授权）+ `capability_discovery.py`（8K 投影） |
 | 某个内建能力（含 `data_query_search`/`data_query_execute`）行为 | `backend/app/core/harness_capability_invoker.py` `_invoke_internal` |
 | 沙箱/命令/脚本执行语义 | `backend/app/harness/`（`sandbox.py`、`command.py`、`skill_script.py`、`executor.py`） |
-| 定时任务调度/成功判定/假成功 | `backend/app/scheduled_tasks/service.py`、`worker.py`、`pipeline.py` |
+| 定时任务调度/成功判定/假成功 | `backend/app/scheduled_tasks/service.py`、`worker.py` |
+| 定时任务 pipeline 步骤与飞书卡片渲染 | `backend/app/scheduled_tasks/pipeline.py`、`scheduled_tasks/renderers/`（`__init__.py` 注册表 / `sales_card.py` / `generic_table.py`） |
 | 数据查询模板/连接器/SQL 白名单 | `backend/app/data_query/service.py`、`executor.py`、`connectors/mysql_connector.py` |
 | 权限/租户/加密/内部令牌 | `backend/app/security/permissions.py`、`tenant.py`、`encryption.py`、`internal_service.py` |
 | 开放 API v1 端点与鉴权 | `backend/app/public_api/`（`app.py`、`auth.py`、`credential_profiles.py`、各资源路由） |
@@ -91,6 +96,7 @@ graph TD
 - **SQL 白名单**：`data_query/connectors/mysql_connector.py` `_is_sql_allowed`；已知 `WITH ... DELETE` 绕过风险（P0）。
 - **skill 运行时代码在数据库不在仓库**：通用技能包（`GeneralSkill` 表）经 Harness 物化到沙箱 `.harness/skill-packages/`，仓库里看不到运行副本。
 - **定时任务成功判定只信持久化记录**：`scheduled_tasks/service.py` 的 `_scheduled_harness_outcome` / `_scheduled_business_failures`，绝不只信模型答复文本。
+- **pipeline 通道仍是半产品化（本分支热点）**：`scheduled_tasks/renderers/__init__.py` `get_card_renderer(None)` 与 `pipeline.py` 缺省 `renderer_name` 均落到 `sales_card`；引擎对每个 query 步骤无条件注入 `params["is_first_push"]`；`pipeline_steps` 在 `schema.py` 中零校验（无 `process` 步骤类型、无 renderer 枚举），前端 `ScheduledTaskEditorPage.tsx` 无 pipeline 入口。非销售 pipeline 任务须在步骤 JSON 显式指定 `renderer`，且目前只能经 API 手搓 JSON 或写库创建。
 - **不改源码**：文档体系只读代码、只写 `CLAUDE.md` 与 `.claude/index.json`。
 
 ## 运行与开发
@@ -123,5 +129,6 @@ graph TD
 
 ## 变更记录 (Changelog)
 
+- 2026-09-24T16:45 — 初始化架构师（增量，聚焦定时任务 pipeline 通道）：登记新 `backend/app/scheduled_tasks/renderers/` 包（Mermaid 节点 + 模块索引行）；「任务 → 文件对照」拆分定时任务行并新增「pipeline 步骤与飞书卡片渲染」；「关键不变量与边界」新增 pipeline 半产品化条目（默认渲染器为销售卡、`is_first_push` 无条件注入、`pipeline_steps` 零校验、前端无入口）；据提交 `042333ee` 修正事实（销售卡已抽包、`run.py` 已共用同一实现、聊天总结改用 `task.title`）；深度更新 `scheduled_tasks/` 模块文档；刷新 `.claude/index.json`（generated_at = 2026-09-24T16:45:22+08:00）。
 - 2026-09-24T09:46 — 初始化架构师（增量）：**新建** `backend/app/core/CLAUDE.md`、`backend/app/capabilities/CLAUDE.md`；扩展 Mermaid 结构图与模块索引（登记 core/capabilities）；新增「任务 → 文件对照」与「关键不变量与边界」两节；深度更新 `backend/`、`data_query/`、`scheduled_tasks/`、`frontend-enterprise/` 文档；修正 Windows 测试基线路径为仓库根 `AGENTS.md`；刷新 `.claude/index.json`（generated_at = 2026-09-24T09:46:04+08:00）。
 - 2026-09-23T18:06 — 初始化架构师（增量）：重建根级 CLAUDE.md；新增 Mermaid 结构图；新增 `data_query` 模块文档与导航面包屑；更新 `.claude/index.json`。

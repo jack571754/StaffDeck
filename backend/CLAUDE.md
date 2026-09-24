@@ -38,7 +38,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 | `general_skills/` | 通用技能包运行时：runner / runtime_env / schema | — |
 | `llm/` | 模型接入：`client`（LLMClient）、`protocol_drivers`（anthropic/gemini/openai-responses 等）、`model_config_resolver`、提示词 `prompts/*.md` | — |
 | `skills/` | 技能/skill 生命周期：skill_distiller、skill_editor、skill_reflection、skill_schema、step_ids、nesting（SOP 嵌套）、llm_limits、tool_authorization | — |
-| `scheduled_tasks/` | 定时/周期任务引擎 | [scheduled_tasks/CLAUDE.md](app/scheduled_tasks/CLAUDE.md) |
+| `scheduled_tasks/` | 定时/周期任务引擎（含 `renderers/` 飞书卡片渲染器注册表） | [scheduled_tasks/CLAUDE.md](app/scheduled_tasks/CLAUDE.md) |
 | `data_query/` | 数据查询中心 | [data_query/CLAUDE.md](app/data_query/CLAUDE.md) |
 | `teams/` | 多员工团队协作：service / wakeup / sweeper / schema | — |
 | `memory/` | 长期记忆：service / jobs | — |
@@ -100,14 +100,16 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 
 - 员工不回答：查模型配置/API Key/网络 + `.dev/logs/app.log`。
 - 定时任务“假成功”：`scheduled_tasks/service.py` 依赖 Harness v2 持久化状态与业务失败判定，绝不只信答复文本（见该模块文档）。
+- 定时任务 pipeline 任务却出销售播报卡：见 `scheduled_tasks/renderers/` 默认渲染器为 `sales_card`（模块文档「Pipeline 通道」一节）。
 - 模型看不到某能力：`core/capability_manifest.py`（是否授权）与 `core/capability_discovery.py`（是否投影进 8K 目录）。
 - 开放 API 401/403：`public_api/auth.py` 的 scope 与 `credential_profiles.py` 档案不匹配；`sd_live_*` 密钥摘要 pepper 变化会使旧密钥失效。
 
 ## 相关文件清单
 
-`app/main.py`、`app/config.py`、`app/db/models.py`、`app/harness/*`、`app/core/*`、`app/capabilities/*`、`app/security/*`、`app/public_api/*`、`app/a2a/codex_adapter.py`、`app/lark_cli/*`、`pyproject.toml`、`../AGENTS.md`。
+`app/main.py`、`app/config.py`、`app/db/models.py`、`app/harness/*`、`app/core/*`、`app/capabilities/*`、`app/scheduled_tasks/*`、`app/security/*`、`app/public_api/*`、`app/a2a/codex_adapter.py`、`app/lark_cli/*`、`pyproject.toml`、`../AGENTS.md`。
 
 ## 变更记录 (Changelog)
 
+- 2026-09-24T16:45 — 增量更新（聚焦定时任务 pipeline 通道）：`scheduled_tasks/` 子包职责补注 `renderers/` 飞书卡片渲染器注册表；FAQ 新增「pipeline 任务却出销售播报卡」条目（默认渲染器为 `sales_card`）；相关文件清单补 `app/scheduled_tasks/*`。
 - 2026-09-24T09:46 — 增量更新：新增 `core/`、`capabilities/` 子模块文档链接；补 `security/`、`public_api/`、`a2a/`、`lark_cli/` 关键符号与表名；数据模型改为「表名 + 模型」对照表；**修正 Windows 失败基线路径为仓库根 `../AGENTS.md`**（原文误写 `backend/AGENTS.md`）。
 - 2026-09-23T18:06 — 初始化架构师（增量）重建模块文档；新增 `data_query` 子模块页与顶层面包屑。
