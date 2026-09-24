@@ -113,6 +113,9 @@ def get_cached_templates(db: Session, tenant_id: str) -> list[dict[str, Any]]:
                 "name": row.name,
                 "description": row.description,
                 "params": row.params_json or [],
+                "dimensions": row.dimensions_json or [],
+                "metrics": row.metrics_json or [],
+                "example_questions": row.example_questions_json or [],
                 "query_type": row.query_type,
             }
         )
@@ -127,6 +130,8 @@ def _call_router_llm(
     question: str,
     templates: list[dict[str, Any]],
     base_date: date,
+    tenant_id: str = "tenant_default",
+    db: Session | None = None,
 ) -> dict[str, Any]:
     """Execute LLM call to classify intent and extract parameters."""
     weekday_labels = ["一", "二", "三", "四", "五", "六", "日"]
@@ -144,11 +149,14 @@ def _call_router_llm(
         from app.db import engine
         from app.llm import LLMClient
 
-        with Session(engine) as session:
-            # Look for system or router model config
-            model_config = model_for_agent(session, "tenant_default", "router")
+        model_config = None
+        if db is not None:
+            model_config = model_for_agent(db, tenant_id, "router") or model_for_agent(db, "tenant_default", "router")
         if not model_config:
-            logger.warning("No model config available for intent router")
+            with Session(engine) as session:
+                model_config = model_for_agent(session, tenant_id, "router") or model_for_agent(session, "tenant_default", "router")
+        if not model_config:
+            logger.warning("No model config available for intent router (tenant=%s)", tenant_id)
             return {"matched": False}
 
         client = LLMClient(model_config)
@@ -181,11 +189,38 @@ def route_question(
 
     effective_base_date = base_date or datetime.now(tz=UTC).date()
 
+    # Fast-path rule matching: template name or example question exact/contain match
+    q_norm = question.strip().lower()
+    for t in templates:
+        t_name = str(t.get("name") or "").lower()
+        if t_name and (t_name in q_norm or q_norm in t_name):
+            logger.info("Direct name match for template %s (%s)", t["name"], t["id"])
+            return RouteResult(
+                template_id=t["id"],
+                template_name=t["name"],
+                params={},
+                confidence=0.98,
+                explanation=f"Direct match with template '{t['name']}'",
+            )
+        for ex in t.get("example_questions") or []:
+            ex_norm = str(ex).strip().lower()
+            if ex_norm and (ex_norm in q_norm or q_norm in ex_norm):
+                logger.info("Direct example question match for template %s (%s): %s", t["name"], t["id"], ex)
+                return RouteResult(
+                    template_id=t["id"],
+                    template_name=t["name"],
+                    params={},
+                    confidence=0.98,
+                    explanation=f"Direct match with example question: {ex}",
+                )
+
     try:
         raw_result = _call_router_llm(
             question=question.strip(),
             templates=templates,
             base_date=effective_base_date,
+            tenant_id=tenant_id,
+            db=db,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Intent routing execution failed, falling back: %s", exc)

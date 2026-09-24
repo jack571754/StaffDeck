@@ -46,6 +46,8 @@ RESERVED_HARNESS_CAPABILITY_NAMES = {
     "knowledge_search",
     "lark_cli",
     "external_task_status",
+    "data_query_search",
+    "data_query_execute",
 }
 
 
@@ -472,7 +474,7 @@ def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["general_skill", "tool", "knowledge", "file"],
+                            "enum": ["general_skill", "tool", "knowledge", "file", "internal"],
                         },
                         "uniqueItems": True,
                     },
@@ -510,6 +512,62 @@ def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
                     }
                 },
                 "required": ["capabilities"],
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "read"},
+        ),
+        CapabilityDescriptor(
+            capability_id="builtin.data_query.search",
+            name="data_query_search",
+            kind="internal",
+            description=(
+                "Search registered and verified business data query templates (BI/SQL/API) by business keywords or questions. "
+                "Returns template IDs, names, descriptions, parameters, and metrics."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Keywords or question to search templates for (e.g. '实时销售', '店铺净销', '达播').",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 10,
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "read"},
+        ),
+        CapabilityDescriptor(
+            capability_id="builtin.data_query.execute",
+            name="data_query_execute",
+            kind="internal",
+            description=(
+                "Execute an approved business data query template by template_id with parameters. "
+                "Returns formatted table data with columns and rows. "
+                "Never write raw scripts or use exec_command to query databases when a template exists."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The ID of the query template to execute (e.g. 'qt_50f463a815af4801').",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Key-value parameters required by the template.",
+                        "default": {},
+                    },
+                },
+                "required": ["template_id"],
                 "additionalProperties": False,
             },
             metadata={"provider": "harness", "side_effect": "read"},

@@ -103,6 +103,8 @@ def test_initial_projection_expands_only_kernel_and_sop_explicit_capabilities() 
                     "capability_describe",
                     "list_published_deliverables",
                     "read_published_deliverable",
+                    "data_query_search",
+                    "data_query_execute",
                 }
                 else "knowledge"
                 if name == "knowledge_search"

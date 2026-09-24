@@ -262,7 +262,7 @@ class HarnessCapabilityInvoker:
             self.db.add(invocation)
             self.db.commit()
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             result = _failure("HARNESS_TOOL_ERROR", str(exc))
         if result.get("success") is True:
             invocation.status = "completed"
@@ -528,6 +528,10 @@ class HarnessCapabilityInvoker:
             return self._list_published_deliverables(arguments)
         if name == "read_published_deliverable":
             return self._read_published_deliverable(arguments)
+        if name == "data_query_search":
+            return self._search_data_queries(arguments)
+        if name == "data_query_execute":
+            return self._execute_data_query(arguments)
         if name == "lark_cli":
             from app.lark_cli.service import invoke_lark_cli
 
@@ -545,6 +549,86 @@ class HarnessCapabilityInvoker:
             "UNSUPPORTED_INTERNAL_CAPABILITY",
             "不支持的 Harness 内部能力。",
         )
+
+    def _search_data_queries(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        query = str(arguments.get("query") or "").strip().lower()
+        if not query:
+            return _failure("INVALID_ARGUMENTS", "query 不能为空。")
+        raw_limit = arguments.get("limit", 10)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+            return _failure("INVALID_ARGUMENTS", "limit 必须是整数。")
+        limit = max(1, min(raw_limit, 20))
+        from app.data_query.service import list_query_templates
+
+        templates = list_query_templates(self.db, self.tenant_id, limit=100)
+        matches = []
+        for t in templates:
+            if t.status != "active":
+                continue
+            searchable = " ".join([
+                t.name or "",
+                t.description or "",
+                t.business_notes or "",
+                " ".join(t.example_questions_json or []),
+                " ".join(t.dimensions_json or []),
+                " ".join(t.metrics_json or []),
+            ]).lower()
+            keywords = [w for w in query.replace("，", " ").replace("、", " ").split() if w]
+            if not keywords or any(kw in searchable for kw in keywords):
+                matches.append({
+                    "template_id": t.id,
+                    "name": t.name,
+                    "description": t.description,
+                    "params": t.params_json or [],
+                    "dimensions": t.dimensions_json or [],
+                    "metrics": t.metrics_json or [],
+                    "example_questions": t.example_questions_json or [],
+                })
+        return {
+            "success": True,
+            "data": {
+                "query": query,
+                "matches": matches[:limit],
+                "match_count": len(matches[:limit]),
+                "notice": "选择合适的 template_id 后，调用 data_query_execute 传入参数执行查询。严禁编写临时脚本直接访问底层数据库。",
+            },
+        }
+
+    def _execute_data_query(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        template_id = str(arguments.get("template_id") or "").strip()
+        if not template_id:
+            return _failure("INVALID_ARGUMENTS", "template_id 不能为空。")
+        params = arguments.get("params")
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            return _failure("INVALID_ARGUMENTS", "params 必须是字典对象。")
+        from app.channels.service_intent_fast_path import _format_markdown_table
+        from app.data_query.service import execute_query_by_id
+
+        try:
+            result = execute_query_by_id(
+                self.db,
+                template_id=template_id,
+                tenant_id=self.tenant_id,
+                params=params,
+            )
+            table_md = _format_markdown_table(result)
+            return {
+                "success": True,
+                "data": {
+                    "template_id": template_id,
+                    "row_count": len(result.rows),
+                    "columns": result.columns,
+                    "table_markdown": table_md,
+                    "execution_time_ms": result.execution_time_ms,
+                    "notice": "已获取格式化查询结果，请直接依据 table_markdown 向用户汇报或分析，无需进行二次数据库连接。",
+                },
+            }
+        except ValueError as exc:
+            return _failure("QUERY_TEMPLATE_ERROR", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return _failure("QUERY_EXECUTION_ERROR", f"执行数据查询失败: {exc}")
 
     def _external_task_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
         task_id = str(arguments.get("task_id") or "").strip().lstrip("#")
@@ -698,7 +782,7 @@ class HarnessCapabilityInvoker:
         if not query:
             return _failure("INVALID_ARGUMENTS", "capability_search query 不能为空。")
         raw_kinds = arguments.get("kinds")
-        allowed_kinds = {"general_skill", "tool", "knowledge", "file"}
+        allowed_kinds = {"general_skill", "tool", "knowledge", "file", "internal"}
         kinds: set[str] | None = None
         if raw_kinds is not None:
             if not isinstance(raw_kinds, list) or any(

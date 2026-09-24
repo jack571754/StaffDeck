@@ -30,6 +30,8 @@ ALWAYS_EXPANDED_CAPABILITIES = {
     "edit_file",
     "publish_artifact",
     "knowledge_search",
+    "data_query_search",
+    "data_query_execute",
 }
 
 

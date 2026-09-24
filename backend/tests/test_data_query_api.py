@@ -1008,3 +1008,81 @@ def test_template_update_invalidates_cache() -> None:
     body = resp.json()
     assert body["cached"] is False
     assert body["rows"] == [{"v": "new"}]
+
+
+def test_harness_data_query_search_and_execute() -> None:
+    engine = _test_engine()
+    user = _seed_tenant_and_user(engine)
+    client = _make_client(engine)
+    headers = _auth(user)
+    params = {"tenant_id": "tenant_a"}
+
+    ds_resp = client.post(
+        "/api/enterprise/data-query/data-sources",
+        params=params,
+        json=_make_ds_payload(),
+        headers=headers,
+    )
+    ds_id = ds_resp.json()["id"]
+
+    qt_resp = client.post(
+        "/api/enterprise/data-query/query-templates",
+        params=params,
+        json={**_make_qt_payload(ds_id), "status": "active", "example_questions_json": ["查询用户列表"]},
+        headers=headers,
+    )
+    qt_id = qt_resp.json()["id"]
+
+    with Session(engine) as sess:
+        from app.core.capability_manifest import CapabilityManifestBuilder
+        from app.core.harness_capability_invoker import HarnessCapabilityInvoker
+        from app.db.models import ChatSession, new_id
+
+        cs = ChatSession(id=new_id("session"), tenant_id="tenant_a", user_id=user.id, title="Test Session")
+        sess.add(cs)
+        sess.commit()
+        sess.refresh(cs)
+
+        manifest = CapabilityManifestBuilder(sess).build("tenant_a", None, None, None)
+        avail_names = {c.name for c in manifest.available}
+        assert "data_query_search" in avail_names
+        assert "data_query_execute" in avail_names
+
+        invoker = HarnessCapabilityInvoker(
+            db=sess,
+            tenant_id="tenant_a",
+            session=cs,
+            task_frame_id="tf_test",
+            run_id="run_test",
+            model_config=None,
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+
+        search_res = invoker._invoke_internal("data_query_search", {"query": "用户列表"})
+        assert search_res["success"] is True
+        assert any(m["template_id"] == qt_id for m in search_res["data"]["matches"])
+
+        from app.data_query.models import QueryExecuteResult
+
+        mock_result = QueryExecuteResult(
+            template_id=qt_id,
+            columns=["id", "username"],
+            rows=[{"id": 1, "username": "alice"}],
+            total_rows=1,
+            execution_time_ms=12.5,
+            cached=False,
+        )
+        from unittest.mock import MagicMock, patch
+
+        with patch("app.data_query.executor.get_connector") as mock_conn:
+            mock_inst = MagicMock()
+            mock_inst.execute.return_value = mock_result
+            mock_conn.return_value = mock_inst
+            exec_res = invoker._invoke_internal("data_query_execute", {"template_id": qt_id})
+            assert exec_res["success"] is True
+            assert exec_res["data"]["row_count"] == 1
+            assert "alice" in exec_res["data"]["table_markdown"]
+
