@@ -1,0 +1,32 @@
+services:
+  staffdeck:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: staffdeck:latest
+    container_name: staffdeck
+    restart: unless-stopped
+    ports:
+      - "${STAFFDECK_PORT:-5173}:5173"
+    env_file:
+      - .env
+    environment:
+      - ULTRARAG_DATA_DIR=/app/data
+      - DATABASE_URL=sqlite:////app/data/skill_agent_loop.db
+      - ULTRARAG_HOST=0.0.0.0
+      - ULTRARAG_PORT=5173
+      - TOOL_BASE_URL=${TOOL_BASE_URL:-http://localhost:5173}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    volumes:
+      - ./data:/app/data
+    # 启用 Linux 安全沙盒（Bubblewrap）所需的系统调用权限
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5173/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s

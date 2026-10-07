@@ -52,5 +52,9 @@ yarn-error.log*
 pnpm-debug.log*
 packaging/assets/staffdeck.iconset/
 backups/
+deploy/data/
+deploy/*.tar.gz
+deploy/*.zip
+.harness/
 .claude/
 .kilo/
