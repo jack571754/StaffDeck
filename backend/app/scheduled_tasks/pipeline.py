@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 
 from app.api.mock import FeishuAppNotifyRequest, feishu_app_notify
 from app.data_query.service import execute_query_by_id
-from app.db.models import ScheduledTask, ScheduledTaskRun, utc_now
+from app.db.models import ChatSession, Message, ScheduledTask, ScheduledTaskRun, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,24 @@ def execute_pipeline_scheduled_task(
             run.id,
         )
 
+    # Immediately initialize user message so session is never empty even if interrupted
+    if run.session_id:
+        from app.scheduled_tasks.service import automatic_task_message
+
+        existing_user_msg = db.exec(
+            select(Message).where(Message.session_id == run.session_id, Message.role == "user")
+        ).first()
+        if not existing_user_msg:
+            user_msg = Message(
+                tenant_id=task.tenant_id,
+                session_id=run.session_id,
+                role="user",
+                content=automatic_task_message(task),
+                metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id},
+            )
+            db.add(user_msg)
+            db.commit()
+
     try:
         # Step 1: Execute query steps
         for idx, step in enumerate(steps, 1):
@@ -225,16 +243,21 @@ def execute_pipeline_scheduled_task(
         run.finished_at = utc_now()
 
         if run.session_id:
-            from app.db.models import ChatSession, Message
             from app.scheduled_tasks.service import automatic_task_message
 
-            user_msg = Message(
-                tenant_id=task.tenant_id,
-                session_id=run.session_id,
-                role="user",
-                content=automatic_task_message(task),
-                metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id},
-            )
+            existing_user_msg = db.exec(
+                select(Message).where(Message.session_id == run.session_id, Message.role == "user")
+            ).first()
+            if not existing_user_msg:
+                user_msg = Message(
+                    tenant_id=task.tenant_id,
+                    session_id=run.session_id,
+                    role="user",
+                    content=automatic_task_message(task),
+                    metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id},
+                )
+                db.add(user_msg)
+
             query_info = f"{len(query_rows)} 条数据记录" if query_rows else "0 条记录"
             notify_info = "原生卡片 2.0 已成功组装并通过 Webhook/应用通道推送" if has_push else "未启用推送（已跳过出站通知）"
             task_title = task.title or "定时任务"
@@ -257,7 +280,6 @@ def execute_pipeline_scheduled_task(
                     "trace": run.trace_json,
                 },
             )
-            db.add(user_msg)
             db.add(asst_msg)
             sess = db.get(ChatSession, run.session_id)
             if sess:
@@ -291,16 +313,21 @@ def execute_pipeline_scheduled_task(
             "step_results": step_results,
         }
         if run.session_id:
-            from app.db.models import ChatSession, Message
             from app.scheduled_tasks.service import automatic_task_message
 
-            user_msg = Message(
-                tenant_id=task.tenant_id,
-                session_id=run.session_id,
-                role="user",
-                content=automatic_task_message(task),
-                metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id},
-            )
+            existing_user_msg = db.exec(
+                select(Message).where(Message.session_id == run.session_id, Message.role == "user")
+            ).first()
+            if not existing_user_msg:
+                user_msg = Message(
+                    tenant_id=task.tenant_id,
+                    session_id=run.session_id,
+                    role="user",
+                    content=automatic_task_message(task),
+                    metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id},
+                )
+                db.add(user_msg)
+
             task_title = task.title or "定时任务"
             asst_msg = Message(
                 tenant_id=task.tenant_id,
@@ -309,7 +336,6 @@ def execute_pipeline_scheduled_task(
                 content=f"❌ **{task_title}流水线执行失败**\n\n- **错误原因**：{exc}",
                 metadata_json={"source": "scheduled_task", "scheduled_task_id": task.id, "run_id": run.id, "error": str(exc)},
             )
-            db.add(user_msg)
             db.add(asst_msg)
             sess = db.get(ChatSession, run.session_id)
             if sess:

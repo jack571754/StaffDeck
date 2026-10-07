@@ -1138,6 +1138,34 @@ class ChannelDelivery(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class FeishuOutboundMessage(SQLModel, table=True):
+    __tablename__ = "feishu_outbound_messages"
+
+    id: str = Field(default_factory=lambda: new_id("fsmsg"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    binding_id: Optional[str] = Field(default=None, index=True)
+    scheduled_task_id: Optional[str] = Field(default=None, index=True)
+    run_id: Optional[str] = Field(default=None, index=True)
+    # channel_type: "app_bot" (自建应用机器人) 或 "webhook" (自定义群机器人)
+    channel_type: str = Field(default="app_bot", index=True)
+    # 飞书远端消息 ID (om_xxx)，用于撤回与卡片更新
+    feishu_message_id: Optional[str] = Field(default=None, index=True)
+    # 目标类型: chat_id, open_id, user_mobile, user_email, webhook
+    target_type: str = Field(default="chat_id", index=True)
+    target_identifier: str
+    target_name: Optional[str] = None
+    title: Optional[str] = None
+    card_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    # 状态机: delivered (已送达), failed (发送失败), recalled (已撤回)
+    status: str = Field(default="delivered", index=True)
+    error_message: Optional[str] = None
+    # 撤回审计
+    recalled_at: Optional[datetime] = None
+    recalled_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now, index=True)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class HumanHandoffRequest(SQLModel, table=True):
     __tablename__ = "human_handoff_requests"
 

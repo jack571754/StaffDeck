@@ -6,6 +6,7 @@ import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 HarnessWorkspaceSnapshot = dict[str, tuple[int, int, int, int]]
 
@@ -78,6 +79,35 @@ def normalize_harness_artifact_path(raw_path: str) -> str:
     if ".harness-trash" in parts:
         raise HarnessArtifactAccessError("Harness internal paths are denied.")
     return PurePosixPath(*parts).as_posix()
+
+
+# Owner kind of an artifact published by a Harness TaskFrame. Every other owner
+# kind (e.g. "scheduled_run" for deterministic pipeline reports) is resolved by a
+# registered resolver in app/core/artifact_owners.py.
+ARTIFACT_OWNER_DEFAULT_KIND = "harness_frame"
+
+
+def artifact_owner_pair(raw: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Derive the ``(owner_kind, owner_id)`` pair from a published artifact dict.
+
+    This is the single definition of the artifact manifest's ownership schema, and
+    is shared by the token layer (``app/security/artifact_share.py``) and the
+    lookup layer (``app/core/published_deliverables.py``) so the two can never
+    disagree about who owns an artifact.
+
+    ``owner_kind``/``owner_id`` are optional for backward compatibility: manifests
+    written before ownership was generalized carry only ``task_frame_id``, which is
+    read as ``("harness_frame", task_frame_id)``.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    kind = str(raw.get("owner_kind") or "").strip() or ARTIFACT_OWNER_DEFAULT_KIND
+    owner_id = str(raw.get("owner_id") or "").strip()
+    if not owner_id:
+        owner_id = str(raw.get("task_frame_id") or "").strip()
+    if not owner_id:
+        return None
+    return kind, owner_id
 
 
 _NOISE_ARTIFACT_SUFFIXES = (".tmp", ".part", ".partial", ".cache", ".log", ".lock")
@@ -399,9 +429,11 @@ def _required_os_flag(name: str) -> int:
 
 
 __all__ = [
+    "ARTIFACT_OWNER_DEFAULT_KIND",
     "HarnessArtifactAccessError",
     "HarnessWorkspaceSnapshot",
     "OpenedHarnessArtifact",
+    "artifact_owner_pair",
     "normalize_harness_artifact_path",
     "open_harness_artifact",
     "publish_changed_harness_artifacts",

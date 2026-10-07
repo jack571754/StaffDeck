@@ -17,6 +17,11 @@ from app.db.models import (
     UIConfig,
     utc_now,
 )
+from app.harness.artifacts import ARTIFACT_OWNER_DEFAULT_KIND
+
+# Directory segment for generated HTML reports inside a Harness workspace. Never
+# collides with a frame directory, whose name always ends in "-<12 hex>".
+HARNESS_REPORTS_DIR = "reports"
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,28 @@ def harness_session_workspace_path(
     )
 
 
+def _validated_workspace_subdir(session_path: Path, *segments: str) -> Path:
+    """Join segments beneath one session workspace, rejecting symlinked components.
+
+    Every writer and reader of a workspace path must agree on this check, otherwise a
+    writer could publish a file that ``open_harness_artifact`` — which opens each path
+    component with ``O_NOFOLLOW`` — then refuses to read. Components that do not exist
+    yet are not symlinks, so this is safe to call before creating the directory.
+    """
+
+    chain = [session_path.parents[1], session_path.parent, session_path]
+    current = session_path
+    for segment in segments:
+        current = current / segment
+        chain.append(current)
+    for component in chain:
+        if component.is_symlink():
+            raise OSError(
+                "refusing to provision Harness workspace through a symlink"
+            )
+    return current
+
+
 def harness_task_workspace_path(
     *,
     tenant_id: str,
@@ -212,18 +239,69 @@ def harness_task_workspace_path(
         session_id=session_id,
         db=db,
     )
-    task_path = session_path / harness_path_segment(task_frame_id)
-    for parent in (
-        session_path.parents[1],
-        session_path.parent,
-        session_path,
-        task_path,
-    ):
-        if parent.is_symlink():
-            raise OSError(
-                "refusing to provision Harness workspace through a symlink"
-            )
-    return task_path
+    return _validated_workspace_subdir(session_path, harness_path_segment(task_frame_id))
+
+
+def harness_owner_workspace_root(
+    *,
+    tenant_id: str,
+    session_id: str,
+    owner_kind: str,
+    owner_id: str,
+    db: Session | None = None,
+) -> Path:
+    """Resolve the workspace root that an artifact owner's relative paths anchor to.
+
+    This is the directory ``open_harness_artifact`` is given, so it must agree exactly
+    with the root the writer used. A ``harness_frame`` owner is anchored at its frame
+    workspace (the same path ``harness_task_workspace_path`` returns); every other
+    owner kind — currently ``scheduled_run``, for deterministic pipeline runs that have
+    no frame at all — is anchored at the session workspace.
+    """
+
+    session_path = harness_session_workspace_path(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        db=db,
+    )
+    if str(owner_kind or "").strip() == ARTIFACT_OWNER_DEFAULT_KIND:
+        return _validated_workspace_subdir(session_path, harness_path_segment(owner_id))
+    return _validated_workspace_subdir(session_path)
+
+
+def harness_reports_root(
+    *,
+    tenant_id: str,
+    session_id: str,
+    owner_kind: str,
+    owner_id: str,
+    db: Session | None = None,
+) -> Path:
+    """Resolve the directory holding generated HTML reports for one artifact owner.
+
+    A ``harness_frame`` owner keeps its reports inside that frame's workspace, so the
+    file stays visible to the frame's later ``exec_command`` calls and the relative
+    artifact path matches what the frame publishes. Every other owner kind keeps them
+    at the session root instead.
+
+    Both locations live inside the session workspace, so
+    ``remove_harness_session_workspace`` deletes reports together with the session and
+    no separate reaper is required. The per-segment id also makes a collision between
+    the frame directory and the literal ``reports`` segment impossible.
+    """
+
+    workspace_root = harness_owner_workspace_root(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        owner_kind=owner_kind,
+        owner_id=owner_id,
+        db=db,
+    )
+    if str(owner_kind or "").strip() == ARTIFACT_OWNER_DEFAULT_KIND:
+        return _validated_workspace_subdir(workspace_root, HARNESS_REPORTS_DIR)
+    return _validated_workspace_subdir(
+        workspace_root, HARNESS_REPORTS_DIR, harness_path_segment(owner_id)
+    )
 
 
 def remove_harness_session_workspace(

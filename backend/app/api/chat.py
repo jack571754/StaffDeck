@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, update
 from sqlmodel import Session, select
 from starlette.background import BackgroundTask
@@ -22,9 +22,9 @@ from app.agents.branching import model_for_agent, visible_published_skills
 from app.channels.service_outbox import stage_channel_delivery
 from app.config import get_settings
 from app.core import AgentLoop
+from app.core.artifact_owners import resolve_artifact_owner
 from app.core.cancellation import cancel_chat_turn, is_chat_turn_cancelled
 from app.core.capability_manifest import CapabilityManifestBuilder
-from app.core.harness_session_cleanup import harness_task_workspace_path
 from app.core.harness_turn_store import HarnessTurnStore
 from app.core.slash_commands import SlashCommandRead, slash_command_catalog
 from app.db import engine, get_session
@@ -32,7 +32,6 @@ from app.db.models import (
     AgentEvent,
     AgentProfile,
     ChatSession,
-    HarnessTaskFrameRecord,
     HarnessTurnRecord,
     HumanHandoffRequest,
     Message,
@@ -47,8 +46,8 @@ from app.db.models import (
 )
 from app.feedback import enqueue_feedback_analysis
 from app.harness import (
+    ARTIFACT_OWNER_DEFAULT_KIND,
     HarnessArtifactAccessError,
-    normalize_harness_artifact_path,
     open_harness_artifact,
 )
 from app.llm import LLMClient, LLMError
@@ -2404,43 +2403,35 @@ def download_harness_artifact(
     task_frame_id: str,
     tenant_id: str = Query(...),
     path: str = Query(..., min_length=1),
+    # A plain default (not Query(...)) so the endpoint stays directly callable in
+    # tests: calling it with `Query(...)` would pass a FieldInfo, not a string.
+    owner_kind: str = ARTIFACT_OWNER_DEFAULT_KIND,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> StreamingResponse:
-    """Download a file explicitly published by a Harness TaskFrame."""
+    """Download a file explicitly published by an artifact owner.
+
+    The path segment stays ``task_frame_id`` for URL compatibility; ``owner_kind``
+    selects the resolver, and defaults to a Harness TaskFrame.
+    """
 
     _ensure_request_tenant(tenant_id, current_user)
     _get_readable_chat_session(db, tenant_id, current_user, session_id)
-    frame = db.exec(
-        select(HarnessTaskFrameRecord).where(
-            HarnessTaskFrameRecord.tenant_id == tenant_id,
-            HarnessTaskFrameRecord.session_id == session_id,
-            HarnessTaskFrameRecord.task_id == task_frame_id,
-        )
-    ).first()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
-    artifact = _published_workspace_artifact(
+    resolved = resolve_artifact_owner(
         db,
+        owner_kind=owner_kind,
         tenant_id=tenant_id,
         session_id=session_id,
-        task_frame_id=task_frame_id,
-        requested_path=path,
+        owner_id=task_frame_id,
+        path=path,
     )
-    if artifact is None:
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = resolved.artifact
 
     opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            path,
-        )
+        opened = open_harness_artifact(resolved.workspace_root, path)
         digest = opened.sha256()
         expected_digest = str(artifact.get("sha256") or "").strip().lower()
         expected_size = artifact.get("size")
@@ -2483,6 +2474,10 @@ class ShareLinkRequest(BaseModel):
     session_id: str
     task_frame_id: str
     path: str
+    owner_kind: str = Field(
+        default=ARTIFACT_OWNER_DEFAULT_KIND,
+        pattern=artifact_share_mod.OWNER_KIND_PATTERN,
+    )
     ttl_seconds: int | None = None
 
 
@@ -2550,7 +2545,6 @@ def view_published_artifact(
     payload = artifact_share_mod.decode_artifact_share_token(token)
     tenant_id = payload["tenant_id"]
     session_id = payload["session_id"]
-    task_frame_id = payload["task_frame_id"]
     cn_path = payload["path"]
 
     if current_user is not None:
@@ -2561,37 +2555,21 @@ def view_published_artifact(
         # so they take the anonymous path and are unaffected.
         _get_readable_chat_session(db, tenant_id, current_user, session_id)
 
-    frame = db.exec(
-        select(HarnessTaskFrameRecord).where(
-            HarnessTaskFrameRecord.tenant_id == tenant_id,
-            HarnessTaskFrameRecord.session_id == session_id,
-            HarnessTaskFrameRecord.task_id == task_frame_id,
-        )
-    ).first()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
-
-    artifact = _published_workspace_artifact(
+    resolved = resolve_artifact_owner(
         db,
+        owner_kind=payload["owner_kind"],
         tenant_id=tenant_id,
         session_id=session_id,
-        task_frame_id=task_frame_id,
-        requested_path=cn_path,
+        owner_id=payload["owner_id"],
+        path=cn_path,
     )
-    if artifact is None:
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
+    artifact = resolved.artifact
 
     opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            cn_path,
-        )
+        opened = open_harness_artifact(resolved.workspace_root, cn_path)
         digest = opened.sha256()
         expected_digest = str(artifact.get("sha256") or "").strip().lower()
         expected_size = artifact.get("size")
@@ -2644,33 +2622,26 @@ def mint_artifact_share(
     """Create a signed, expiring share link for an already-published artifact.
 
     Only a user who can read the owning session may mint a link, and only for a
-    path that is actually published in a task frame's manifest.
+    path that is actually published in the owner's manifest.
     """
     _ensure_request_tenant(request.tenant_id, current_user)
     _get_readable_chat_session(db, request.tenant_id, current_user, request.session_id)
-    frame = db.exec(
-        select(HarnessTaskFrameRecord).where(
-            HarnessTaskFrameRecord.tenant_id == request.tenant_id,
-            HarnessTaskFrameRecord.session_id == request.session_id,
-            HarnessTaskFrameRecord.task_id == request.task_frame_id,
-        )
-    ).first()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="Artifact not found")
-    artifact = _published_workspace_artifact(
+    resolved = resolve_artifact_owner(
         db,
+        owner_kind=request.owner_kind,
         tenant_id=request.tenant_id,
         session_id=request.session_id,
-        task_frame_id=request.task_frame_id,
-        requested_path=request.path,
+        owner_id=request.task_frame_id,
+        path=request.path,
     )
-    if artifact is None:
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     token = artifact_share_mod.mint_artifact_share_token(
         tenant_id=request.tenant_id,
         session_id=request.session_id,
-        task_frame_id=request.task_frame_id,
+        owner_kind=resolved.owner_kind,
+        owner_id=resolved.owner_id,
         path=request.path,
         ttl_seconds=(
             request.ttl_seconds
@@ -2979,48 +2950,6 @@ def _get_readable_chat_session(db: Session, tenant_id: str, current_user: User, 
     if _user_can_read_handoff_session(db, tenant_id, current_user, session_id):
         return row
     raise HTTPException(status_code=404, detail="Session not found")
-
-
-def _published_workspace_artifact(
-    db: Session,
-    *,
-    tenant_id: str,
-    session_id: str,
-    task_frame_id: str,
-    requested_path: str,
-) -> dict[str, object] | None:
-    try:
-        normalized_requested_path = normalize_harness_artifact_path(requested_path)
-    except HarnessArtifactAccessError:
-        return None
-    rows = db.exec(
-        select(Message).where(
-            Message.tenant_id == tenant_id,
-            Message.session_id == session_id,
-            Message.role == "assistant",
-        )
-    ).all()
-    for row in rows:
-        artifacts = (row.metadata_json or {}).get("harness_artifacts")
-        if not isinstance(artifacts, list):
-            continue
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                continue
-            if artifact.get("type") != "workspace_file":
-                continue
-            if str(artifact.get("task_frame_id") or "") != task_frame_id:
-                continue
-            stored_path = artifact.get("path")
-            if not isinstance(stored_path, str):
-                continue
-            try:
-                normalized_stored_path = normalize_harness_artifact_path(stored_path)
-            except HarnessArtifactAccessError:
-                continue
-            if normalized_stored_path == normalized_requested_path:
-                return dict(artifact)
-    return None
 
 
 def _safe_artifact_download_name(filename: str) -> str:

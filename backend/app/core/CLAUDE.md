@@ -23,23 +23,24 @@ StaffDeck Agent 运行时的内核（Harness v2）：把一条 `ChatTurnRequest`
 | Turn 收口 | `turn_finalizer.py` → `TurnFinalizer`；回复生成 `response_generator.py` → `ResponseGenerator` |
 | 取消 | `cancellation.py` → `cancel_chat_turn` / `is_chat_turn_cancelled` / `clear_chat_turn_cancelled` |
 | 恢复 | `harness_recovery.py` → `recover_orphan_harness_runs`、`start_harness_recovery_sweeper`（`SWEEP_INTERVAL_SECONDS=60`） |
+| 产物归属 | `artifact_owners.py` → `resolve_artifact_owner` / `register_artifact_owner_resolver` / `registered_artifact_owner_kinds` / `ResolvedArtifact`；`SCHEDULED_RUN_OWNER_KIND="scheduled_run"`；`published_deliverables.py` → `find_published_workspace_artifact`（owner-aware） |
 
 主链路（自上而下）：`HarnessV2Engine.run` → `TurnPlanner` 出 `TurnPlan` → `TaskFrameStore` 落 `HarnessTaskFrameRecord` → 逐 frame `TaskRequestCompiler.compile` → `CapabilityManifestBuilder.build` + `project_capability_manifest` → `HarnessTaskAgent` 循环 → `HarnessCapabilityInvoker.invoke` → `TaskExecutionResult` → `TurnFinalizer` → `ChatTurnResponse`。
 
 ## 关键机制与不变量
 
 - **渐进披露（progressive disclosure）**：服务端 `CapabilityManifest` 是**冻结的完整授权快照**；`project_capability_manifest` 只裁剪模型可见的上下文（扩展开 `ALWAYS_EXPANDED_CAPABILITIES` 内核能力 + SOP 显式引用，其余进 8K 预算目录），**绝不新增授权**。想改“模型能看到哪些能力 schema”改这里；想改“能力是否存在/可用”改 `capability_manifest.py`。
-- **保留能力名**：`RESERVED_HARNESS_CAPABILITY_NAMES`（含 `capability_search`/`capability_describe`/`exec_command`/`run_skill_script`/`knowledge_search`/`lark_cli`/`data_query_search`/`data_query_execute`/`external_task_status` 等）。新增内建能力必须同步此集合与 `ALWAYS_EXPANDED_CAPABILITIES`。
+- **保留能力名**：`RESERVED_HARNESS_CAPABILITY_NAMES`（含 `capability_search`/`capability_describe`/`exec_command`/`run_skill_script`/`knowledge_search`/`lark_cli`/`data_query_search`/`data_query_execute`/`report_generate`/`external_task_status` 等）。新增内建能力必须同步此集合与 `ALWAYS_EXPANDED_CAPABILITIES`（后者的当前集合另含 `read_file`/`write_file`/`edit_file`/`publish_artifact`/`extract_document_text`）。
 - **调用重放与幂等**：`harness_capability_invoker.py` 用 `_logical_action_key` / `_request_digest` 去重，`_replay_or_block` 命中历史返回 `_replayed_result`；`tool_replay_policy.py` 定义 `TOOL_CALL_HISTORY_SLOT` / `TOOL_RESULTS_SLOT`。
 - **大结果句柄**：`_persist_large_json_result`（阈值 `_INLINE_JSON_TOOL_RESULT_MAX_CHARS=2000`）把大 JSON 落盘到 `.harness/tool-results/`，回给模型一个句柄；`_resolve_json_tool_result_references` / `_read_json_tool_result_reference` 负责回读。技能包物化到 `.harness/skill-packages/{slug}-{digest}/`（`_materialize_general_skill_package`）。
 - **租约（三重 900s）**：Turn `TURN_LEASE_SECONDS`、Session `SESSION_LEASE_SECONDS`、Frame `FRAME_LEASE_SECONDS`；会话互斥锁 `harness_session_lock.py`（`acquire_harness_session`，冲突抛 `HarnessSessionBusy`）。
-- **会话与存储布局**：`harness_session_cleanup.py` → `harness_storage_root` / `harness_session_workspace_path` / `harness_task_workspace_path` / `remove_harness_session_workspace`。
+- **会话与存储布局**：`harness_session_cleanup.py` → `harness_storage_root` / `harness_session_workspace_path` / `harness_task_workspace_path` / `remove_harness_session_workspace`；本分支新增 **`HARNESS_REPORTS_DIR="reports"` / `harness_owner_workspace_root` / `harness_reports_root` / `_validated_workspace_subdir`**（生成报告与读取报告必须走同一套布局，且拒绝 symlink 组件，否则「写得进、读 404」）。
 - **上下文预算**：`context_projection.py`（`CONTROL_CONTEXT_TOKEN_BUDGET=32000`）压缩模型可见上下文；`conversation_context.py`（`DEFAULT_CONTEXT_TOKEN_BUDGET=32000`，`COMPACTION_TRIGGER_RATIO=0.70`，`RECENT_ROUND_LIMIT=6`）做历史摘要。
 - **附件隔离**：`harness_attachments.py` → `materialize_task_attachments` / `validated_task_image_payloads` / `isolated_attachment_context`。
 - **Slash 命令**：`slash_commands.py` → `parse_slash_command` / `resolve_sop` / `resolve_capability` / `build_slash_turn_plan` / `force_capability_for_requirement` / `slash_command_catalog`。
 - **人工接管**：`human_handoff_service.py` → `HumanHandoffService`。
 - **反射**：`reflection_agent.py` → `ReflectionAgent`、`action_needs_reflection`、`tool_result_needs_reflection`（提示词 `reflection_prompt.md`）。
-- **已发布交付物**：`published_deliverables.py` → `list_published_deliverables` / `find_published_deliverable`（`MAX_PUBLISHED_DELIVERABLES=20`）。
+- **已发布交付物与产物归属**：`published_deliverables.py` → `list_published_deliverables` / `find_published_deliverable`（`MAX_PUBLISHED_DELIVERABLES=20`）+ **`find_published_workspace_artifact`**（owner-aware、不要求 TaskFrame，供 `artifact_owners.py` 调用）。**归属语义集中在 `artifact_owners.py`**：`resolve_artifact_owner(db, owner_kind, tenant_id, session_id, owner_id, path)` 是下载/预览/分享三条链路的唯一入口，resolver 失败一律返回 `None`（→ 上层 404）。已注册 kind：`harness_frame`（TaskFrame，锚定帧工作区）、`scheduled_run`（确定性 pipeline run，锚定 session 工作区）。**归属 schema 的唯一定义在 `harness/artifacts.py` 的 `artifact_owner_pair`**（本层不得再定义一套）。
 
 ## 内建能力实现锚点（`harness_capability_invoker.py`）
 
@@ -49,6 +50,7 @@ StaffDeck Agent 运行时的内核（Harness v2）：把一条 `ChatTurnRequest`
 |---|---|
 | `capability_search` / `capability_describe` | `_search_capabilities` / `_describe_capabilities` |
 | `data_query_search` / `data_query_execute` | `_search_data_queries` / `_execute_data_query`（走 `app.data_query.service.list_query_templates` / `execute_query_by_id`；返回 `table_markdown`） |
+| `report_generate` | `_generate_report`（走 `app.reporting.spec.build_report_from_spec` + `write_report_html`，owner 固定 `harness_frame` + 当前 `task_frame_id`；返回能力级 `artifacts`，闭环见 `../reporting/CLAUDE.md`） |
 | `external_task_status` | `_external_task_status` |
 | `list_published_deliverables` / `read_published_deliverable` | `_list_published_deliverables` / `_read_published_deliverable` |
 | `lark_cli` | 转 `app.lark_cli.service.invoke_lark_cli` |
@@ -63,17 +65,20 @@ StaffDeck Agent 运行时的内核（Harness v2）：把一条 `ChatTurnRequest`
 |---|---|
 | 模型“看到”的能力清单 / 8K 目录预算 / 搜索排序 | `capability_discovery.py` |
 | 某能力是否可用、授权范围、保留名、快照摘要 | `capability_manifest.py`（`tool_snapshot_digest` / `general_skill_snapshot_digest` / `_snapshot_revision`） |
-| 内建能力行为（含 data_query 两个能力） | `harness_capability_invoker.py` `_invoke_internal` 及各 `_*` 方法 |
+| 内建能力行为（含 data_query 两个能力与 `report_generate`） | `harness_capability_invoker.py` `_invoke_internal` 及各 `_*` 方法 |
+| 让模型直接产出一份可分享 HTML 报告 | `harness_capability_invoker.py` `_generate_report` + `../reporting/spec.py`；能力声明在 `capability_manifest.py` |
 | 单任务 ReAct 循环 / 动作解析 / 预算与超时 | `harness_agent.py`（`MAX_*`、`_bounded_capability_result`、`_step_timeout_result`） |
 | Turn 如何拆成多个 TaskFrame | `turn_planner.py`、`task_frame_store.py` |
 | 每个 Task 收到什么（slots / SOP 节点 / 记忆 / 附件） | `task_request_compiler.py` `TaskRequestCompiler.compile` |
 | 任务完成 / 失败 / handoff 判定与回复 | `harness_v2_engine.py`（`_combine_results`、`_single_task_reply`、`_structured_reply_requires_synthesis`）、`turn_finalizer.py` |
 | 进程崩溃后恢复孤点 run | `harness_recovery.py` |
+| 某个交付物属于谁 / 下载·预览·分享为何 404 | `artifact_owners.py`（resolver 注册表）、`published_deliverables.py`（`find_published_workspace_artifact`）、`../harness/artifacts.py`（`artifact_owner_pair`） |
+| 报告/交付物落在哪个目录 | `harness_session_cleanup.py`（`harness_owner_workspace_root` / `harness_reports_root`） |
 | 上下文太大 / 模型失忆 | `context_projection.py`、`conversation_context.py` |
 
 ## 测试与质量
 
-- 相关测试：`backend/tests/test_capability_discovery.py`、`test_capability_contracts.py`、`test_capability_registry.py`、`test_capability_scope.py`、`test_context_projection.py`、`test_conversation_context.py`、`test_harness_turn_store.py`、`test_harness_session_lease.py`、`test_harness_recovery.py`、`test_harness_v2_schema_migration.py`、`test_reflection_agent.py`、`test_graph_rules.py`。
+- 相关测试：`backend/tests/test_capability_discovery.py`、`test_capability_contracts.py`、`test_capability_registry.py`、`test_capability_scope.py`、`test_context_projection.py`、`test_conversation_context.py`、`test_harness_turn_store.py`、`test_harness_session_lease.py`、`test_harness_recovery.py`、`test_harness_v2_schema_migration.py`、`test_reflection_agent.py`、`test_graph_rules.py`、**`test_artifact_owners.py`**（归属解析与 reports 布局）、`test_artifact_share_token_owner.py`、`test_reporting_writer.py`。
 - Windows 已知失败基线见仓库根 `AGENTS.md`（沙箱/符号链接/lark-cli 相关）。
 
 ## 常见问题 (FAQ)
@@ -84,8 +89,10 @@ StaffDeck Agent 运行时的内核（Harness v2）：把一条 `ChatTurnRequest`
 
 ## 相关文件清单
 
-`harness_v2_engine.py`、`turn_planner.py`、`task_frame_store.py`、`task_request_compiler.py`、`capability_manifest.py`、`capability_discovery.py`、`harness_agent.py`、`harness_capability_invoker.py`、`turn_finalizer.py`、`response_generator.py`、`context_projection.py`、`conversation_context.py`、`harness_recovery.py`、`harness_session_lease.py`、`harness_session_lock.py`、`harness_session_cleanup.py`、`harness_turn_store.py`、`harness_attachments.py`、`cancellation.py`、`reflection_agent.py`、`slash_commands.py`、`human_handoff_service.py`、`published_deliverables.py`、`tool_replay_policy.py`、`slot_hydration_policy.py`、`task_frame_policy.py`、`skill_runtime.py`、`agent_loop.py`、`step_agent.py`、`router.py`、`graph_rules.py`、`agent_identity_prompt.py`、`conversation_projection.py`。
+`harness_v2_engine.py`、`turn_planner.py`、`task_frame_store.py`、`task_request_compiler.py`、`capability_manifest.py`、`capability_discovery.py`、`harness_agent.py`、`harness_capability_invoker.py`、`turn_finalizer.py`、`response_generator.py`、`context_projection.py`、`conversation_context.py`、`harness_recovery.py`、`harness_session_lease.py`、`harness_session_lock.py`、`harness_session_cleanup.py`、`harness_turn_store.py`、`harness_attachments.py`、`cancellation.py`、`reflection_agent.py`、`slash_commands.py`、`human_handoff_service.py`、`published_deliverables.py`、`artifact_owners.py`、`tool_replay_policy.py`、`slot_hydration_policy.py`、`task_frame_policy.py`、`skill_runtime.py`、`agent_loop.py`、`step_agent.py`、`router.py`、`graph_rules.py`、`agent_identity_prompt.py`、`conversation_projection.py`。
 
 ## 变更记录 (Changelog)
 
+- 2026-09-30T18:30 — 接线 `report_generate`：`capability_manifest.py` 新增 `builtin.reporting.generate` 描述符与保留名，`capability_discovery.py` 列入 `ALWAYS_EXPANDED_CAPABILITIES`，`harness_capability_invoker._invoke_internal` 新增分发与 `_generate_report`（调 `app.reporting` 生成 HTML 并返回能力级 `artifacts`）；同步内建能力锚点表与「任务 → 文件对照」。
+- 2026-09-30T16:05 — 增量更新（在途改动核实）：新增「产物归属」链路（`artifact_owners.py` resolver 注册表、`find_published_workspace_artifact`、`artifact_owner_pair` 唯一定义）；「会话与存储布局」补 `harness_reports_root` / `harness_owner_workspace_root` / `_validated_workspace_subdir`（写读同源 + 拒绝 symlink）；补「任务 → 文件对照」2 行与 3 个新测试文件。
 - 2026-09-24T09:46 — 初始化架构师新建；登记 Harness v2 主链路、渐进披露不变量、内建能力分发锚点与任务→文件对照表。

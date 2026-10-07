@@ -48,6 +48,7 @@ RESERVED_HARNESS_CAPABILITY_NAMES = {
     "external_task_status",
     "data_query_search",
     "data_query_execute",
+    "report_generate",
 }
 
 
@@ -571,6 +572,90 @@ def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
                 "additionalProperties": False,
             },
             metadata={"provider": "harness", "side_effect": "read"},
+        ),
+        CapabilityDescriptor(
+            capability_id="builtin.reporting.generate",
+            name="report_generate",
+            kind="internal",
+            description=(
+                "Render a self-contained, shareable HTML report from tabular rows and publish it "
+                "as a deliverable of this task. The report is a single offline-openable page with "
+                "sortable/filterable table, optional KPI row, summary, and charts. "
+                "Use it when the user asks for a report/报告/独立页面 instead of a chat table, and "
+                "do not paste the same table into the reply afterwards."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "报告标题。",
+                    },
+                    "subtitle": {
+                        "type": "string",
+                        "description": "副标题（可选）。",
+                    },
+                    "renderer": {
+                        "type": "string",
+                        "enum": ["generic_table", "sales_report"],
+                        "default": "generic_table",
+                        "description": (
+                            "报表模板：generic_table 通用表格（默认，中性）；"
+                            "sales_report 销售口径。未知名一律回退通用表。"
+                        ),
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "表格数据行（对象数组，列名即键）。",
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "列顺序声明（可选；缺省按首次出现顺序）。",
+                    },
+                    "column_labels": {
+                        "type": "object",
+                        "description": "列名 → 显示名（可选，用于重复标签的列）。",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "报告开头的 Markdown 说明（可选）。",
+                    },
+                    "kpis": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "minLength": 1},
+                                "value": {"type": "string"},
+                                "delta": {"type": "string"},
+                                "delta_tone": {
+                                    "type": "string",
+                                    "enum": ["up", "down", "flat"],
+                                },
+                                "hint": {"type": "string"},
+                            },
+                            "required": ["label", "value"],
+                            "additionalProperties": False,
+                        },
+                        "description": "顶部指标卡（可选）。",
+                    },
+                    "source": {
+                        "type": "object",
+                        "description": "数据来源说明（可选，写入报告元信息）。",
+                    },
+                    "max_rows": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "最多渲染行数（可选，超过上限按上限截断）。",
+                    },
+                },
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "write"},
         ),
     ]
 

@@ -94,6 +94,19 @@ class TestValidateParams:
         result = _validate_params({"date": "2025-01-15"}, params_def)
         assert result["date"] == "2025-01-15"
 
+    def test_type_conversion_date_dynamic_macros(self) -> None:
+        """Dynamic date macros (今天/today/执行日期/昨天) translate using CST timezone."""
+        from datetime import datetime, timezone, timedelta
+        cst = timezone(timedelta(hours=8))
+        today_str = datetime.now(cst).strftime("%Y-%m-%d")
+        yesterday_str = (datetime.now(cst) - timedelta(days=1)).strftime("%Y-%m-%d")
+        params_def = [{"name": "date", "type": "date", "required": True}]
+
+        for macro in ("今天", "today", "@today", "now", "当前", "当天", "当日", "执行日期"):
+            assert _validate_params({"date": macro}, params_def)["date"] == today_str
+        for macro in ("昨天", "yesterday", "@yesterday", "昨", "前一日"):
+            assert _validate_params({"date": macro}, params_def)["date"] == yesterday_str
+
     def test_type_conversion_date_invalid_format(self) -> None:
         """Invalid date format raises ValueError."""
         params_def = [{"name": "date", "type": "date", "required": True}]

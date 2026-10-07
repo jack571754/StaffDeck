@@ -10,12 +10,18 @@ import HarnessArtifactDownloads from './HarnessArtifactDownloads';
 
 const mocks = vi.hoisted(() => ({
   blob: vi.fn(),
+  copy: vi.fn(),
   notifyError: vi.fn(),
   notifySuccess: vi.fn(),
+  post: vi.fn(),
 }));
 
 vi.mock('@/api/client', () => ({
-  api: { blob: mocks.blob },
+  api: { blob: mocks.blob, post: mocks.post },
+}));
+
+vi.mock('@/lib/clipboard', () => ({
+  copyTextToClipboard: mocks.copy,
 }));
 
 vi.mock('@/components/ui/app-toast', () => ({
@@ -36,8 +42,10 @@ const artifact: HarnessWorkspaceArtifact = {
 
 beforeEach(() => {
   mocks.blob.mockReset();
+  mocks.copy.mockReset();
   mocks.notifyError.mockReset();
   mocks.notifySuccess.mockReset();
+  mocks.post.mockReset();
   vi.spyOn(window.URL, 'createObjectURL').mockReturnValue('blob:artifact');
   vi.spyOn(window.URL, 'revokeObjectURL').mockImplementation(() => undefined);
   vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
@@ -141,5 +149,108 @@ describe('Harness artifact downloads', () => {
       expect(mocks.notifyError).toHaveBeenCalledWith('Artifact not found');
     });
     expect(window.URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  // ------------------------------------------------------ HTML report actions
+
+  const htmlArtifact: HarnessWorkspaceArtifact = {
+    ...artifact,
+    path: 'reports/门店日报.html',
+    display_name: '门店日报.html',
+    content_type: 'text/html; charset=utf-8',
+    description: '可分享的 HTML 报告',
+  };
+
+  it('offers preview and share only for HTML reports', () => {
+    render(
+      <HarnessArtifactDownloads
+        artifacts={[artifact]}
+        tenantId="tenant demo"
+        sessionId="session demo"
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /^预览文件/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^分享文件/ })).toBeNull();
+  });
+
+  it('previews a report through a signed same-origin link', async () => {
+    const user = userEvent.setup();
+    mocks.post.mockResolvedValue({ token: 'signed-token', url: 'http://localhost:5173/api/chat/artifacts/view/signed-token' });
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+
+    render(
+      <HarnessArtifactDownloads
+        artifacts={[htmlArtifact]}
+        tenantId="tenant demo"
+        sessionId="session demo"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '预览文件 门店日报.html' }));
+
+    await waitFor(() => {
+      expect(mocks.post).toHaveBeenCalledWith('/api/chat/artifacts/share-link', {
+        tenant_id: 'tenant demo',
+        session_id: 'session demo',
+        task_frame_id: 'task/frame',
+        path: 'reports/门店日报.html',
+      });
+    });
+    // Relative on purpose: the report must open at whatever host the console is on,
+    // not at the host TOOL_BASE_URL hard-codes.
+    expect(open).toHaveBeenCalledWith(
+      '/api/chat/artifacts/view/signed-token',
+      '_blank',
+      'noopener,noreferrer',
+    );
+    expect(mocks.notifyError).not.toHaveBeenCalled();
+  });
+
+  it('copies the minted share link', async () => {
+    const user = userEvent.setup();
+    mocks.post.mockResolvedValue({
+      token: 'signed-token',
+      url: 'http://staffdeck.internal/api/chat/artifacts/view/signed-token',
+    });
+    mocks.copy.mockResolvedValue(undefined);
+
+    render(
+      <HarnessArtifactDownloads
+        artifacts={[htmlArtifact]}
+        tenantId="tenant demo"
+        sessionId="session demo"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '分享文件 门店日报.html' }));
+
+    await waitFor(() => {
+      expect(mocks.copy).toHaveBeenCalledWith(
+        'http://staffdeck.internal/api/chat/artifacts/view/signed-token',
+      );
+    });
+    expect(mocks.notifySuccess).toHaveBeenCalledWith('分享链接已复制');
+  });
+
+  it('surfaces a failed share-link mint instead of opening anything', async () => {
+    const user = userEvent.setup();
+    mocks.post.mockRejectedValue(new Error('Artifact not found'));
+    const open = vi.spyOn(window, 'open').mockReturnValue(null);
+
+    render(
+      <HarnessArtifactDownloads
+        artifacts={[htmlArtifact]}
+        tenantId="tenant demo"
+        sessionId="session demo"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: '预览文件 门店日报.html' }));
+
+    await waitFor(() => {
+      expect(mocks.notifyError).toHaveBeenCalledWith('Artifact not found');
+    });
+    expect(open).not.toHaveBeenCalled();
   });
 });

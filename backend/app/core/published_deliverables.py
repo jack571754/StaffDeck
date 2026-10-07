@@ -6,8 +6,12 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.db.models import HarnessTaskFrameRecord, Message
-from app.harness import HarnessArtifactAccessError, normalize_harness_artifact_path
-
+from app.harness import (
+    ARTIFACT_OWNER_DEFAULT_KIND,
+    HarnessArtifactAccessError,
+    artifact_owner_pair,
+    normalize_harness_artifact_path,
+)
 
 MAX_PUBLISHED_DELIVERABLES = 20
 
@@ -115,6 +119,64 @@ def find_published_deliverable(
     return None
 
 
+def find_published_workspace_artifact(
+    db: Session,
+    *,
+    tenant_id: str,
+    session_id: str,
+    owner_kind: str,
+    owner_id: str,
+    path: str,
+) -> dict[str, Any] | None:
+    """Owner-aware lookup of a published workspace artifact in a session's manifest.
+
+    Unlike ``find_published_deliverable`` this does not require a Harness TaskFrame:
+    ownership is whatever ``artifact_owner_pair`` derives from the manifest entry, so
+    a deterministic pipeline run (which has no frame) can be addressed by
+    ``("scheduled_run", run_id)``. Callers are responsible for proving the owner
+    exists and belongs to the tenant/session.
+
+    Iteration order is deliberately messages-unordered / artifacts-forward (first
+    match wins), which is what the inline lookup in ``api/chat.py`` did before it
+    moved here. ``find_published_deliverable`` is newest-first; the two differ only
+    for a path published twice under the same owner, which the writers never do
+    because every report path embeds a freshly minted id.
+    """
+    try:
+        requested_path = normalize_harness_artifact_path(path)
+    except HarnessArtifactAccessError:
+        return None
+    wanted = (str(owner_kind or ARTIFACT_OWNER_DEFAULT_KIND).strip(), str(owner_id or "").strip())
+    if not wanted[0] or not wanted[1]:
+        return None
+    rows = db.exec(
+        select(Message).where(
+            Message.tenant_id == tenant_id,
+            Message.session_id == session_id,
+            Message.role == "assistant",
+        )
+    ).all()
+    for row in rows:
+        artifacts = (row.metadata_json or {}).get("harness_artifacts")
+        if not isinstance(artifacts, list):
+            continue
+        for raw in artifacts:
+            if not isinstance(raw, dict) or raw.get("type") != "workspace_file":
+                continue
+            if artifact_owner_pair(raw) != wanted:
+                continue
+            stored_path = raw.get("path")
+            if not isinstance(stored_path, str):
+                continue
+            try:
+                normalized_stored_path = normalize_harness_artifact_path(stored_path)
+            except HarnessArtifactAccessError:
+                continue
+            if normalized_stored_path == requested_path:
+                return dict(raw)
+    return None
+
+
 def _published_item(
     raw: object,
     *,
@@ -144,5 +206,6 @@ def _published_item(
 __all__ = [
     "MAX_PUBLISHED_DELIVERABLES",
     "find_published_deliverable",
+    "find_published_workspace_artifact",
     "list_published_deliverables",
 ]

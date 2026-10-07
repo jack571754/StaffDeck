@@ -32,6 +32,7 @@ ALWAYS_EXPANDED_CAPABILITIES = {
     "knowledge_search",
     "data_query_search",
     "data_query_execute",
+    "report_generate",
 }
 
 

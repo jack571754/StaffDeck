@@ -3,10 +3,13 @@ import { useEffect, useState } from 'react';
 import StaffdeckIcon from '@/components/StaffdeckIcon';
 import { notify } from '@/components/ui/app-toast';
 import { api } from '@/api/client';
+import { copyTextToClipboard } from '@/lib/clipboard';
 import type { HarnessWorkspaceArtifact } from '@/types';
 
 import {
   CHAT_ARTIFACTS_CLASS,
+  CHAT_ARTIFACT_ACTION_CLASS,
+  CHAT_ARTIFACT_ACTIONS_CLASS,
   CHAT_ARTIFACT_BUTTON_CLASS,
   CHAT_ARTIFACT_COPY_CLASS,
   CHAT_ARTIFACT_HEADING_CLASS,
@@ -20,6 +23,7 @@ import {
   CHAT_ARTIFACT_LIST_CLASS,
   CHAT_ARTIFACT_META_CLASS,
   CHAT_ARTIFACT_NAME_CLASS,
+  CHAT_ARTIFACT_ROW_CLASS,
 } from '../chatPageStyles';
 
 type HarnessArtifactDownloadsProps = {
@@ -28,17 +32,25 @@ type HarnessArtifactDownloadsProps = {
   sessionId: string;
 };
 
+type ArtifactShareLink = {
+  url?: string;
+  token?: string;
+  expires_at?: number;
+};
+
 export default function HarnessArtifactDownloads({
   artifacts,
   tenantId,
   sessionId,
 }: HarnessArtifactDownloadsProps) {
   const [downloading, setDownloading] = useState('');
+  const [previewing, setPreviewing] = useState('');
+  const [sharing, setSharing] = useState('');
 
   if (artifacts.length === 0) return null;
 
   async function downloadArtifact(artifact: HarnessWorkspaceArtifact) {
-    const identity = `${artifact.task_frame_id}\u001f${artifact.path}`;
+    const identity = artifactIdentity(artifact);
     const filename = artifactFilename(artifact.display_name || artifact.path);
     setDownloading(identity);
     try {
@@ -59,6 +71,61 @@ export default function HarnessArtifactDownloads({
     }
   }
 
+  /**
+   * Mint a short-lived signed link for one published artifact.
+   *
+   * The backend already owns this capability (`POST /api/chat/artifacts/share-link`)
+   * and signs `(owner_kind, owner_id, path)`; the console only needs to ask for it.
+   */
+  async function mintArtifactShareLink(
+    artifact: HarnessWorkspaceArtifact,
+  ): Promise<ArtifactShareLink> {
+    return api.post<ArtifactShareLink>('/api/chat/artifacts/share-link', {
+      tenant_id: tenantId,
+      session_id: sessionId,
+      task_frame_id: artifact.task_frame_id,
+      path: artifact.path,
+    });
+  }
+
+  async function previewArtifact(artifact: HarnessWorkspaceArtifact) {
+    const identity = artifactIdentity(artifact);
+    setPreviewing(identity);
+    try {
+      const share = await mintArtifactShareLink(artifact);
+      if (!share.token) throw new Error('分享链接生成失败');
+      // Deliberately relative: the console and the API share one origin here (single
+      // port app, or the Vite dev proxy), so the report opens whichever address the
+      // user actually uses — TOOL_BASE_URL may hard-code localhost:5173.
+      window.open(
+        `/api/chat/artifacts/view/${encodeURIComponent(share.token)}`,
+        '_blank',
+        'noopener,noreferrer',
+      );
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '报告预览失败');
+    } finally {
+      setPreviewing('');
+    }
+  }
+
+  async function shareArtifact(artifact: HarnessWorkspaceArtifact) {
+    const identity = artifactIdentity(artifact);
+    setSharing(identity);
+    try {
+      const share = await mintArtifactShareLink(artifact);
+      if (!share.token) throw new Error('分享链接生成失败');
+      const link = share.url
+        || `${window.location.origin}/api/chat/artifacts/view/${encodeURIComponent(share.token)}`;
+      await copyTextToClipboard(link);
+      notify.success('分享链接已复制');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '分享链接生成失败');
+    } finally {
+      setSharing('');
+    }
+  }
+
   return (
     <div className={CHAT_ARTIFACTS_CLASS} aria-label="生成文件">
       <div className={CHAT_ARTIFACT_HEADING_CLASS}>
@@ -67,7 +134,7 @@ export default function HarnessArtifactDownloads({
       </div>
       <div className={CHAT_ARTIFACT_LIST_CLASS}>
         {artifacts.map((artifact) => {
-          const identity = `${artifact.task_frame_id}\u001f${artifact.path}`;
+          const identity = artifactIdentity(artifact);
           const filename = artifactFilename(artifact.display_name || artifact.path);
           const isDownloading = downloading === identity;
           if (isImageArtifact(artifact)) {
@@ -85,28 +152,55 @@ export default function HarnessArtifactDownloads({
             );
           }
           return (
-            <button
-              type="button"
-              className={CHAT_ARTIFACT_BUTTON_CLASS}
-              key={identity}
-              disabled={isDownloading || !sessionId || !tenantId}
-              aria-label={`下载文件 ${filename}`}
-              aria-busy={isDownloading}
-              onClick={() => void downloadArtifact(artifact)}
-            >
-              <span className={CHAT_ARTIFACT_ICON_CLASS}>
-                <StaffdeckIcon name="file" size={17} />
-              </span>
-              <span className={CHAT_ARTIFACT_COPY_CLASS}>
-                <span className={CHAT_ARTIFACT_NAME_CLASS} data-i18n-ignore>
-                  {filename}
+            <div className={CHAT_ARTIFACT_ROW_CLASS} key={identity}>
+              <button
+                type="button"
+                className={CHAT_ARTIFACT_BUTTON_CLASS}
+                disabled={isDownloading || !sessionId || !tenantId}
+                aria-label={`下载文件 ${filename}`}
+                aria-busy={isDownloading}
+                onClick={() => void downloadArtifact(artifact)}
+              >
+                <span className={CHAT_ARTIFACT_ICON_CLASS}>
+                  <StaffdeckIcon name="file" size={17} />
                 </span>
-                <span className={CHAT_ARTIFACT_META_CLASS}>
-                  {isDownloading ? '下载中' : artifactMeta(artifact)}
+                <span className={CHAT_ARTIFACT_COPY_CLASS}>
+                  <span className={CHAT_ARTIFACT_NAME_CLASS} data-i18n-ignore>
+                    {filename}
+                  </span>
+                  <span className={CHAT_ARTIFACT_META_CLASS}>
+                    {isDownloading ? '下载中' : artifactMeta(artifact)}
+                  </span>
                 </span>
-              </span>
-              <StaffdeckIcon name="download" size={16} />
-            </button>
+                <StaffdeckIcon name="download" size={16} />
+              </button>
+              {isHtmlArtifact(artifact) ? (
+                <div className={CHAT_ARTIFACT_ACTIONS_CLASS}>
+                  <button
+                    type="button"
+                    className={CHAT_ARTIFACT_ACTION_CLASS}
+                    disabled={!sessionId || !tenantId || previewing === identity}
+                    aria-label={`预览文件 ${filename}`}
+                    aria-busy={previewing === identity}
+                    onClick={() => void previewArtifact(artifact)}
+                  >
+                    <StaffdeckIcon name="eye" size={14} />
+                    <span>{previewing === identity ? '生成中' : '预览'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={CHAT_ARTIFACT_ACTION_CLASS}
+                    disabled={!sessionId || !tenantId || sharing === identity}
+                    aria-label={`分享文件 ${filename}`}
+                    aria-busy={sharing === identity}
+                    onClick={() => void shareArtifact(artifact)}
+                  >
+                    <StaffdeckIcon name="globe" size={14} />
+                    <span>{sharing === identity ? '生成中' : '分享'}</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
           );
         })}
       </div>
@@ -213,6 +307,16 @@ function artifactApiPath(
   });
   return `/api/chat/sessions/${encodeURIComponent(sessionId)}/artifacts/`
     + `${encodeURIComponent(artifact.task_frame_id)}?${query.toString()}`;
+}
+
+function artifactIdentity(artifact: HarnessWorkspaceArtifact): string {
+  return `${artifact.task_frame_id}\u001f${artifact.path}`;
+}
+
+function isHtmlArtifact(artifact: HarnessWorkspaceArtifact): boolean {
+  const contentType = artifact.content_type?.toLowerCase().split(';')[0].trim();
+  if (contentType === 'text/html') return true;
+  return /\.html?$/i.test(artifact.display_name || artifact.path);
 }
 
 function artifactFilename(path: string): string {

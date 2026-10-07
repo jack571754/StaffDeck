@@ -11,7 +11,7 @@ from sqlmodel import Session
 
 from app.channels.feishu_binding import resolve_feishu_binding
 from app.db import get_session
-from app.db.models import ChannelBinding, MockOrder, ScheduledTask, utc_now
+from app.db.models import ChannelBinding, FeishuOutboundMessage, MockOrder, ScheduledTask, utc_now
 from app.security.internal_service import require_internal_service
 
 router = APIRouter(
@@ -738,6 +738,18 @@ def feishu_app_notify(
     if isinstance(card_content, dict) and "card" in card_content and isinstance(card_content["card"], dict):
         card_content = card_content["card"]
 
+    card_title: str | None = None
+    if isinstance(card_content, dict):
+        header = card_content.get("header")
+        if isinstance(header, dict):
+            title_obj = header.get("title")
+            if isinstance(title_obj, dict):
+                card_title = str(title_obj.get("content") or "").strip() or None
+    if not card_title and request.scheduled_task_id:
+        task_row = db.get(ScheduledTask, request.scheduled_task_id)
+        if task_row:
+            card_title = task_row.title
+
     sent_results: list[dict[str, Any]] = []
     failed_results: list[dict[str, Any]] = []
 
@@ -756,30 +768,84 @@ def feishu_app_notify(
                 except Exception:  # noqa: BLE001
                     resp_json = {}
                 if resp_json.get("code") in (None, 0):
+                    msg_id = resp_json.get("data", {}).get("message_id") or "webhook_ok"
                     sent_results.append({
                         "target_type": "webhook",
                         "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
                         "url": wh,
-                        "message_id": resp_json.get("data", {}).get("message_id") or "webhook_ok",
+                        "message_id": msg_id,
                     })
+                    db.add(FeishuOutboundMessage(
+                        tenant_id=request.tenant_id,
+                        scheduled_task_id=request.scheduled_task_id,
+                        channel_type="webhook",
+                        feishu_message_id=None,
+                        target_type="webhook",
+                        target_identifier=wh,
+                        target_name="群机器人 Webhook",
+                        title=card_title,
+                        card_json=card_content if isinstance(card_content, dict) else {},
+                        status="delivered",
+                    ))
                 else:
+                    err_msg = f"Webhook 返回错误码 {resp_json.get('code')}: {resp_json.get('msg')}"
                     failed_results.append({
                         "target_type": "webhook",
                         "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
-                        "error": f"Webhook 返回错误码 {resp_json.get('code')}: {resp_json.get('msg')}",
+                        "error": err_msg,
                     })
+                    db.add(FeishuOutboundMessage(
+                        tenant_id=request.tenant_id,
+                        scheduled_task_id=request.scheduled_task_id,
+                        channel_type="webhook",
+                        feishu_message_id=None,
+                        target_type="webhook",
+                        target_identifier=wh,
+                        target_name="群机器人 Webhook",
+                        title=card_title,
+                        card_json=card_content if isinstance(card_content, dict) else {},
+                        status="failed",
+                        error_message=err_msg,
+                    ))
             else:
+                err_msg = f"Webhook 请求返回 HTTP {resp.status_code}: {resp.text[:150]}"
                 failed_results.append({
                     "target_type": "webhook",
                     "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
-                    "error": f"Webhook 请求返回 HTTP {resp.status_code}: {resp.text[:150]}",
+                    "error": err_msg,
                 })
+                db.add(FeishuOutboundMessage(
+                    tenant_id=request.tenant_id,
+                    scheduled_task_id=request.scheduled_task_id,
+                    channel_type="webhook",
+                    feishu_message_id=None,
+                    target_type="webhook",
+                    target_identifier=wh,
+                    target_name="群机器人 Webhook",
+                    title=card_title,
+                    card_json=card_content if isinstance(card_content, dict) else {},
+                    status="failed",
+                    error_message=err_msg,
+                ))
         except Exception as exc:  # noqa: BLE001
             failed_results.append({
                 "target_type": "webhook",
                 "identifier": wh[:45] + "..." if len(wh) > 45 else wh,
                 "error": str(exc),
             })
+            db.add(FeishuOutboundMessage(
+                tenant_id=request.tenant_id,
+                scheduled_task_id=request.scheduled_task_id,
+                channel_type="webhook",
+                feishu_message_id=None,
+                target_type="webhook",
+                target_identifier=wh,
+                target_name="群机器人 Webhook",
+                title=card_title,
+                card_json=card_content if isinstance(card_content, dict) else {},
+                status="failed",
+                error_message=str(exc),
+            ))
 
     # 3. 发送企业自建应用通道 (群聊与个人私聊)
     if has_app_targets:
@@ -798,8 +864,34 @@ def feishu_app_notify(
                 }
             for cid in chat_ids_to_send:
                 failed_results.append({"target_type": "chat_id", "identifier": cid, "error": err_msg})
+                db.add(FeishuOutboundMessage(
+                    tenant_id=request.tenant_id,
+                    scheduled_task_id=request.scheduled_task_id,
+                    channel_type="app_bot",
+                    feishu_message_id=None,
+                    target_type="chat_id",
+                    target_identifier=cid,
+                    target_name=cid,
+                    title=card_title,
+                    card_json=card_content if isinstance(card_content, dict) else {},
+                    status="failed",
+                    error_message=err_msg,
+                ))
             for m in mobiles_to_send:
                 failed_results.append({"target_type": "user_mobile", "identifier": m, "error": err_msg})
+                db.add(FeishuOutboundMessage(
+                    tenant_id=request.tenant_id,
+                    scheduled_task_id=request.scheduled_task_id,
+                    channel_type="app_bot",
+                    feishu_message_id=None,
+                    target_type="user_mobile",
+                    target_identifier=m,
+                    target_name=m,
+                    title=card_title,
+                    card_json=card_content if isinstance(card_content, dict) else {},
+                    status="failed",
+                    error_message=err_msg,
+                ))
         else:
             adapter = FeishuAdapter()
             app_targets: list[dict[str, Any]] = []
@@ -832,14 +924,29 @@ def feishu_app_notify(
                             "identifier": m,
                         })
                     else:
+                        err_m = (
+                            f"手机号 {m} 无法在飞书通讯录解析（应用缺少 contact:user.phone:readonly 权限或号码未在应用可用范围内）。"
+                            f"建议在配置中直接填写 OpenID（形如 ou_xxx）或选择已绑定的飞书账号。"
+                        )
                         failed_results.append({
                             "target_type": "user_mobile",
                             "identifier": m,
-                            "error": (
-                                f"手机号 {m} 无法在飞书通讯录解析（应用缺少 contact:user.phone:readonly 权限或号码未在应用可用范围内）。"
-                                f"建议在配置中直接填写 OpenID（形如 ou_xxx）或选择已绑定的飞书账号。"
-                            ),
+                            "error": err_m,
                         })
+                        db.add(FeishuOutboundMessage(
+                            tenant_id=request.tenant_id,
+                            binding_id=binding.id,
+                            scheduled_task_id=request.scheduled_task_id,
+                            channel_type="app_bot",
+                            feishu_message_id=None,
+                            target_type="user_mobile",
+                            target_identifier=m,
+                            target_name=m,
+                            title=card_title,
+                            card_json=card_content if isinstance(card_content, dict) else {},
+                            status="failed",
+                            error_message=err_m,
+                        ))
 
             for email in emails_to_send:
                 resolved_open_id = adapter.resolve_open_id_by_mobile_or_email(binding, email=email)
@@ -851,11 +958,26 @@ def feishu_app_notify(
                         "identifier": email,
                     })
                 else:
+                    err_e = f"通讯录无法反查到邮箱 {email} 对应的 OpenID，请检查通讯录权限或邮箱是否正确"
                     failed_results.append({
                         "target_type": "user_email",
                         "identifier": email,
-                        "error": f"通讯录无法反查到邮箱 {email} 对应的 OpenID，请检查通讯录权限或邮箱是否正确",
+                        "error": err_e,
                     })
+                    db.add(FeishuOutboundMessage(
+                        tenant_id=request.tenant_id,
+                        binding_id=binding.id,
+                        scheduled_task_id=request.scheduled_task_id,
+                        channel_type="app_bot",
+                        feishu_message_id=None,
+                        target_type="user_email",
+                        target_identifier=email,
+                        target_name=email,
+                        title=card_title,
+                        card_json=card_content if isinstance(card_content, dict) else {},
+                        status="failed",
+                        error_message=err_e,
+                    ))
 
             for t in app_targets:
                 try:
@@ -871,12 +993,41 @@ def feishu_app_notify(
                         "receive_id": t["receive_id"],
                         "message_id": msg_id,
                     })
+                    db.add(FeishuOutboundMessage(
+                        tenant_id=request.tenant_id,
+                        binding_id=binding.id,
+                        scheduled_task_id=request.scheduled_task_id,
+                        channel_type="app_bot",
+                        feishu_message_id=msg_id,
+                        target_type=t["target_type"],
+                        target_identifier=t["identifier"],
+                        target_name=t["identifier"],
+                        title=card_title,
+                        card_json=card_content if isinstance(card_content, dict) else {},
+                        status="delivered",
+                    ))
                 except Exception as exc:  # noqa: BLE001
                     failed_results.append({
                         "target_type": t["target_type"],
                         "identifier": t["identifier"],
                         "error": str(exc),
                     })
+                    db.add(FeishuOutboundMessage(
+                        tenant_id=request.tenant_id,
+                        binding_id=binding.id,
+                        scheduled_task_id=request.scheduled_task_id,
+                        channel_type="app_bot",
+                        feishu_message_id=None,
+                        target_type=t["target_type"],
+                        target_identifier=t["identifier"],
+                        target_name=t["identifier"],
+                        title=card_title,
+                        card_json=card_content if isinstance(card_content, dict) else {},
+                        status="failed",
+                        error_message=str(exc),
+                    ))
+
+    db.commit()
 
     err_detail = None
     if not sent_results and failed_results:

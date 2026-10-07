@@ -13,7 +13,7 @@
 | `api.py` | REST 路由，`APIRouter(prefix="/api/enterprise/data-query")`，全部需登录并按租户隔离；管理端点要求租户管理员 |
 | `service.py` | 领域逻辑：数据源 / 模板 CRUD（`create_data_source`/`update_data_source`/`list_data_sources`）、连接测试（`test_data_source_connection`）、试运行（`test_query_template`）、执行（`execute_query_by_id`）、临时查询（`execute_adhoc_query`）、schema 刷新（`refresh_schema_cache`）、模板版本（`list_template_versions`/`rollback_template_version`） |
 | `models.py` | SQLModel 模型：表 `DataSource` / `QueryTemplate` / `QueryTemplateVersion`；请求/响应 `DataSourceCreate/Update/Read`、`QueryTemplateCreate/Update/Read`、`QueryTemplateVersionRead`、`QueryExecuteRequest`/`QueryExecuteResult`、`TableSummary`、`ColumnMeta`、`TablePreviewResult`、`AdhocTestRequest` |
-| `executor.py` | 模板执行器：`QueryExecutor`、`_validate_params`（参数校验）、`_QueryCache`（缓存 + `invalidate_template_cache`、`_make_cache_key`）、`_clean_row`（Decimal/日期归一化） |
+| `executor.py` | 模板执行器：`QueryExecutor`、`_validate_params`（参数校验 + `date` 型动态宏）、`_QueryCache`（缓存 + `invalidate_template_cache`、`_make_cache_key`）、`_clean_row`（Decimal/日期归一化） |
 | `intent_router.py` | 自然语言 → 模板意图路由：`route_question`、`_call_router_llm`、`RouteResult`、`INTENT_ROUTER_PROMPT`、模板元数据缓存（`get_cached_templates` / `clear_intent_template_cache`，`_CACHE_TTL_SECONDS=300`） |
 | `date_resolver.py` | 日期/时间参数解析：`resolve_date_expression`、`resolve_date_range`、`compute_prev_period_date`、`_parse_explicit_date` |
 | `authorization.py` | `authorized_data_source_ids`：当前用户可访问的数据源集合 |
@@ -59,7 +59,7 @@
 | SQL 白名单与 MySQL 行为 | `connectors/mysql_connector.py`（`_SQL_ALLOW_PATTERN`、`_is_sql_allowed`） |
 | HTTP 取数语义 | `connectors/http_connector.py` |
 | 自然语言 → 模板匹配、置信度阈值 | `intent_router.py`（`route_question(threshold=0.8)`，名称/示例问句直配 0.98） |
-| “今天/近7天/环比”等日期换算 | `date_resolver.py` |
+| “今天/昨天/近7天/环比”等日期换算 | `date_resolver.py`；**模板 `date` 参数的动态宏在 `executor.py` `_validate_params`**（今天/today/@today/now/当前/当天/当日/执行日期 → 当日；昨天/昨/前一日/@yesterday → 前一日；前天/before_yesterday → 前两日），按本地 CST（UTC+8）计算，**不是 UTC** |
 | 敏感字段加密与密钥派生 | `security.py` |
 | 模型侧能看到的 data_query 能力 | `../core/capability_manifest.py`、`../core/capability_discovery.py`、`../core/harness_capability_invoker.py` |
 
@@ -75,5 +75,6 @@
 
 ## 变更记录 (Changelog)
 
+- 2026-09-30T15:50 — 增量更新（在途改动核实）：`executor._validate_params` 的 `date` 型动态宏由 **UTC 改为本地 CST（UTC+8）**，并扩充别名（新增 当天/当日/执行日期、昨/前一日）；同步「任务 → 文件对照」的日期换算行。
 - 2026-09-24T09:46 — 增量更新：补 `intent_router.py` / `date_resolver.py` / `authorization.py` 细节；新增「与 Agent 的对接（Harness v2）」与「任务 → 文件对照」；登记前端 `SqlEditor.test.tsx`。
 - 2026-09-23T18:06 — 初始化架构师首次生成；记录连接器、AES-GCM 加密与官方审查风险点。

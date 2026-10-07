@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+import logging
 import re
 import socket
 import threading
@@ -28,6 +29,7 @@ from app.db.models import (
     HarnessRunRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
+    Message,
     ScheduledTask,
     ScheduledTaskRun,
     User,
@@ -59,6 +61,9 @@ CONFLICT_RETRY_SECONDS = 15
 SCHEDULE_TYPES = {"once", "daily", "weekly", "monthly", "interval"}
 SOP_VERSION_POLICIES = {"latest", "pinned"}
 SOP_SNAPSHOT_METADATA_KEY = "_sop_snapshot"
+TASK_RUN_STALE_SECONDS = 900
+
+logger = logging.getLogger(__name__)
 
 
 class ScheduledTaskAgentUnavailable(RuntimeError):
@@ -282,6 +287,8 @@ def update_scheduled_task(
     if getattr(request, "pipeline_steps", None) is not None:
         row.pipeline_steps_json = list(request.pipeline_steps or [])
     row.updated_at = utc_now()
+    row.lease_owner = None
+    row.lease_until = None
     row.next_run_at = compute_next_run_at(row, after=utc_now()) if row.status == "active" else None
     db.add(row)
     db.commit()
@@ -455,8 +462,124 @@ def detect_scheduled_task_draft(
     )
 
 
+def reap_stale_scheduled_task_runs(
+    db: Session,
+    max_age_seconds: int = TASK_RUN_STALE_SECONDS,
+    now: datetime | None = None,
+) -> list[ScheduledTaskRun]:
+    """Scan and reap stale/orphan task runs that remain in 'running' status.
+
+    Prevents scheduled tasks from becoming permanently deadlocked when a worker
+    process crashes, reboots, or aborts daemon threads without clean finalization.
+    """
+    now = now or utc_now()
+    threshold = now - timedelta(seconds=max_age_seconds)
+
+    stale_runs = db.exec(
+        select(ScheduledTaskRun).where(
+            ScheduledTaskRun.status == "running",
+            (
+                (ScheduledTaskRun.started_at.is_not(None)) & (ScheduledTaskRun.started_at < threshold)
+            )
+            | (
+                (ScheduledTaskRun.started_at.is_(None)) & (ScheduledTaskRun.created_at < threshold)
+            ),
+        )
+    ).all()
+
+    reaped: list[ScheduledTaskRun] = []
+    for run in stale_runs:
+        task = db.get(ScheduledTask, run.scheduled_task_id)
+        run.status = "failed"
+        run.error = f"任务执行超时或异常中断（系统已自动回收孤儿任务，执行已超过 {max_age_seconds} 秒）"
+        run.finished_at = now
+        run.updated_at = now
+        db.add(run)
+
+        # Release task lease if held
+        if task:
+            task.lease_owner = None
+            task.lease_until = None
+            task.updated_at = now
+            db.add(task)
+
+        # Ensure session is not blank
+        if run.session_id:
+            user_msg = db.exec(
+                select(Message).where(Message.session_id == run.session_id, Message.role == "user")
+            ).first()
+            if not user_msg and task:
+                db.add(
+                    Message(
+                        tenant_id=task.tenant_id,
+                        session_id=run.session_id,
+                        role="user",
+                        content=automatic_task_message(task),
+                        metadata_json={
+                            "source": "scheduled_task",
+                            "scheduled_task_id": task.id,
+                            "run_id": run.id,
+                        },
+                    )
+                )
+            asst_msg = db.exec(
+                select(Message).where(Message.session_id == run.session_id, Message.role == "assistant")
+            ).first()
+            if not asst_msg and task:
+                task_title = task.title or "定时任务"
+                db.add(
+                    Message(
+                        tenant_id=task.tenant_id,
+                        session_id=run.session_id,
+                        role="assistant",
+                        content=(
+                            f"❌ **{task_title}执行异常中断**\n\n"
+                            f"- **状态**：已由系统自愈机制回收\n"
+                            f"- **原因**：任务执行超时或后台服务重启，未在预定周期内完成。"
+                        ),
+                        metadata_json={
+                            "source": "scheduled_task",
+                            "scheduled_task_id": task.id,
+                            "run_id": run.id,
+                            "reaped_at": now.isoformat(),
+                        },
+                    )
+                )
+            sess = db.get(ChatSession, run.session_id)
+            if sess:
+                sess.updated_at = now
+                db.add(sess)
+
+        logger.warning(
+            "Reaped stale scheduled task run %s for task %s (started=%s)",
+            run.id,
+            run.scheduled_task_id,
+            run.started_at or run.created_at,
+        )
+        reaped.append(run)
+
+    if reaped:
+        db.commit()
+        for r in reaped:
+            db.refresh(r)
+
+    return reaped
+
+
 def due_scheduled_tasks(db: Session, now: datetime | None = None, limit: int = 10) -> list[ScheduledTask]:
     now = now or utc_now()
+    reap_stale_scheduled_task_runs(db, now=now)
+    db.exec(
+        update(ScheduledTask)
+        .where(
+            ScheduledTask.lease_until.is_not(None),
+            ScheduledTask.lease_until < now,  # type: ignore[operator]
+        )
+        .values(
+            lease_owner=None,
+            lease_until=None,
+        )
+    )
     db.exec(
         update(ScheduledTask)
         .where(
@@ -522,13 +645,20 @@ def execute_scheduled_task(
     manual: bool = False,
 ) -> ScheduledTaskRun:
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
-    skipped = _skip_misfired_run(db, task, scheduled_for, manual)
-    if skipped is not None:
-        return skipped
-    run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
-    if run.status != "running" or not run.session_id:
-        return run
-    return _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    try:
+        skipped = _skip_misfired_run(db, task, scheduled_for, manual)
+        if skipped is not None:
+            return skipped
+        run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
+        if run.status != "running" or not run.session_id:
+            return run
+        return _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    finally:
+        task.lease_owner = None
+        task.lease_until = None
+        task.updated_at = utc_now()
+        db.add(task)
+        db.commit()
 
 
 def start_scheduled_task_async(
@@ -574,6 +704,8 @@ def _prepare_scheduled_task_run(
             db.add(existing)
             db.commit()
             db.refresh(existing)
+        else:
+            _finish_task_schedule(db, task, scheduled_for, existing.status, manual)
         return existing
     if task.concurrency_policy == "forbid":
         running = db.exec(
@@ -582,6 +714,23 @@ def _prepare_scheduled_task_run(
                 ScheduledTaskRun.status == "running",
             )
         ).first()
+        if running:
+            run_started = running.started_at or running.created_at
+            if run_started and run_started < utc_now() - timedelta(seconds=TASK_RUN_STALE_SECONDS):
+                logger.warning(
+                    "Auto-healing stale scheduled task run %s for task %s (running since %s)",
+                    running.id,
+                    task.id,
+                    run_started,
+                )
+                reap_stale_scheduled_task_runs(db, max_age_seconds=TASK_RUN_STALE_SECONDS)
+                running = db.exec(
+                    select(ScheduledTaskRun).where(
+                        ScheduledTaskRun.scheduled_task_id == task.id,
+                        ScheduledTaskRun.status == "running",
+                    )
+                ).first()
+
         if running:
             run = _create_run(db, task, scheduled_for, "skipped")
             run.error = "上一轮自动任务仍在执行，已按 forbid 策略跳过本次唤醒。"
@@ -643,6 +792,7 @@ def _skip_misfired_run(
         )
     ).first()
     if existing:
+        _finish_task_schedule(db, task, scheduled_for, existing.status, manual=False)
         return existing
     run = _create_run(db, task, scheduled_for, "skipped")
     run.error = "计划执行时间已超过补偿窗口，已按 skip 策略跳过。"
@@ -658,12 +808,35 @@ def _skip_misfired_run(
 
 
 def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, manual: bool) -> None:
-    with Session(engine) as db:
-        task = db.get(ScheduledTask, task_id)
-        run = db.get(ScheduledTaskRun, run_id)
-        if not task or not run:
-            return
-        _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    try:
+        with Session(engine) as db:
+            task = db.get(ScheduledTask, task_id)
+            run = db.get(ScheduledTaskRun, run_id)
+            if not task or not run:
+                return
+            _execute_prepared_scheduled_task(db, task, run, manual=manual)
+    except Exception as exc:
+        logger.exception("Background execution of scheduled task %s (run %s) failed", task_id, run_id)
+        try:
+            with Session(engine) as db:
+                run = db.get(ScheduledTaskRun, run_id)
+                task = db.get(ScheduledTask, task_id)
+                if run and run.status == "running":
+                    run.status = "failed"
+                    run.error = f"后台线程执行异常中断: {exc}"
+                    run.finished_at = utc_now()
+                    run.updated_at = utc_now()
+                    db.add(run)
+                if task:
+                    task.lease_owner = None
+                    task.lease_until = None
+                    task.updated_at = utc_now()
+                    sched_for = run.scheduled_for if run and run.scheduled_for else utc_now()
+                    _finish_task_schedule(db, task, sched_for, "failed", manual)
+                    db.add(task)
+                db.commit()
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning("Failed to mark crashed scheduled task as failed: %s", cleanup_exc)
 
 
 def _execute_prepared_scheduled_task(
@@ -1394,10 +1567,12 @@ def _finish_task_schedule(db: Session, task: ScheduledTask, scheduled_for: datet
     now = utc_now()
     task.last_run_at = now
     task.last_status = status
-    task.run_count += 1
     if not manual:
+        task.run_count += 1
+    should_update_next = (not manual) or (task.next_run_at is None or task.next_run_at <= now)
+    if should_update_next and task.status == "active":
         schedule_after = scheduled_for + timedelta(seconds=1)
-        if task.misfire_policy in {"coalesce", "skip"}:
+        if task.misfire_policy in {"coalesce", "skip"} or manual:
             schedule_after = max(schedule_after, now)
         next_run = compute_next_run_at(task, after=schedule_after)
         if task.max_runs is not None and task.run_count >= task.max_runs:

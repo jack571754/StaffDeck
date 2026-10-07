@@ -50,6 +50,7 @@ from app.db.models import (
     utc_now,
 )
 from app.harness import (
+    ARTIFACT_OWNER_DEFAULT_KIND,
     HarnessArtifactAccessError,
     HarnessExecutor,
     HarnessToolCall,
@@ -532,6 +533,8 @@ class HarnessCapabilityInvoker:
             return self._search_data_queries(arguments)
         if name == "data_query_execute":
             return self._execute_data_query(arguments)
+        if name == "report_generate":
+            return self._generate_report(arguments)
         if name == "lark_cli":
             from app.lark_cli.service import invoke_lark_cli
 
@@ -629,6 +632,53 @@ class HarnessCapabilityInvoker:
             return _failure("QUERY_TEMPLATE_ERROR", str(exc))
         except Exception as exc:  # noqa: BLE001
             return _failure("QUERY_EXECUTION_ERROR", f"执行数据查询失败: {exc}")
+
+    def _generate_report(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Render a shareable HTML report and publish it as a TaskFrame artifact.
+
+        The report is written into this frame's workspace, so it is served by the
+        existing artifact endpoints with no new route: ``discover_artifacts`` finds the
+        file after the step finishes, and the engine attaches it to the assistant
+        message. The artifact is also returned here so the AgentLoop does not depend on
+        discovery alone.
+        """
+
+        from app.reporting.errors import ReportError
+        from app.reporting.spec import build_report_from_spec
+        from app.reporting.writer import write_report_html
+
+        try:
+            document = build_report_from_spec(arguments, tenant_id=self.tenant_id)
+            published = write_report_html(
+                db=self.db,
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+                owner_id=self.task_frame_id,
+                document=document,
+            )
+        except ReportError as exc:
+            return _failure("REPORT_GENERATION_ERROR", str(exc))
+        except OSError as exc:
+            return _failure("REPORT_GENERATION_ERROR", f"报告写入失败：{exc}")
+
+        artifact = dict(published.artifact)
+        artifact["sandbox_path"] = _sandbox_path(published.path)
+        artifact["source"] = "harness.report_generate"
+        return {
+            "success": True,
+            "data": {
+                "path": published.path,
+                "display_name": published.display_name,
+                "size": published.size,
+                "sha256": published.sha256,
+                "notice": (
+                    "独立 HTML 报告已生成并登记为本次任务的交付物，用户可在会话中直接预览、"
+                    "下载或分享；请勿再把同样的表格粘贴进回复正文。"
+                ),
+            },
+            "artifacts": [artifact],
+        }
 
     def _external_task_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
         task_id = str(arguments.get("task_id") or "").strip().lstrip("#")

@@ -1,7 +1,9 @@
 from app.harness.artifacts import (
+    ARTIFACT_OWNER_DEFAULT_KIND,
     HarnessArtifactAccessError,
     HarnessWorkspaceSnapshot,
     OpenedHarnessArtifact,
+    artifact_owner_pair,
     is_noise_artifact_path,
     normalize_harness_artifact_path,
     open_harness_artifact,
@@ -41,10 +43,10 @@ from app.harness.skill_script import (
 )
 
 __all__ = [
+    "ARTIFACT_OWNER_DEFAULT_KIND",
     "ExecCommandArguments",
     "ExtractDocumentTextArguments",
     "HarnessArtifactAccessError",
-    "HarnessWorkspaceSnapshot",
     "HarnessExecutionError",
     "HarnessExecutor",
     "HarnessLimits",
@@ -54,9 +56,11 @@ __all__ = [
     "HarnessToolError",
     "HarnessToolResult",
     "HarnessToolSpec",
+    "HarnessWorkspaceSnapshot",
     "OpenedHarnessArtifact",
     "PublishArtifactArguments",
     "RunSkillScriptArguments",
+    "artifact_owner_pair",
     "build_command_tool_registry",
     "build_file_tool_registry",
     "exec_command",
@@ -69,7 +73,7 @@ __all__ = [
     "register_command_tools",
     "register_file_tools",
     "register_skill_script_tools",
-    "run_skill_script",
     "run_sandboxed_process",
+    "run_skill_script",
     "snapshot_harness_workspace",
 ]

@@ -91,7 +91,7 @@ def test_llm_draft_defaults_to_requested_timezone(monkeypatch) -> None:
 
         assert draft is not None
         assert draft.timezone == "America/Los_Angeles"
-        assert draft.schedule == {"time": "09:00"}
+        assert draft.schedule["time"] == "09:00"
 
 
 def test_llm_negative_result_does_not_fallback(monkeypatch) -> None:

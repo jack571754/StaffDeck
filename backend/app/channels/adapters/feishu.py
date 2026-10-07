@@ -467,6 +467,23 @@ class FeishuAdapter:
             body={"content": json.dumps(card_json, ensure_ascii=False)},
         )
 
+    def recall_message(
+        self,
+        binding: ChannelBinding,
+        message_id: str,
+    ) -> None:
+        """DELETE 撤回已发送的消息 (包含文本或卡片)。"""
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            raise FeishuPermanentError("飞书消息撤回缺少 message_id")
+        self._request(
+            binding,
+            "DELETE",
+            f"{FEISHU_API_BASE}/im/v1/messages/{message_id}",
+            params=None,
+            body=None,
+        )
+
     def resolve_open_id_by_mobile_or_email(
         self,
         binding: ChannelBinding,

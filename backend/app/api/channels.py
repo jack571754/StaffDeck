@@ -29,6 +29,7 @@ from app.channels.adapters.dingtalk import (
     validate_dingtalk_credentials,
 )
 from app.channels.adapters.feishu import (
+    FeishuAdapter,
     FeishuPermanentError,
     validate_feishu_credentials,
 )
@@ -56,6 +57,9 @@ from app.channels.schema import (
     ChannelQRCodeStatusRead,
     DingTalkCredentialsRequest,
     FeishuCredentialsRequest,
+    FeishuOutboundMessagePage,
+    FeishuOutboundMessageRead,
+    FeishuOutboundStatsRead,
     MyIdentityBindingRead,
     WeChatKfAccountCreateRequest,
     WeChatKfAccountSelectRequest,
@@ -92,7 +96,9 @@ from app.db.models import (
     ChannelIdentity,
     ChannelInboundEvent,
     ChatSession,
+    FeishuOutboundMessage,
     Message,
+    ScheduledTask,
     Team,
     User,
     WeChatKfAccount,
@@ -2301,3 +2307,170 @@ def get_channel_conversation_attachment(
             )
         },
     )
+
+
+@router.get("/feishu/messages", response_model=FeishuOutboundMessagePage)
+def list_feishu_outbound_messages(
+    tenant_id: str = Query(...),
+    channel_type: str | None = Query(None),
+    status: str | None = Query(None),
+    search: str | None = Query(None),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> FeishuOutboundMessagePage:
+    ensure_current_user_tenant(tenant_id, current_user)
+    actual_channel_type = channel_type if isinstance(channel_type, str) and channel_type else None
+    actual_status = status if isinstance(status, str) and status else None
+    actual_search = search.strip() if isinstance(search, str) and search.strip() else None
+    actual_offset = offset if isinstance(offset, int) and offset >= 0 else 0
+    actual_limit = limit if isinstance(limit, int) and limit > 0 else 20
+
+    query = select(FeishuOutboundMessage).where(FeishuOutboundMessage.tenant_id == tenant_id)
+    if actual_channel_type:
+        query = query.where(FeishuOutboundMessage.channel_type == actual_channel_type)
+    if actual_status:
+        query = query.where(FeishuOutboundMessage.status == actual_status)
+    if actual_search:
+        search_pattern = f"%{actual_search}%"
+        query = query.where(
+            or_(
+                FeishuOutboundMessage.target_identifier.like(search_pattern),
+                FeishuOutboundMessage.target_name.like(search_pattern),
+                FeishuOutboundMessage.title.like(search_pattern),
+                FeishuOutboundMessage.feishu_message_id.like(search_pattern),
+            )
+        )
+    from sqlalchemy import func
+
+    total = db.exec(select(func.count()).select_from(query.subquery())).one()
+    rows = db.exec(query.order_by(FeishuOutboundMessage.created_at.desc()).offset(actual_offset).limit(actual_limit)).all()
+
+    task_ids = [r.scheduled_task_id for r in rows if r.scheduled_task_id]
+    task_map: dict[str, str] = {}
+    if task_ids:
+        tasks = db.exec(select(ScheduledTask).where(ScheduledTask.id.in_(task_ids))).all()
+        task_map = {t.id: t.title for t in tasks}
+
+    items: list[FeishuOutboundMessageRead] = []
+    for r in rows:
+        can_recall = r.channel_type == "app_bot" and r.status == "delivered" and bool(r.feishu_message_id)
+        items.append(
+            FeishuOutboundMessageRead(
+                id=r.id,
+                tenant_id=r.tenant_id,
+                binding_id=r.binding_id,
+                scheduled_task_id=r.scheduled_task_id,
+                scheduled_task_title=task_map.get(r.scheduled_task_id or "") if r.scheduled_task_id else None,
+                run_id=r.run_id,
+                channel_type=r.channel_type,
+                feishu_message_id=r.feishu_message_id,
+                target_type=r.target_type,
+                target_identifier=r.target_identifier,
+                target_name=r.target_name,
+                title=r.title or task_map.get(r.scheduled_task_id or ""),
+                card_json=r.card_json if isinstance(r.card_json, dict) else {},
+                status=r.status,
+                error_message=r.error_message,
+                can_recall=can_recall,
+                recalled_at=r.recalled_at.isoformat() if r.recalled_at else None,
+                recalled_by=r.recalled_by,
+                created_at=r.created_at.isoformat(),
+                updated_at=r.updated_at.isoformat(),
+            )
+        )
+    return FeishuOutboundMessagePage(items=items, total=total, offset=actual_offset, limit=actual_limit)
+
+
+@router.get("/feishu/messages/stats", response_model=FeishuOutboundStatsRead)
+def get_feishu_outbound_stats(
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> FeishuOutboundStatsRead:
+    ensure_current_user_tenant(tenant_id, current_user)
+    today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = db.exec(
+        select(FeishuOutboundMessage).where(
+            FeishuOutboundMessage.tenant_id == tenant_id,
+            FeishuOutboundMessage.created_at >= today_start,
+        )
+    ).all()
+    total_today = len(rows)
+    delivered_today = sum(1 for r in rows if r.status == "delivered")
+    failed_today = sum(1 for r in rows if r.status == "failed")
+    recalled_today = sum(1 for r in rows if r.status == "recalled")
+    return FeishuOutboundStatsRead(
+        total_today=total_today,
+        delivered_today=delivered_today,
+        failed_today=failed_today,
+        recalled_today=recalled_today,
+    )
+
+
+@router.post("/feishu/messages/{message_id}/recall")
+def recall_feishu_message(
+    message_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    ensure_current_user_tenant(tenant_id, current_user)
+    msg = db.get(FeishuOutboundMessage, message_id)
+    if not msg or msg.tenant_id != tenant_id:
+        msg = db.exec(
+            select(FeishuOutboundMessage).where(
+                FeishuOutboundMessage.tenant_id == tenant_id,
+                FeishuOutboundMessage.feishu_message_id == message_id,
+            )
+        ).first()
+    if not msg:
+        raise HTTPException(status_code=404, detail="未找到对应的飞书推送记录")
+    if msg.channel_type != "app_bot":
+        raise HTTPException(
+            status_code=400,
+            detail="飞书自定义群机器人 Webhook 不支持 API 撤回，仅企业自建应用支持消息撤回",
+        )
+    if msg.status == "recalled":
+        return {
+            "ok": True,
+            "message": "消息此前已被撤回",
+            "recalled_at": msg.recalled_at.isoformat() if msg.recalled_at else None,
+        }
+    if not msg.feishu_message_id:
+        raise HTTPException(status_code=400, detail="该记录缺少飞书消息唯一 ID (message_id)，无法执行撤回")
+
+    binding: ChannelBinding | None = None
+    if msg.binding_id:
+        binding = db.get(ChannelBinding, msg.binding_id)
+    if not binding:
+        from app.channels.feishu_binding import resolve_feishu_binding
+
+        binding, _ = resolve_feishu_binding(db, tenant_id=tenant_id)
+    if not binding:
+        raise HTTPException(status_code=400, detail="未找到用于撤回的飞书应用绑定凭证")
+
+    adapter = FeishuAdapter()
+    try:
+        adapter.recall_message(binding, msg.feishu_message_id)
+    except Exception as exc:
+        logger.exception("Failed to recall feishu message %s", msg.feishu_message_id)
+        raise HTTPException(status_code=400, detail=f"飞书开放平台撤回失败: {exc}") from exc
+
+    msg.status = "recalled"
+    msg.recalled_at = utc_now()
+    msg.recalled_by = current_user.display_name or current_user.username
+    msg.updated_at = utc_now()
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+
+    return {
+        "ok": True,
+        "message": "消息撤回成功",
+        "id": msg.id,
+        "recalled_at": msg.recalled_at.isoformat() if msg.recalled_at else None,
+        "recalled_by": msg.recalled_by,
+    }

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.db.models import ChannelBinding, ChannelDelivery, Team, User
@@ -279,6 +279,43 @@ class ChannelDeliveryDayPage(BaseModel):
     total_days: int
     offset: int
     limit: int
+
+
+class FeishuOutboundMessageRead(BaseModel):
+    id: str
+    tenant_id: str
+    binding_id: str | None = None
+    scheduled_task_id: str | None = None
+    scheduled_task_title: str | None = None
+    run_id: str | None = None
+    channel_type: str
+    feishu_message_id: str | None = None
+    target_type: str
+    target_identifier: str
+    target_name: str | None = None
+    title: str | None = None
+    card_json: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    error_message: str | None = None
+    can_recall: bool = False
+    recalled_at: str | None = None
+    recalled_by: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class FeishuOutboundMessagePage(BaseModel):
+    items: list[FeishuOutboundMessageRead]
+    total: int
+    offset: int
+    limit: int
+
+
+class FeishuOutboundStatsRead(BaseModel):
+    total_today: int
+    delivered_today: int
+    failed_today: int
+    recalled_today: int
 
 
 def channel_binding_agents_read(db: Session, binding: ChannelBinding) -> list[ChannelBindingAgentRead]:

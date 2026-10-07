@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -17,8 +18,18 @@ from app.api.chat import (
     mint_artifact_share,
     view_published_artifact,
 )
-from app.core.harness_session_cleanup import harness_task_workspace_path
-from app.db.models import ChatSession, HarnessTaskFrameRecord, Message, Tenant, User
+from app.core.harness_session_cleanup import (
+    harness_session_workspace_path,
+    harness_task_workspace_path,
+)
+from app.db.models import (
+    ChatSession,
+    HarnessTaskFrameRecord,
+    Message,
+    ScheduledTaskRun,
+    Tenant,
+    User,
+)
 from app.harness import publish_harness_artifacts
 from app.security import artifact_share as artifact_share_mod
 from app.security import auth as security_auth
@@ -425,3 +436,126 @@ def test_view_rejects_login_token_as_share_token(
         with pytest.raises(HTTPException) as wrong_type:
             view_published_artifact(login_token, current_user=None, db=db)
         assert wrong_type.value.status_code == 404
+
+# --- ownership generalization (see tests/test_artifact_owners.py for the resolvers) --
+
+
+def test_view_rejects_an_unregistered_owner_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signed token for an owner kind nobody resolves must 404, not 500.
+
+    The token layer checks only the claim's shape; the semantic check lives in the
+    resolver registry, so an unknown kind has to fail closed at lookup time.
+    """
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_artifact(db)
+        token = artifact_share_mod.mint_artifact_share_token(
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            owner_kind="not_registered",
+            owner_id="task_demo",
+            path="reports/report.html",
+        )
+
+        with pytest.raises(HTTPException) as unknown_owner:
+            view_published_artifact(token, current_user=None, db=db)
+        assert unknown_owner.value.status_code == 404
+
+
+def test_legacy_token_still_resolves_the_frame_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token carrying only task_frame_id keeps working after generalization."""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        _seed_artifact(db)
+        token = _handcraft_token(
+            {
+                "type": artifact_share_mod.ARTIFACT_SHARE_CLAIM,
+                "tenant_id": "tenant_demo",
+                "session_id": "session_demo",
+                "task_frame_id": "task_demo",
+                "path": "reports/report.html",
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 600,
+            }
+        )
+
+        response = view_published_artifact(token, current_user=None, db=db)
+        assert asyncio.run(_read_response_body(response)) == HTML_BODY.encode("utf-8")
+
+
+def test_mint_accepts_an_explicit_owner_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scheduled_run report is mintable and its token round-trips that owner."""
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        user = _seed_artifact(db)
+        run_id = "schedrun_demo"
+        report_path = f"reports/{run_id}/report.html"
+        db.add(
+            ScheduledTaskRun(
+                id=run_id,
+                tenant_id="tenant_demo",
+                scheduled_task_id="sched_demo",
+                agent_id="agent_demo",
+                user_id=user.id,
+                session_id="session_demo",
+                scheduled_for=datetime(2026, 9, 28, 8, 0, tzinfo=UTC),
+            )
+        )
+        session_workspace = harness_session_workspace_path(
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+        )
+        report_file = session_workspace / report_path
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        report_file.write_text(HTML_BODY, encoding="utf-8")
+        published = publish_harness_artifacts(
+            session_workspace,
+            run_id,
+            [{"path": report_path}],
+            operation="scheduled_task_pipeline",
+        )
+        for artifact in published:
+            artifact["owner_kind"] = "scheduled_run"
+            artifact["owner_id"] = run_id
+        db.add(
+            Message(
+                id="msg_pipeline",
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                role="assistant",
+                content="报告已生成。",
+                metadata_json={"harness_artifacts": published},
+            )
+        )
+        db.commit()
+
+        minted = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id=run_id,
+                path=report_path,
+                owner_kind="scheduled_run",
+            ),
+            current_user=user,
+            db=db,
+        )
+
+        decoded = artifact_share_mod.decode_artifact_share_token(minted.token)
+        assert decoded["owner_kind"] == "scheduled_run"
+        assert decoded["owner_id"] == run_id
+
+        response = view_published_artifact(minted.token, current_user=None, db=db)
+        assert asyncio.run(_read_response_body(response)) == HTML_BODY.encode("utf-8")

@@ -1254,3 +1254,45 @@ export type TeamEventRead = {
   payload: Record<string, unknown>;
   created_at: string;
 };
+
+// ---------------------------------------------------------------------------
+// Feishu Outbound Message Tracking & Recall
+// ---------------------------------------------------------------------------
+
+export type FeishuOutboundMessageRead = {
+  id: string;
+  tenant_id: string;
+  binding_id?: string | null;
+  scheduled_task_id?: string | null;
+  scheduled_task_title?: string | null;
+  run_id?: string | null;
+  channel_type: 'app_bot' | 'webhook' | string;
+  feishu_message_id?: string | null;
+  target_type: string;
+  target_identifier: string;
+  target_name?: string | null;
+  title?: string | null;
+  card_json: Record<string, unknown>;
+  status: 'delivered' | 'failed' | 'recalled' | string;
+  error_message?: string | null;
+  can_recall: boolean;
+  recalled_at?: string | null;
+  recalled_by?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type FeishuOutboundMessagePage = {
+  items: FeishuOutboundMessageRead[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+export type FeishuOutboundStatsRead = {
+  total_today: number;
+  delivered_today: number;
+  failed_today: number;
+  recalled_today: number;
+};
+

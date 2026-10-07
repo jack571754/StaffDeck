@@ -20,6 +20,8 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
+  UnderlineTabs,
+  type UnderlineTabItem,
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 
@@ -63,6 +65,7 @@ import FeishuSetup from './channels/FeishuSetup';
 import DingTalkSetup from './channels/DingTalkSetup';
 import WechatKfSetup from './channels/WechatKfSetup';
 import BindingManagers from './channels/BindingManagers';
+import FeishuMessagesTab from './channels/FeishuMessagesTab';
 import {
   canDeleteBinding,
   canManageBinding,
@@ -235,6 +238,11 @@ function groupByDay<T>(
   return groups;
 }
 
+const MAIN_TABS: UnderlineTabItem<'channels' | 'feishu-messages'>[] = [
+  { value: 'channels', label: '渠道接入与绑定' },
+  { value: 'feishu-messages', label: '飞书消息管控与撤回' },
+];
+
 export default function ChannelsPage({
   currentUser,
   onLogout,
@@ -242,6 +250,7 @@ export default function ChannelsPage({
   currentUser?: EnterpriseAuthUser;
   onLogout?: () => void;
 } = {}) {
+  const [mainTab, setMainTab] = useState<'channels' | 'feishu-messages'>('channels');
   const [bindings, setBindings] = useState<ChannelBindingRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedId, setSelectedId] = useState('');
@@ -1605,7 +1614,23 @@ export default function ChannelsPage({
   return (
     <div className="min-h-full box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader onLogout={onLogout} userName={currentUser?.username} title="渠道接入" />
-      {binding ? detailView : listView}
+      <UnderlineTabs
+        className="mt-[16px] mb-[4px]"
+        aria-label="渠道页面导航"
+        value={mainTab}
+        onChange={(val) => {
+          setMainTab(val);
+          if (val === 'feishu-messages') {
+            setSelectedId('');
+          }
+        }}
+        items={MAIN_TABS}
+      />
+      {mainTab === 'channels' ? (
+        binding ? detailView : listView
+      ) : (
+        <FeishuMessagesTab />
+      )}
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent

@@ -195,6 +195,11 @@ export const CHAT_ARTIFACT_IMAGE_FOOTER_CLASS =
   'grid min-w-0 grid-cols-[minmax(0,1fr)_32px] items-center gap-[10px] border-t border-[#eef0f4] bg-white px-[10px] py-[8px]';
 export const CHAT_ARTIFACT_IMAGE_DOWNLOAD_CLASS =
   'inline-grid size-[32px] place-items-center rounded-[8px] border border-[#e3e7f1] bg-white text-[#464c5e] transition hover:border-[#c9d2e4] hover:bg-[#f7f8fa] disabled:cursor-wait disabled:opacity-60';
+// Row wrapper for a downloadable artifact plus its inline actions (preview/share).
+export const CHAT_ARTIFACT_ROW_CLASS = 'grid min-w-0 gap-[4px]';
+export const CHAT_ARTIFACT_ACTIONS_CLASS = 'flex flex-wrap items-center gap-[6px] pl-[41px]';
+export const CHAT_ARTIFACT_ACTION_CLASS =
+  'inline-flex items-center gap-[4px] rounded-[8px] border border-[#e3e7f1] bg-white px-[8px] py-[3px] text-[11px] text-[#464c5e] transition hover:border-[#c9d2e4] hover:bg-[#f7f8fa] disabled:cursor-wait disabled:opacity-60';
 
 // ---------------------------------------------------------------------------
 // Feedback actions

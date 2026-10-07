@@ -29,7 +29,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 
 | 子包 | 职责 | 文档 |
 |---|---|---|
-| `core/` | **Harness v2 运行时内核**：Turn 规划、TaskFrame 持久化/租约、能力清单与渐进披露、单任务 Agent 循环、能力调用与重放、上下文投影、取消/恢复、反射、人工接管、slash 命令 | [core/CLAUDE.md](app/core/CLAUDE.md) |
+| `core/` | **Harness v2 运行时内核**：Turn 规划、TaskFrame 持久化/租约、能力清单与渐进披露、单任务 Agent 循环、能力调用与重放、上下文投影、取消/恢复、反射、人工接管、slash 命令、**产物归属解析（`artifact_owners.py`）/已发布交付物查询** | [core/CLAUDE.md](app/core/CLAUDE.md) |
 | `harness/` | Harness v2 沙箱执行引擎：executor / sandbox / command / skill_script / registry / contracts / filesystem / artifacts / execution_context | — |
 | `capabilities/` | 能力契约体系（端口/适配器、注册表与快照、本地知识/技能包实现、testkit、JSON Schema） | [capabilities/CLAUDE.md](app/capabilities/CLAUDE.md) |
 | `channels/` | IM 渠道内核与适配器（base + dingtalk/wecom/wechat_kf/feishu_manager），渠道无关的 autoroute / identity / inbox / outbox / routing / session | — |
@@ -38,8 +38,9 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 | `general_skills/` | 通用技能包运行时：runner / runtime_env / schema | — |
 | `llm/` | 模型接入：`client`（LLMClient）、`protocol_drivers`（anthropic/gemini/openai-responses 等）、`model_config_resolver`、提示词 `prompts/*.md` | — |
 | `skills/` | 技能/skill 生命周期：skill_distiller、skill_editor、skill_reflection、skill_schema、step_ids、nesting（SOP 嵌套）、llm_limits、tool_authorization | — |
-| `scheduled_tasks/` | 定时/周期任务引擎（含 `renderers/` 飞书卡片渲染器注册表） | [scheduled_tasks/CLAUDE.md](app/scheduled_tasks/CLAUDE.md) |
+| `scheduled_tasks/` | 定时/周期任务引擎（含 `renderers/` 飞书卡片渲染器注册表、孤儿 run 回收与租约自愈） | [scheduled_tasks/CLAUDE.md](app/scheduled_tasks/CLAUDE.md) |
 | `data_query/` | 数据查询中心 | [data_query/CLAUDE.md](app/data_query/CLAUDE.md) |
+| `reporting/` | **可分享 HTML 报告生成（generate 半边，本分支在途）**：纯数据契约 → 渲染器注册表 → 单文件自包含 HTML → 原子落盘登记为交付物 + 签名分享链接；**尚无生产调用方** | [reporting/CLAUDE.md](app/reporting/CLAUDE.md) |
 | `teams/` | 多员工团队协作：service / wakeup / sweeper / schema | — |
 | `memory/` | 长期记忆：service / jobs | — |
 | `feedback/` | 用户反馈：service / jobs | — |
@@ -47,7 +48,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 | `session/` | 会话模型与 ChatTurn 请求/响应（`session_schema.py`：`ChatTurnRequest`、`TurnPlan`、`PlannedTaskFrame`、`StepAgentResult`） | — |
 | `security/` | 权限 / 租户 / 加密 / 内部服务令牌 / 托管子进程（见下） | — |
 | `observability/` | 事件日志与 spans（`llm_operation` 等） | — |
-| `db/` | 引擎与模型：`models.py`（约 67 表）、`seed.py`、`staffdeck_seed.py`、`database.py` | — |
+| `db/` | 引擎与模型：`models.py`（约 1715 行、75 个表模型）、`seed.py`、`staffdeck_seed.py`、`database.py` | — |
 | `public_api/` | 开放 API v1 子应用（见下） | — |
 | `a2a/` | Codex A2A 协议适配（见下） | — |
 | `lark_cli/` | 飞书 CLI 集成（见下） | — |
@@ -62,6 +63,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 | `encryption.py` | `encrypt_secret` / `decrypt_secret` / `mask_secret`（Fernet） | 渠道凭证等敏感串加密 |
 | `internal_service.py` | `INTERNAL_SERVICE_HEADER = "X-UltraRAG-Internal-Token"`、`internal_service_token`、`require_internal_service` | 内部服务间 HMAC 头（mock 数据查询接口用） |
 | `managed_subprocess.py` | `ManagedProcess`、`ManagedProcessError`、`_WindowsJob`、`_terminate_process_tree` | 跨平台托管子进程与进程树终止（Windows Job Object） |
+| `artifact_share.py` | `mint_artifact_share_token`、`decode_artifact_share_token`、`normalize_owner_kind`、`OWNER_KIND_PATTERN`、`ARTIFACT_SHARE_CLAIM`、`ARTIFACT_SHARE_TTL_SECONDS`（7 天） | 无状态签名分享 token：绑定 `tenant_id` / `session_id` / `(owner_kind, owner_id)` / `path`；**不 import `app.core`**（签名层只认 slug 形状），一切失败统一 404 防存在性预言机 |
 
 ## public_api/ 开放 API v1
 
@@ -78,11 +80,12 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 
 ## 数据模型
 
-集中在 `app/db/models.py`（SQLModel，约 67 表）。关键表名与模型：
+集中在 `app/db/models.py`（SQLModel，约 1715 行、75 个 `table=True` 模型；2026-09-30 实测）。关键表名与模型：
 
 | 域 | 表名 | 模型 |
 |---|---|---|
 | 定时任务 | `scheduled_tasks` / `scheduled_task_runs` | `ScheduledTask` / `ScheduledTaskRun` |
+| 渠道·飞书出站 | `feishu_outbound_messages` | `FeishuOutboundMessage`（本分支新增；出站卡片追踪 + 撤回审计，`status ∈ {delivered, failed, recalled}`） |
 | Harness v2 | `harness_turns` / `harness_task_frames` / `harness_runs` / `harness_invocations` / `harness_session_leases` / `harness_agent_loops` | `HarnessTurnRecord` / `HarnessTaskFrameRecord` / `HarnessRunRecord` / `HarnessInvocationRecord` / `HarnessSessionLeaseRecord` |
 | 技能 | `skills` / `skill_versions` / `general_skills` / `skill_feedback` | `Skill` / `GeneralSkill` |
 | 开放 API | `api_clients` / `api_credentials` / `api_jobs` / `api_job_events` / `api_audit_logs` / `api_idempotency_records` / `api_sop_drafts` | `APIClient` / `APICredential` / `APIJob` |
@@ -91,7 +94,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 
 ## 测试与质量
 
-- `backend/tests/`：169 个 `pytest` 文件，按域命名（channel_*/harness_*/knowledge_*/tools_*/capability_*/public_api_*/scheduled_task 等）。
+- `backend/tests/`：179 个 `pytest` 文件（2026-09-30 实测），按域命名（channel_*/harness_*/knowledge_*/tools_*/capability_*/public_api_*/scheduled_task/reporting/artifact_* 等）。
 - **Windows 已知本机失败基线**：详见**仓库根** `../AGENTS.md`「Known environment-specific test failures (Windows)」（2026-09-16 快照 48 failed / 2198 passed；lark_cli / 沙箱 / 符号链接相关；先读此文件再判断失败归属）。
 - 规范：`ruff`，line-length 100；`pyproject.toml` 配置 `testpaths=["tests"]`。
 - 其他：`mock_servers/` 提供 MCP stdio server 与鉴权矩阵 mock，供测试/演示。
@@ -103,6 +106,10 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 - 定时任务 pipeline 任务却出销售播报卡：见 `scheduled_tasks/renderers/` 默认渲染器为 `sales_card`（模块文档「Pipeline 通道」一节）。
 - 模型看不到某能力：`core/capability_manifest.py`（是否授权）与 `core/capability_discovery.py`（是否投影进 8K 目录）。
 - 开放 API 401/403：`public_api/auth.py` 的 scope 与 `credential_profiles.py` 档案不匹配；`sd_live_*` 密钥摘要 pepper 变化会使旧密钥失效。
+- 交付物/报告下载或预览 404：owner 语义在 `core/artifact_owners.py` —— `owner_kind` 未注册 resolver 直接返回 `None` → 404；token 里的 owner 对与 `Message.metadata_json["harness_artifacts"]` 条目不一致同样 404。分享链接见 `security/artifact_share.py`。
+- 定时任务被系统判为"执行异常中断"：`scheduled_tasks/service.py` 的 `reap_stale_scheduled_task_runs` 把 running 超过 900s 的 run 置 `failed`（只看 run 年龄，不看租约持有者）——长任务会被误收，详见模块文档。
+- 飞书消息管控页没有数据：`feishu_outbound_messages` 目前**只有 `api/mock.py` 的 `feishu_app_notify` 写入**，真实发送链路尚未落库。
+- 撤回飞书消息报 500：`api/channels.py` 的兜底 `resolve_feishu_binding(...)` 调用缺 `binding_id` 实参（`feishu_binding.py` 无默认值）→ `TypeError`；`api/channels.py:2419` 还引用了未导入的 `Any`（ruff F821）。均为在途改动遗留，详见 `scheduled_tasks`/根文档风险表。
 
 ## 相关文件清单
 
@@ -110,6 +117,7 @@ StaffDeck 的单体后端：内部路由、Agent 运行时（Harness v2）、渠
 
 ## 变更记录 (Changelog)
 
+- 2026-09-30T16:05 — 增量更新（在途改动核实）：子包表新增 **`reporting/`**、`core/` 补产物归属解析、`scheduled_tasks/` 补自愈；`security/` 锚点表新增 `artifact_share.py`；数据模型改为实测计数（约 1715 行 / 75 个 `table=True` 模型）并新增 `feishu_outbound_messages`；FAQ 新增 4 条（交付物 404、定时任务被误回收、飞书管控页无数据、撤回 500 的两处确定缺陷）。
 - 2026-09-24T16:45 — 增量更新（聚焦定时任务 pipeline 通道）：`scheduled_tasks/` 子包职责补注 `renderers/` 飞书卡片渲染器注册表；FAQ 新增「pipeline 任务却出销售播报卡」条目（默认渲染器为 `sales_card`）；相关文件清单补 `app/scheduled_tasks/*`。
 - 2026-09-24T09:46 — 增量更新：新增 `core/`、`capabilities/` 子模块文档链接；补 `security/`、`public_api/`、`a2a/`、`lark_cli/` 关键符号与表名；数据模型改为「表名 + 模型」对照表；**修正 Windows 失败基线路径为仓库根 `../AGENTS.md`**（原文误写 `backend/AGENTS.md`）。
 - 2026-09-23T18:06 — 初始化架构师（增量）重建模块文档；新增 `data_query` 子模块页与顶层面包屑。
