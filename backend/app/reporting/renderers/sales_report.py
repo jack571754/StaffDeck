@@ -24,6 +24,7 @@ from app.reporting.document import (
 from app.reporting.format import format_metric_delta, format_metric_value, to_float
 from app.reporting.renderers.base import default_generated_at, rows_to_dataset
 from app.reporting.renderers.generic_table import build_generic_table_report
+from app.reporting.sales_metrics import get_top_influencers, is_dabo_row
 
 DEFAULT_TITLE = "实时销售播报"
 
@@ -50,6 +51,29 @@ BRAND_COLUMN_LABELS = {
 }
 _HOURLY_CATEGORIES = ("24小时环比", "hourly_trend")
 
+CANONICAL_BRAND_ORDER: tuple[str, ...] = (
+    "电商整体",
+    "可复美整体",
+    "天猫可复美",
+    "抖音可复美",
+    "京东可复美",
+    "唯品会可复美",
+    "微信视频号可复美",
+    "小红书可复美",
+    "可丽金整体",
+    "天猫可丽金",
+    "抖音可丽金",
+    "京东可丽金",
+    "唯品会可丽金",
+    "微信视频号可丽金",
+    "小红书可丽金",
+    "巨子生物",
+    "可预",
+    "分销",
+    "以我",
+)
+_CANONICAL_ORDER_MAP = {name: i for i, name in enumerate(CANONICAL_BRAND_ORDER)}
+
 
 def _classify_rows(
     rows: list[dict[str, Any]],
@@ -70,7 +94,12 @@ def _classify_rows(
     for row in rows:
         category = str(row.get("category") or row.get("_channel") or "")
         item = str(row.get("item") or row.get("name") or "")
-        if category in _HOURLY_CATEGORIES:
+        stat_dim = str(row.get("统计维度") or "").strip()
+        if is_dabo_row(row):
+            neg_increment_shops.append(row)
+        elif stat_dim or (not category and not item):
+            continue
+        elif category in _HOURLY_CATEGORIES:
             hourly_rows.append(row)
         elif category == "大盘" and item == "电商整体":
             summary_row = row
@@ -196,7 +225,7 @@ def _build_summary_text(
         return (
             f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{net}**"
             f"（当日首次播报，增量计为 0.00万，不对比前一日数据），"
-            f"其中运营端 **{ops}**；达播端 **{live}**，各渠道运行平稳。"
+            f"其中运营端 **{ops}**；达播端 **{live}**。"
         )
 
     net_delta = format_metric_delta(magnitude("环比增量_万", "diff_amount"))[0]
@@ -205,8 +234,22 @@ def _build_summary_text(
     return (
         f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{net}**"
         f"（较上一时刻增量 {net_delta}，其中运营端 **{ops}**，较上一时刻增量 {ops_delta}；"
-        f"达播端 **{live}**，较上一时刻增量 {live_delta}），各渠道运行平稳。"
+        f"达播端 **{live}**，较上一时刻增量 {live_delta}）。"
     )
+
+
+def _dabo_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    top_items = get_top_influencers(rows, limit=5)
+    for i, metrics in enumerate(top_items, 1):
+        name = metrics["name"]
+        net_str = format_metric_value(metrics["net_wan"])
+        if metrics["has_gmv"] and float(metrics["gmv_wan"]) > 0:
+            gmv_str = format_metric_value(metrics["gmv_wan"])
+            lines.append(f"{i}. **{name}**\n   净销: {net_str} | GMV: {gmv_str}")
+        else:
+            lines.append(f"{i}. **{name}**\n   净销: {net_str}")
+    return lines
 
 
 def _build_rank_blocks(
@@ -228,25 +271,31 @@ def _build_rank_blocks(
         return []
 
     pos_lines = [_shop_line(i, row) for i, row in enumerate(pos_rows[:5], 1)]
-    neg_lines = [_shop_line(i, row) for i, row in enumerate(neg_rows[:5], 1)]
-    if not neg_lines:
-        neg_lines = ["*（其余活跃店铺增量均为正或持平）*"]
+    dabo_lines = _dabo_lines(neg_rows)
+    if not dabo_lines:
+        dabo_lines = ["*（暂无达人实时销售数据）*"]
 
     return [
-        ReportBlock(kind="heading", level=2, text="店铺正负增量动态排行（较上一时刻 Top 5）"),
+        ReportBlock(kind="heading", level=2, text="店铺增量与达人销售排行（Top 5）"),
         ReportBlock(
             kind="markdown",
             text="📈 **正增量领跑 Top 5**\n" + ("\n".join(pos_lines) if pos_lines else "暂无"),
         ),
-        ReportBlock(kind="markdown", text="📉 **负增量预警 Top 5**\n" + "\n".join(neg_lines)),
+        ReportBlock(kind="markdown", text="🏆 **达人销售TOP 5**\n" + "\n".join(dabo_lines)),
     ]
 
 
 def _build_brand_dataset(
     brand_rows: list[tuple[str, dict[str, Any]]], *, is_first_push: bool
 ):
+    # Match the card even when the result contains no approved summary rows.
+    final_brand_rows = sorted(
+        (item for item in brand_rows if item[0] in _CANONICAL_ORDER_MAP),
+        key=lambda item: _CANONICAL_ORDER_MAP[item[0]],
+    )
+
     detail_rows: list[dict[str, Any]] = []
-    for label, row in brand_rows:
+    for label, row in final_brand_rows:
         detail_rows.append(
             {
                 "brand": label,

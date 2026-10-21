@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # 回滚为逐行展示的旧样式；binding 的 config_json.compact_trace=false 可对单个
     # 绑定回滚。
     channel_feishu_trace_compact_sop: bool = True
+    # 销售实时看板（reporting/ 的 dashboard_* 与 sales_metrics）使用的 ClickHouse
+    # 只读数据源。地址/账号/口令只允许来自环境变量或 backend/.env，绝不写进仓库
+    # 代码；未配置时看板同步自动跳过 ClickHouse 部分并记录告警。
+    sales_dashboard_clickhouse_url: str = ""
+    sales_dashboard_clickhouse_user: str = ""
+    sales_dashboard_clickhouse_password: str = ""
 
     model_config = SettingsConfigDict(
         env_file=_os.environ.get("ULTRARAG_DOTENV", ".env"),
