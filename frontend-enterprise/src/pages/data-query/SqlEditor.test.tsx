@@ -115,4 +115,36 @@ describe('SqlEditor', () => {
     expect(newlineAfterComment).toBeGreaterThan(commentIndex);
     expect(formatted.indexOf(', name')).toBeGreaterThan(newlineAfterComment);
   });
+
+  it('supports collapsing and expanding the SQL editor', () => {
+    const onChange = vi.fn();
+    render(<SqlEditor queryType="sql" queryContent="SELECT 1" onChange={onChange} />);
+
+    // Initially expanded, textarea is present
+    expect(screen.getByPlaceholderText('SELECT * FROM sales WHERE DATE(date) = :date')).toBeDefined();
+
+    // Click collapse
+    const collapseBtn = screen.getByTitle('折叠编辑栏');
+    fireEvent.click(collapseBtn);
+
+    // Collapsed banner is shown
+    expect(screen.getByText('SQL 编辑栏已收起')).toBeDefined();
+    expect(screen.getByText('点击展开编辑')).toBeDefined();
+
+    // Click expand
+    fireEvent.click(screen.getByText('点击展开编辑'));
+    expect(screen.getByPlaceholderText('SELECT * FROM sales WHERE DATE(date) = :date')).toBeDefined();
+  });
+
+  it('supports toggling compact and expanded editor heights', () => {
+    const onChange = vi.fn();
+    render(<SqlEditor queryType="sql" queryContent="SELECT 1" onChange={onChange} />);
+
+    // Initially compact (shows '扩展高度')
+    const heightBtn = screen.getByTitle('扩展高度 (340px)');
+    expect(heightBtn).toBeDefined();
+
+    fireEvent.click(heightBtn);
+    expect(screen.getByTitle('收窄高度 (180px)')).toBeDefined();
+  });
 });

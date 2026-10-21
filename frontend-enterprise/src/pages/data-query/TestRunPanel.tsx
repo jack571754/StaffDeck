@@ -31,6 +31,10 @@ export interface TestRunPanelProps {
   dataSourceId?: string | null;
   queryContent?: string;
   queryType?: string;
+  templateName?: string;
+  onResultChange?: (result: QueryExecuteResult | null) => void;
+  onRunningChange?: (running: boolean) => void;
+  onErrorChange?: (error: string | null) => void;
 }
 
 /**
@@ -62,6 +66,10 @@ export default function TestRunPanel({
   dataSourceId,
   queryContent,
   queryType = 'sql',
+  templateName,
+  onResultChange,
+  onRunningChange,
+  onErrorChange,
 }: TestRunPanelProps) {
   const [paramValues, setParamValues] = useState<Record<string, unknown>>({});
   const [loading, setLoading] = useState(false);
@@ -105,6 +113,8 @@ export default function TestRunPanel({
     setLoading(true);
     setError(null);
     setResult(null);
+    onRunningChange?.(true);
+    onErrorChange?.(null);
 
     try {
       let data: QueryExecuteResult;
@@ -119,11 +129,15 @@ export default function TestRunPanel({
         });
       }
       setResult(data);
+      onResultChange?.(data);
     } catch (err) {
       const message = err instanceof Error ? err.message : '运行失败';
       setError(message);
+      onErrorChange?.(message);
+      onResultChange?.(null);
     } finally {
       setLoading(false);
+      onRunningChange?.(false);
     }
   };
 
@@ -229,6 +243,8 @@ export default function TestRunPanel({
               columns={result.columns}
               rows={result.rows}
               maxHeight="320px"
+              showExport={true}
+              exportFilename={templateName || 'test_query_results'}
             />
           </div>
         )}

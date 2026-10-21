@@ -14,11 +14,13 @@ import { notify } from '@/components/ui/app-toast';
 import {
   dataSourcesApi,
   type DataSource,
+  type QueryExecuteResult,
   type QueryTemplate,
 } from '@/api/data-query';
 import SqlEditor from './SqlEditor';
 import ParamsConfigPanel, { type QueryParam } from './ParamsConfigPanel';
 import TestRunPanel from './TestRunPanel';
+import TestResultSection from './TestResultSection';
 
 export interface QueryTemplateEditorProps {
   template: QueryTemplate | null;
@@ -203,6 +205,9 @@ export default function QueryTemplateEditor({
   const [formData, setFormData] = useState<QueryTemplate>(DEFAULT_TEMPLATE);
   const [dataSources, setDataSources] = useState<DataSource[]>([]);
   const [dsLoading, setDsLoading] = useState(false);
+  const [testResult, setTestResult] = useState<QueryExecuteResult | null>(null);
+  const [testRunning, setTestRunning] = useState<boolean>(false);
+  const [testError, setTestError] = useState<string | null>(null);
 
   // 同步父组件 template 到局部 state（编辑模式初次加载）
   useEffect(() => {
@@ -256,7 +261,8 @@ export default function QueryTemplateEditor({
   };
 
   return (
-    <div className="grid grid-cols-1 items-start gap-[20px] lg:grid-cols-[minmax(0,1fr)_400px]">
+    <div className="flex flex-col gap-[20px]">
+      <div className="grid grid-cols-1 items-start gap-[20px] lg:grid-cols-[minmax(0,1fr)_400px]">
       {/* 左侧：基础信息 + SQL 编辑器 */}
       <div className="flex flex-col gap-[20px]">
         {/* 基础信息卡片 */}
@@ -425,8 +431,29 @@ export default function QueryTemplateEditor({
         <TestRunPanel
           templateId={formData.id || null}
           params={formData.params_json as unknown as QueryParam[]}
+          dataSourceId={formData.data_source_id || null}
+          queryContent={formData.query_content}
+          queryType={formData.query_type}
+          templateName={formData.name}
+          onResultChange={setTestResult}
+          onRunningChange={setTestRunning}
+          onErrorChange={setTestError}
         />
       </div>
     </div>
+
+    {/* 测试运行结果展示界面 (全宽卡片，支持搜索、分页与快捷导出) */}
+    <TestResultSection
+      result={testResult}
+      loading={testRunning}
+      error={testError}
+      templateName={formData.name}
+      dataSourceName={dataSources.find((ds) => ds.id === formData.data_source_id)?.name}
+      onClear={() => {
+        setTestResult(null);
+        setTestError(null);
+      }}
+    />
+  </div>
   );
 }

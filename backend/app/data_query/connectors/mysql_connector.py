@@ -33,6 +33,8 @@ _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 # Known limitation: a ``:name`` occurrence preceded by whitespace *inside* a
 # string literal would still be converted (regex cannot see string quoting).
 _PARAM_PATTERN = re.compile(r"(?<!:)(?<!\w):([a-zA-Z_][a-zA-Z0-9_]*)")
+_BARE_PERCENT_RE = re.compile(r"(?<!%)%(?!%|\([a-zA-Z_][a-zA-Z0-9_]*\)s)")
+_TABLE_IDENTIFIER_RE = re.compile(r"^[\w\u4e00-\u9fff\-]+$")
 
 _MYSQL_SENSITIVE_KEYS = ["password"]
 
@@ -195,10 +197,11 @@ class MySQLConnector(BaseConnector):
         assert self._conn is not None, "connection should be open after _connect"
 
         converted_query, _ = _convert_params(query)
+        safe_query = _BARE_PERCENT_RE.sub("%%", converted_query)
 
         try:
             with self._conn.cursor() as cursor:
-                cursor.execute(converted_query, params)
+                cursor.execute(safe_query, params)
                 if max_rows and max_rows > 0:
                     raw_rows = cursor.fetchmany(max_rows)
                 else:
@@ -215,7 +218,7 @@ class MySQLConnector(BaseConnector):
         )
 
     def list_tables(self) -> list[dict[str, Any]]:
-        """List tables from information_schema for the configured database."""
+        """List tables from information_schema (or ClickHouse system.tables fallback)."""
         self._connect()
         assert self._conn is not None
         cfg = self._get_decrypted_config()
@@ -232,8 +235,20 @@ class MySQLConnector(BaseConnector):
             with self._conn.cursor() as cursor:
                 cursor.execute(query, (db_name,))
                 raw_rows = cursor.fetchall() or []
-        except Exception as exc:
-            raise MySQLError(f"Failed to list MySQL tables: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            # ClickHouse MySQL protocol compatibility fallback (system.tables)
+            ch_query = (
+                "SELECT name, comment, coalesce(total_rows, 0) as row_count_estimate "
+                "FROM system.tables "
+                "WHERE database = %s "
+                "ORDER BY name"
+            )
+            try:
+                with self._conn.cursor() as cursor:
+                    cursor.execute(ch_query, (db_name,))
+                    raw_rows = cursor.fetchall() or []
+            except Exception:  # noqa: BLE001
+                raise MySQLError(f"Failed to list MySQL tables: {exc}") from exc
 
         tables: list[dict[str, Any]] = []
         for row in raw_rows:
@@ -248,8 +263,8 @@ class MySQLConnector(BaseConnector):
         return tables
 
     def describe_table(self, table: str) -> list[dict[str, Any]]:
-        """Return column definitions from information_schema for *table*."""
-        if not re.match(r"^[A-Za-z0-9_]+$", table):
+        """Return column definitions from information_schema (or ClickHouse system.columns) for *table*."""
+        if not _TABLE_IDENTIFIER_RE.match(table):
             raise ValueError(f"Invalid table identifier: {table!r}")
         allowed_tables = set(getattr(self._data_source, "allowed_tables_json", []) or [])
         if allowed_tables and table not in allowed_tables:
@@ -271,8 +286,21 @@ class MySQLConnector(BaseConnector):
             with self._conn.cursor() as cursor:
                 cursor.execute(query, (db_name, table))
                 raw_rows = cursor.fetchall() or []
-        except Exception as exc:
-            raise MySQLError(f"Failed to describe table {table}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            ch_query = (
+                "SELECT name, type as data_type, type as column_type, "
+                "if(position(type, 'Nullable') > 0, 'YES', 'NO') as is_nullable, "
+                "comment "
+                "FROM system.columns "
+                "WHERE database = %s AND table = %s "
+                "ORDER BY position"
+            )
+            try:
+                with self._conn.cursor() as cursor:
+                    cursor.execute(ch_query, (db_name, table))
+                    raw_rows = cursor.fetchall() or []
+            except Exception:  # noqa: BLE001
+                raise MySQLError(f"Failed to describe table {table}: {exc}") from exc
 
         columns: list[dict[str, Any]] = []
         for row in raw_rows:
@@ -288,7 +316,7 @@ class MySQLConnector(BaseConnector):
 
     def preview_table(self, table: str, limit: int = 20) -> QueryResult:
         """Fetch up to 50 sample rows from *table* safely."""
-        if not re.match(r"^[A-Za-z0-9_]+$", table):
+        if not _TABLE_IDENTIFIER_RE.match(table):
             raise ValueError(f"Invalid table identifier: {table!r}")
         allowed_tables = set(getattr(self._data_source, "allowed_tables_json", []) or [])
         if allowed_tables and table not in allowed_tables:
@@ -308,9 +336,10 @@ class MySQLConnector(BaseConnector):
         assert self._conn is not None
 
         converted_query, _ = _convert_params(f"EXPLAIN {sql}")
+        safe_query = _BARE_PERCENT_RE.sub("%%", converted_query)
         try:
             with self._conn.cursor() as cursor:
-                cursor.execute(converted_query, params)
+                cursor.execute(safe_query, params)
                 raw_rows = cursor.fetchall() or []
                 columns = [desc[0] for desc in cursor.description] if cursor.description else []
         except Exception as exc:
@@ -332,4 +361,3 @@ class MySQLConnector(BaseConnector):
                 pass
             self._conn = None
         super().close()
-

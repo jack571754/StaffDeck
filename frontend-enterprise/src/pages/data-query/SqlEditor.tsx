@@ -1,5 +1,5 @@
 import { useState, useRef, useMemo, type KeyboardEvent, type UIEvent } from 'react';
-import { Copy, Check, Sparkles, RotateCcw, Code2 } from 'lucide-react';
+import { Copy, Check, Sparkles, RotateCcw, Code2, ChevronDown, ChevronUp, ChevronsUpDown } from 'lucide-react';
 import { renderCodeTokens } from '@/components/CodeBlock';
 
 export interface SqlEditorProps {
@@ -8,6 +8,7 @@ export interface SqlEditorProps {
   onChange: (content: string) => void;
   className?: string;
   minHeight?: number | string;
+  defaultCollapsed?: boolean;
 }
 
 const CARD_CLASS = 'rounded-[14px] border border-[#eceef1] bg-white shadow-xs';
@@ -80,7 +81,8 @@ export default function SqlEditor({
   queryContent,
   onChange,
   className = '',
-  minHeight = 260,
+  minHeight = 180,
+  defaultCollapsed = false,
 }: SqlEditorProps) {
   const isSql = queryType === 'sql';
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -88,6 +90,8 @@ export default function SqlEditor({
   const codeRef = useRef<HTMLElement>(null);
   const [copied, setCopied] = useState(false);
   const [scrollState, setScrollState] = useState({ top: 0, left: 0 });
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [isCompact, setIsCompact] = useState(true);
 
   const title = isSql ? 'SQL 查询' : 'HTTP 请求路径';
   const hint = isSql
@@ -163,6 +167,9 @@ export default function SqlEditor({
     onChange('');
   };
 
+  // 动态高度：收窄模式下为 180px，展开模式下为 340px
+  const editorHeight = isCompact ? (typeof minHeight === 'number' ? minHeight : 180) : 340;
+
   return (
     <section className={`${CARD_CLASS} overflow-hidden ${className}`}>
       {/* Top Header */}
@@ -173,121 +180,188 @@ export default function SqlEditor({
           <span className="inline-flex items-center rounded-md bg-[#f1f3f7] px-[6px] py-[1px] text-[11px] font-semibold text-[#5a6275]">
             {isSql ? 'SQL' : 'HTTP'}
           </span>
+          {collapsed && (
+            <span className="rounded bg-[#fef3c7] px-[6px] py-[1px] text-[11px] font-medium text-[#92400e]">
+              已折叠
+            </span>
+          )}
         </div>
 
-        {/* Toolbar & Hint */}
+        {/* Toolbar & Actions */}
         <div className="flex items-center gap-[10px]">
           <span className={`hidden sm:inline ${HINT_CLASS}`}>{hint}</span>
 
           <div className="flex items-center gap-[4px] border-l border-[#eceef1] pl-[10px]">
-            {isSql && (
-              <button
-                type="button"
-                onClick={handleFormat}
-                disabled={!queryContent.trim()}
-                title="格式化 SQL"
-                className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a] disabled:opacity-40 disabled:pointer-events-none"
-              >
-                <Sparkles className="size-[13px] text-[#2563eb]" />
-                <span>格式化</span>
-              </button>
+            {/* 折叠 / 展开切换 */}
+            <button
+              type="button"
+              onClick={() => setCollapsed(!collapsed)}
+              title={collapsed ? '展开编辑栏' : '折叠编辑栏'}
+              aria-label={collapsed ? '展开编辑栏' : '折叠编辑栏'}
+              className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a]"
+            >
+              {collapsed ? (
+                <>
+                  <ChevronDown className="size-[13px] text-[#2563eb]" />
+                  <span>展开</span>
+                </>
+              ) : (
+                <>
+                  <ChevronUp className="size-[13px]" />
+                  <span>折叠</span>
+                </>
+              )}
+            </button>
+
+            {!collapsed && (
+              <>
+                {/* 高度切换：收窄 (180px) vs 展开 (340px) */}
+                <button
+                  type="button"
+                  onClick={() => setIsCompact(!isCompact)}
+                  title={isCompact ? '扩展高度 (340px)' : '收窄高度 (180px)'}
+                  className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a]"
+                >
+                  <ChevronsUpDown className="size-[13px]" />
+                  <span>{isCompact ? '扩展高度' : '收窄高度'}</span>
+                </button>
+
+                {isSql && (
+                  <button
+                    type="button"
+                    onClick={handleFormat}
+                    disabled={!queryContent.trim()}
+                    title="格式化 SQL"
+                    className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a] disabled:opacity-40 disabled:pointer-events-none"
+                  >
+                    <Sparkles className="size-[13px] text-[#2563eb]" />
+                    <span>格式化</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  disabled={!queryContent.trim()}
+                  title="复制代码"
+                  className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a] disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="size-[13px] text-[#16a34a]" />
+                      <span className="text-[#16a34a]">已复制</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="size-[13px]" />
+                      <span>复制</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleClear}
+                  disabled={!queryContent.trim()}
+                  title="清空内容"
+                  className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#fee2e2] hover:text-[#dc2626] disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  <RotateCcw className="size-[13px]" />
+                  <span>清空</span>
+                </button>
+              </>
             )}
-
-            <button
-              type="button"
-              onClick={handleCopy}
-              disabled={!queryContent.trim()}
-              title="复制代码"
-              className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#edf1f7] hover:text-[#18181a] disabled:opacity-40 disabled:pointer-events-none"
-            >
-              {copied ? (
-                <>
-                  <Check className="size-[13px] text-[#16a34a]" />
-                  <span className="text-[#16a34a]">已复制</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="size-[13px]" />
-                  <span>复制</span>
-                </>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={handleClear}
-              disabled={!queryContent.trim()}
-              title="清空内容"
-              className="inline-flex h-[26px] items-center gap-[4px] rounded-[6px] px-[8px] text-[12px] font-medium text-[#5a6275] transition-colors hover:bg-[#fee2e2] hover:text-[#dc2626] disabled:opacity-40 disabled:pointer-events-none"
-            >
-              <RotateCcw className="size-[13px]" />
-              <span>清空</span>
-            </button>
           </div>
         </div>
       </div>
 
-      {/* Editor Main Canvas */}
-      <div
-        className="relative flex overflow-hidden border-b border-[#eceef1] bg-[#ffffff] font-mono text-[13px] leading-[22px]"
-        style={{ minHeight: typeof minHeight === 'number' ? `${minHeight}px` : minHeight }}
-      >
-        {/* Line Numbers Gutter */}
-        <div
-          ref={gutterRef}
-          aria-hidden="true"
-          className="pointer-events-none shrink-0 select-none overflow-hidden border-r border-[#eceef1] bg-[#f8f9fb] py-[12px] px-[8px] text-right font-mono text-[12px] leading-[22px] text-[#9ea3b5]"
-          style={{ width: `${Math.max(38, String(lines.length).length * 9 + 18)}px` }}
-        >
-          <div style={{ transform: `translateY(${-scrollState.top}px)` }}>
-            {lines.map((_, i) => (
-              <div key={i} className="h-[22px] leading-[22px]">
-                {i + 1}
-              </div>
-            ))}
+      {/* 折叠时的简易信息栏 */}
+      {collapsed ? (
+        <div className="flex items-center justify-between border-b border-[#eceef1] bg-[#fcfdfe] px-[16px] py-[12px] text-[12px] text-[#757f9c]">
+          <div className="flex items-center gap-[8px]">
+            <span className="font-medium text-[#464c5e]">SQL 编辑栏已收起</span>
+            <span className="text-[#d0d4dc]">·</span>
+            <span>共 {lines.length} 行</span>
+            <span className="text-[#d0d4dc]">·</span>
+            <span>{queryContent.length} 字符</span>
+            {detectedParams.length > 0 && (
+              <>
+                <span className="text-[#d0d4dc]">·</span>
+                <span className="text-[#2563eb]">识别参数: {detectedParams.map(p => `:${p}`).join(', ')}</span>
+              </>
+            )}
           </div>
-        </div>
-
-        {/* Code Content Container */}
-        <div className="relative flex-1 min-w-0 overflow-hidden bg-white">
-          {/* Highlight Layer (Behind) */}
-          <pre
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-0 z-[1] m-0 overflow-hidden whitespace-pre py-[12px] px-[16px] font-mono text-[13px] leading-[22px] tracking-[0.01em] tab-[2]"
+          <button
+            type="button"
+            onClick={() => setCollapsed(false)}
+            className="inline-flex items-center gap-1 font-medium text-[#2563eb] hover:underline"
           >
-            <code
-              ref={codeRef}
-              className="block w-max min-w-full font-[inherit]"
-              style={{
-                transform: `translate(${-scrollState.left}px, ${-scrollState.top}px)`,
-              }}
-            >
-              {queryContent ? (
-                renderCodeTokens(
-                  queryContent.endsWith('\n') ? `${queryContent} ` : queryContent,
-                  isSql ? 'sql' : 'plain'
-                )
-              ) : (
-                <span className="text-[#9ea3b5] italic select-none">
-                  {placeholder}
-                </span>
-              )}
-            </code>
-          </pre>
-
-          {/* Interactive Textarea (Foreground) */}
-          <textarea
-            ref={textareaRef}
-            value={queryContent}
-            onChange={(e) => onChange(e.target.value)}
-            onScroll={handleScroll}
-            onKeyDown={handleKeyDown}
-            placeholder={placeholder}
-            spellCheck={false}
-            className="absolute inset-0 z-[2] m-0 size-full resize-none overflow-auto border-0 bg-transparent! py-[12px] px-[16px] font-mono text-[13px] leading-[22px] tracking-[0.01em] whitespace-pre text-transparent caret-[#18181a] outline-none tab-[2] placeholder:text-transparent selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]"
-          />
+            点击展开编辑
+          </button>
         </div>
-      </div>
+      ) : (
+        /* Editor Main Canvas - 收窄高度为 180px/340px */
+        <div
+          className="relative flex overflow-hidden border-b border-[#eceef1] bg-[#ffffff] font-mono text-[13px] leading-[22px] transition-all duration-200"
+          style={{ height: `${editorHeight}px` }}
+        >
+          {/* Line Numbers Gutter */}
+          <div
+            ref={gutterRef}
+            aria-hidden="true"
+            className="pointer-events-none shrink-0 select-none overflow-hidden border-r border-[#eceef1] bg-[#f8f9fb] py-[12px] px-[8px] text-right font-mono text-[12px] leading-[22px] text-[#9ea3b5]"
+            style={{ width: `${Math.max(38, String(lines.length).length * 9 + 18)}px` }}
+          >
+            <div style={{ transform: `translateY(${-scrollState.top}px)` }}>
+              {lines.map((_, i) => (
+                <div key={i} className="h-[22px] leading-[22px]">
+                  {i + 1}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Code Content Container */}
+          <div className="relative flex-1 min-w-0 overflow-hidden bg-white">
+            {/* Highlight Layer (Behind) */}
+            <pre
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 z-[1] m-0 overflow-hidden whitespace-pre py-[12px] px-[16px] font-mono text-[13px] leading-[22px] tracking-[0.01em] tab-[2]"
+            >
+              <code
+                ref={codeRef}
+                className="block w-max min-w-full font-[inherit]"
+                style={{
+                  transform: `translate(${-scrollState.left}px, ${-scrollState.top}px)`,
+                }}
+              >
+                {queryContent ? (
+                  renderCodeTokens(
+                    queryContent.endsWith('\n') ? `${queryContent} ` : queryContent,
+                    isSql ? 'sql' : 'plain'
+                  )
+                ) : (
+                  <span className="text-[#9ea3b5] italic select-none">
+                    {placeholder}
+                  </span>
+                )}
+              </code>
+            </pre>
+
+            {/* Interactive Textarea (Foreground) */}
+            <textarea
+              ref={textareaRef}
+              value={queryContent}
+              onChange={(e) => onChange(e.target.value)}
+              onScroll={handleScroll}
+              onKeyDown={handleKeyDown}
+              placeholder={placeholder}
+              spellCheck={false}
+              className="absolute inset-0 z-[2] m-0 size-full resize-none overflow-auto border-0 bg-transparent! py-[12px] px-[16px] font-mono text-[13px] leading-[22px] tracking-[0.01em] whitespace-pre text-transparent caret-[#18181a] outline-none tab-[2] placeholder:text-transparent selection:bg-[rgba(0,120,215,0.24)] [-webkit-text-fill-color:transparent]"
+            />
+          </div>
+        </div>
+      )}
 
       {/* Bottom Status & Parameter Detection Bar */}
       <div className="flex flex-wrap items-center justify-between gap-[10px] bg-[#fbfcfd] px-[16px] py-[8px] text-[12px] text-[#757f9c]">

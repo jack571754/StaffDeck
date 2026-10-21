@@ -118,6 +118,16 @@ class ToolExecutor:
                 invocation_id=invocation_id,
                 timeout_seconds_override=timeout_seconds_override,
             )
+        if (
+            (tool.tool_type or "http") == "data_query"
+            or (
+                isinstance(tool.config_json, dict)
+                and tool.config_json.get("source") == "data_query"
+                and tool.config_json.get("template_id")
+            )
+            or "/api/mock/data-query/" in (tool.url or "")
+        ):
+            return self._execute_data_query_tool(tenant_id, tool, tool_call.arguments)
         if (tool.tool_type or "http") != "http":
             return self._error(
                 tool.name, "UNSUPPORTED_TOOL_TYPE", f"不支持的工具类型：{tool.tool_type}"
@@ -182,6 +192,44 @@ class ToolExecutor:
                 f"工具返回异常状态码：{exc.response.status_code}",
             )
         except Exception as exc:
+            return self._error(tool.name, "EXECUTION_ERROR", str(exc))
+
+    def _execute_data_query_tool(
+        self,
+        tenant_id: str,
+        tool: Tool,
+        arguments: dict[str, Any] | None,
+    ) -> ToolResult:
+        from app.data_query.service import execute_query_by_id
+
+        cfg = tool.config_json if isinstance(tool.config_json, dict) else {}
+        template_id = str(cfg.get("template_id") or "").strip()
+        if not template_id and tool.url and "/api/mock/data-query/" in tool.url:
+            template_id = tool.url.rsplit("/api/mock/data-query/", 1)[-1].split("?")[0].strip("/")
+        if not template_id:
+            template_id = tool.id
+        params: dict[str, Any] = {}
+        if isinstance(arguments, dict):
+            if "params" in arguments and isinstance(arguments["params"], dict):
+                params = arguments["params"]
+            else:
+                params = {k: v for k, v in arguments.items() if k != "tenant_id"}
+        try:
+            result = execute_query_by_id(self.db, template_id, tenant_id, params)
+            return ToolResult(
+                tool_name=tool.name,
+                success=True,
+                data={
+                    "template_id": result.template_id,
+                    "columns": result.columns,
+                    "rows": result.rows,
+                    "row_count": result.row_count,
+                    "execution_time_ms": result.execution_time_ms,
+                    "cached": result.cached,
+                },
+                error=None,
+            )
+        except Exception as exc:  # noqa: BLE001
             return self._error(tool.name, "EXECUTION_ERROR", str(exc))
 
     def execute_sync_http(

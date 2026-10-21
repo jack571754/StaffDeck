@@ -67,15 +67,17 @@ def _validate_params(params: dict[str, Any], params_def: list[dict[str, Any]]) -
         default = pdef.get("default", None)
         enum_values = pdef.get("enum", None)
 
-        if name not in params:
-            if required:
+        if name not in params or (params[name] in (None, "") and "default" in pdef and default not in (None, "")):
+            if "default" in pdef and default not in (None, ""):
+                value = default
+            elif required:
                 raise ValueError(f"Missing required parameter: {name!r}")
-            # Use default if provided; otherwise skip
-            if "default" in pdef:
-                result[name] = default
-            continue
-
-        value = params[name]
+            else:
+                if "default" in pdef:
+                    result[name] = default
+                continue
+        else:
+            value = params[name]
 
         # Type coercion
         if ptype == "int":
