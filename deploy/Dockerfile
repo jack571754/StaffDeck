@@ -7,7 +7,7 @@ WORKDIR /build/frontend-enterprise
 
 # 先复制依赖定义，利用 Docker 缓存层
 COPY frontend-enterprise/package*.json ./
-RUN npm ci --no-audit --no-fund
+RUN npm config set registry https://registry.npmmirror.com && npm ci --no-audit --no-fund
 
 # 复制前端完整源码并构建生产 bundle
 COPY frontend-enterprise/ ./
@@ -25,6 +25,7 @@ ENV PYTHONUNBUFFERED=1 \
     APP_PORT=5173
 
 # 安装基础运行系统依赖与沙箱工具 (bubblewrap)
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -40,12 +41,12 @@ WORKDIR /app
 
 # 利用独立 requirements.txt 预先安装 Python 依赖库，最大化利用 Docker 缓存
 COPY deploy/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+    pip install --no-cache-dir -r /app/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 
 # 复制后端源码并以可编辑模式注册
 COPY backend /app/backend
-RUN pip install --no-cache-dir --no-deps -e /app/backend
+RUN pip install --no-cache-dir --no-deps -e /app/backend -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 
 # 复制阶段 1 前端构建产物 (dist)
 COPY --from=frontend-builder /build/frontend-enterprise/dist /app/frontend-enterprise/dist

@@ -58,3 +58,25 @@ deploy/*.zip
 .harness/
 .claude/
 .kilo/
+# 本地运维/部署脚本：可能含服务器凭证，只允许放在仓库外（见 ../StaffDeck-ops-local）
+deploy_to_server.py
+deploy_to_server.bat
+backend/check_*.py
+backend/inspect_*.py
+backend/fix_app_secret.py
+backend/upload_db_and_env.py
+backend/remote_ops.py
+backend/run_deploy.py
+backend/rebuild_with_sqlmodel42.py
+backend/test_sqlmodel_compat.py
+start.bat
+stop.bat
+# 本地临时排查脚本/查询结果导出（可能含业务数据与内部凭据），不入库
+/scratch_*
+# 误建的重复嵌套目录，保留一个即可
+/backend/backend/
+# 本地测试临时目录（pytest 生成，权限受限时可能残留）
+/.pytest-data/
+/.pytest-tmp/
+/.tmp-pytest/
+/pytest-of-*/

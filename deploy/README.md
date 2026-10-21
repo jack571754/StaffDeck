@@ -2,6 +2,8 @@
 
 本目录包含将 StaffDeck 作为独立容器部署到 Linux / Windows 服务器所需的所有 Docker 构建、编排文件及运维管理脚本。
 
+> 📖 **生产环境完整部署与运维手册**：请参阅详细手册 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)，内含单端口架构解析、环境变量详解、SQLite 轻量化迁移脚本、CentOS 7 避坑指南及数据备份方案。
+
 ---
 
 ## 目录结构说明

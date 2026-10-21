@@ -29,6 +29,7 @@ check_env() {
         fi
     fi
     mkdir -p "$DEPLOY_DIR/data"
+    chmod 777 "$DEPLOY_DIR/data"
 }
 
 action_init() {
