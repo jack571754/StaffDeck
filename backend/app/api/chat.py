@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import mimetypes
@@ -8,11 +9,13 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_, update
 from sqlmodel import Session, select
@@ -31,11 +34,14 @@ from app.db import engine, get_session
 from app.db.models import (
     AgentEvent,
     AgentProfile,
+    ArtifactShareLink,
     ChatSession,
+    HarnessTaskFrameRecord,
     HarnessTurnRecord,
     HumanHandoffRequest,
     Message,
     MessageFeedback,
+    ScheduledTask,
     ScheduledTaskRun,
     Skill,
     SkillFeedback,
@@ -58,7 +64,11 @@ from app.observability.spans import (
     set_span_sink,
 )
 from app.scheduled_tasks.schema import ScheduledTaskDraftRead
-from app.scheduled_tasks.service import DEFAULT_TASK_TIME, detect_scheduled_task_draft
+from app.scheduled_tasks.service import (
+    DEFAULT_TASK_TIME,
+    _ensure_task_access,
+    detect_scheduled_task_draft,
+)
 from app.security import artifact_share as artifact_share_mod
 from app.security.auth import get_current_user, get_current_user_optional
 from app.security.permissions import agent_owned_by_user, is_admin_user
@@ -2479,12 +2489,268 @@ class ShareLinkRequest(BaseModel):
         pattern=artifact_share_mod.OWNER_KIND_PATTERN,
     )
     ttl_seconds: int | None = None
+    days: int | None = None
+    title: str | None = None
 
 
 class ShareLinkResponse(BaseModel):
     token: str
     url: str
     expires_at: int
+    link_id: str | None = None
+    title: str | None = None
+
+
+class ArtifactShareLinkRead(BaseModel):
+    id: str
+    tenant_id: str
+    session_id: str
+    owner_kind: str
+    owner_id: str
+    path: str
+    title: str | None = None
+    token: str
+    url: str
+    created_by_user_id: str | None = None
+    created_by_username: str | None = None
+    ttl_seconds: int
+    expires_at: datetime
+    is_revoked: bool
+    revoked_at: datetime | None = None
+    revoked_by_user_id: str | None = None
+    view_count: int
+    last_viewed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    status: str
+    remaining_seconds: int
+    bound_task_id: str | None = None
+    bound_task_title: str | None = None
+
+
+class ArtifactShareLinksListResponse(BaseModel):
+    items: list[ArtifactShareLinkRead]
+    total: int
+    active_count: int
+    expiring_soon_count: int
+    expired_count: int
+    revoked_count: int
+    total_views: int
+
+
+DEMO_SHARE_TITLE_PREFIX = "【演示数据】"
+
+
+class ExtendShareLinkRequest(BaseModel):
+    days: int | None = 7
+    ttl_seconds: int | None = None
+
+
+class UpdateShareLinkRequest(BaseModel):
+    title: str | None = None
+    expires_at: datetime | None = None
+
+
+class ScheduledPushConfig(BaseModel):
+    enabled: bool = False
+    schedule_type: str = "daily"
+    time: str = "09:00"
+    times: list[str] = Field(default_factory=list)
+    interval_minutes: int | None = 60
+    feishu_webhook: str | None = None
+    feishu_chat_id: str | None = None
+    task_title: str | None = None
+    agent_id: str | None = None
+
+
+class BindScheduledTaskRequest(BaseModel):
+    tenant_id: str | None = None
+    task_id: str | None = None
+    mode: str | None = None
+    existing_task_id: str | None = None
+    create_new_task: bool = False
+    task_title: str | None = None
+    schedule_type: str = "daily"
+    time: str = "09:00"
+    times: list[str] = Field(default_factory=list)
+    interval_minutes: int | None = 60
+    feishu_webhook: str | None = None
+    feishu_chat_id: str | None = None
+    agent_id: str | None = None
+
+
+class BindScheduledTaskResponse(BaseModel):
+    ok: bool = True
+    task_id: str
+    task_title: str
+    schedule_type: str
+    url: str
+
+
+class SemanticGenerateShareLinkRequest(BaseModel):
+    prompt: str = Field(..., description="语义需求描述，如：生成近7天各门店销售与运营分析报表")
+    tenant_id: str | None = None
+    title: str | None = Field(default=None, description="自定义标题（可选）")
+    renderer: str | None = Field(default="sales_report", description="报表模板风格：sales_report 或 generic_table")
+    days: int | None = Field(default=7, description="有效天数，默认 7 天")
+    session_id: str | None = Field(default=None, description="所属会话ID（可选）")
+    data_template_id: str | None = Field(
+        default=None,
+        description="真实数据查询模板 ID；提供时报表只使用查询结果，未提供则标记为演示数据",
+    )
+    schedule_push: ScheduledPushConfig | None = None
+
+
+
+def _render_share_link_notice_page(
+    title: str,
+    message: str,
+    status_code: int = 410,
+) -> HTMLResponse:
+    content = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title} - StaffDeck</title>
+  <style>
+    :root {{
+      --bg: #0b0f19;
+      --card-bg: rgba(23, 31, 48, 0.85);
+      --border: rgba(255, 255, 255, 0.1);
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      background-image: radial-gradient(circle at 50% 25%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: var(--card-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 44px 32px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    }}
+    .icon-wrap {{
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      background: rgba(239, 68, 68, 0.12);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 24px;
+    }}
+    .icon {{
+      width: 34px;
+      height: 34px;
+      color: #f87171;
+    }}
+    h1 {{
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }}
+    p {{
+      color: var(--text-muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 24px;
+    }}
+    .badge {{
+      display: inline-block;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-wrap">
+      <svg class="icon" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+      </svg>
+    </div>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    <span class="badge">StaffDeck 报告安全访问控制</span>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=content, status_code=status_code)
+
+
+def _ensure_share_link_access(link: ArtifactShareLink, current_user: User) -> None:
+    """管理类动作（撤回/延期/删除）只允许管理员或链接创建者。"""
+
+    if is_admin_user(current_user):
+        return
+    if link.created_by_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权管理该分享链接")
+
+
+def _to_share_link_read(
+    link: ArtifactShareLink,
+    now: datetime,
+    bound_task_id: str | None = None,
+    bound_task_title: str | None = None,
+    *,
+    include_token: bool = True,
+) -> ArtifactShareLinkRead:
+    remaining = max(0, int((link.expires_at - now).total_seconds()))
+    if link.is_revoked:
+        status = "revoked"
+    elif remaining == 0:
+        status = "expired"
+    elif remaining <= 86400:
+        status = "expiring_soon"
+    else:
+        status = "active"
+    return ArtifactShareLinkRead(
+        id=link.id,
+        tenant_id=link.tenant_id,
+        session_id=link.session_id,
+        owner_kind=link.owner_kind,
+        owner_id=link.owner_id,
+        path=link.path,
+        title=link.title,
+        token=link.token if include_token else "",
+        url=link.url,
+        created_by_user_id=link.created_by_user_id,
+        created_by_username=link.created_by_username,
+        ttl_seconds=link.ttl_seconds,
+        expires_at=link.expires_at,
+        is_revoked=link.is_revoked,
+        revoked_at=link.revoked_at,
+        revoked_by_user_id=link.revoked_by_user_id,
+        view_count=link.view_count,
+        last_viewed_at=link.last_viewed_at,
+        created_at=link.created_at,
+        updated_at=link.updated_at,
+        status=status,
+        remaining_seconds=remaining,
+        bound_task_id=bound_task_id,
+        bound_task_title=bound_task_title,
+    )
 
 
 # CSP for inline HTML artifacts: sandboxed into an opaque origin (no
@@ -2528,12 +2794,13 @@ def _shared_artifact_headers(digest: str, size: int) -> dict[str, str]:
     }
 
 
-@router.get("/artifacts/view/{token}")
+@router.get("/artifacts/view/{token}", response_model=None)
 def view_published_artifact(
     token: str,
+    request: Request = None,
     current_user: User | None = Depends(get_current_user_optional),
     db: Session = Depends(get_session),
-) -> StreamingResponse:
+) -> Response:
     """Render a published Harness artifact inline, or open it anonymously.
 
     Dual-path auth: a valid signed share token always opens the artifact; when a
@@ -2542,7 +2809,49 @@ def view_published_artifact(
     anonymous). HTML files are served inline under a sandbox CSP; every other
     extension is served as an attachment.
     """
-    payload = artifact_share_mod.decode_artifact_share_token(token)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    link_record = db.exec(
+        select(ArtifactShareLink).where(
+            or_(
+                ArtifactShareLink.token_hash == token_hash,
+                ArtifactShareLink.token == token,
+            )
+        )
+    ).first()
+
+    wants_html = False
+    if request is not None and "text/html" in request.headers.get("accept", ""):
+        wants_html = True
+
+    if link_record is not None:
+        if link_record.is_revoked:
+            if wants_html:
+                return _render_share_link_notice_page(
+                    title="链接已作废",
+                    message="抱歉，该报告分享链接已被管理员手动撤销或作废，无法继续访问。",
+                    status_code=403,
+                )
+            raise HTTPException(status_code=403, detail="该分享链接已被撤销作废")
+        if link_record.expires_at < utc_now():
+            if wants_html:
+                return _render_share_link_notice_page(
+                    title="链接已过期",
+                    message="抱歉，该报告分享链接已超出有效期（默认7天），如需查看请联系分享人重新生成链接。",
+                    status_code=410,
+                )
+            raise HTTPException(status_code=410, detail="该分享链接已过期失效")
+
+    try:
+        payload = artifact_share_mod.decode_artifact_share_token(token)
+    except HTTPException:
+        if wants_html:
+            return _render_share_link_notice_page(
+                title="链接无效或已过期",
+                message="抱歉，未能找到对应的报告，该分享链接可能已过期或已被修改。",
+                status_code=404,
+            )
+        raise
+
     tenant_id = payload["tenant_id"]
     session_id = payload["session_id"]
     cn_path = payload["path"]
@@ -2584,6 +2893,12 @@ def view_published_artifact(
             opened.close()
         raise HTTPException(status_code=404, detail="Artifact not found") from None
 
+    if link_record is not None:
+        link_record.view_count += 1
+        link_record.last_viewed_at = utc_now()
+        db.add(link_record)
+        db.commit()
+
     filename = _safe_artifact_download_name(
         str(artifact.get("display_name") or opened.filename)
     )
@@ -2614,6 +2929,7 @@ def view_published_artifact(
 
 
 @router.post("/artifacts/share-link")
+@router.post("/artifacts/share-links")
 def mint_artifact_share(
     request: ShareLinkRequest,
     current_user: User = Depends(get_current_user),
@@ -2622,7 +2938,8 @@ def mint_artifact_share(
     """Create a signed, expiring share link for an already-published artifact.
 
     Only a user who can read the owning session may mint a link, and only for a
-    path that is actually published in the owner's manifest.
+    path that is actually published in the owner's manifest. Records the link in
+    the database for lifecycle management.
     """
     _ensure_request_tenant(request.tenant_id, current_user)
     _get_readable_chat_session(db, request.tenant_id, current_user, request.session_id)
@@ -2637,25 +2954,986 @@ def mint_artifact_share(
     if resolved is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
+    ttl = (
+        (request.days * 86400)
+        if request.days is not None
+        else (
+            request.ttl_seconds
+            if request.ttl_seconds is not None
+            else artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
+        )
+    )
     token = artifact_share_mod.mint_artifact_share_token(
         tenant_id=request.tenant_id,
         session_id=request.session_id,
         owner_kind=resolved.owner_kind,
         owner_id=resolved.owner_id,
         path=request.path,
-        ttl_seconds=(
-            request.ttl_seconds
-            if request.ttl_seconds is not None
-            else artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
-        ),
+        ttl_seconds=ttl,
     )
     payload = artifact_share_mod.decode_artifact_share_token(token)
+    url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{token}"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    exp_dt = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
+
+    display_title = (
+        request.title
+        or resolved.artifact.get("display_name")
+        or Path(request.path).name
+    )
+
+    share_record = ArtifactShareLink(
+        tenant_id=request.tenant_id,
+        session_id=request.session_id,
+        owner_kind=resolved.owner_kind,
+        owner_id=resolved.owner_id,
+        path=request.path,
+        title=display_title,
+        token=token,
+        token_hash=token_hash,
+        url=url,
+        created_by_user_id=current_user.id,
+        created_by_username=current_user.display_name or current_user.username,
+        ttl_seconds=ttl,
+        expires_at=exp_dt,
+        is_revoked=False,
+    )
+    db.add(share_record)
+    db.commit()
+    db.refresh(share_record)
+
     return ShareLinkResponse(
         token=token,
-        url=f"{get_settings().normalized_tool_base_url}"
-        f"/api/chat/artifacts/view/{token}",
+        url=url,
         expires_at=payload["exp"],
+        link_id=share_record.id,
+        title=share_record.title,
     )
+
+
+@router.get("/artifacts/share-links")
+def list_artifact_share_links(
+    tenant_id: str | None = None,
+    status: str = "all",
+    search: str | None = None,
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ArtifactShareLinksListResponse:
+    """List and manage generated HTML artifact share links with lifecycle metrics."""
+    tid = tenant_id or current_user.tenant_id
+    _ensure_request_tenant(tid, current_user)
+
+    stmt = select(ArtifactShareLink).where(ArtifactShareLink.tenant_id == tid)
+    if not is_admin_user(current_user):
+        # 普通成员只能看到自己创建的链接，避免枚举他人的报告路径与 token
+        stmt = stmt.where(ArtifactShareLink.created_by_user_id == current_user.id)
+    all_links = db.exec(stmt.order_by(ArtifactShareLink.created_at.desc())).all()
+
+    # Map tasks bound to artifact share links
+    task_map: dict[str, tuple[str, str]] = {}
+    try:
+        tasks = db.exec(select(ScheduledTask).where(ScheduledTask.tenant_id == tid)).all()
+        for t in tasks:
+            meta = t.metadata_json if isinstance(t.metadata_json, dict) else {}
+            lid = meta.get("artifact_share_link_id")
+            if lid and str(lid).strip():
+                task_map[str(lid).strip()] = (t.id, t.title)
+    except Exception:
+        pass
+
+    now = utc_now()
+    active_count = 0
+    expiring_soon_count = 0
+    expired_count = 0
+    revoked_count = 0
+    total_views = 0
+
+    read_items: list[ArtifactShareLinkRead] = []
+    for link in all_links:
+        bound_id, bound_title = task_map.get(link.id, (None, None))
+        read = _to_share_link_read(
+            link,
+            now,
+            bound_task_id=bound_id,
+            bound_task_title=bound_title,
+            include_token=False,
+        )
+        total_views += link.view_count
+        if read.status == "revoked":
+            revoked_count += 1
+        elif read.status == "expired":
+            expired_count += 1
+        elif read.status == "expiring_soon":
+            expiring_soon_count += 1
+            active_count += 1
+        elif read.status == "active":
+            active_count += 1
+
+        if status == "active" and read.status not in ("active", "expiring_soon"):
+            continue
+        if status == "expiring_soon" and read.status != "expiring_soon":
+            continue
+        if status == "expired" and read.status != "expired":
+            continue
+        if status == "revoked" and read.status != "revoked":
+            continue
+
+        if search:
+            q = search.lower().strip()
+            title_match = bool(link.title and q in link.title.lower())
+            path_match = q in link.path.lower()
+            user_match = bool(link.created_by_username and q in link.created_by_username.lower())
+            if not (title_match or path_match or user_match):
+                continue
+
+        read_items.append(read)
+
+    total = len(read_items)
+    paginated = read_items[skip : skip + limit]
+
+    return ArtifactShareLinksListResponse(
+        items=paginated,
+        total=total,
+        active_count=active_count,
+        expiring_soon_count=expiring_soon_count,
+        expired_count=expired_count,
+        revoked_count=revoked_count,
+        total_views=total_views,
+    )
+
+
+@router.post("/artifacts/share-links/{link_id}/revoke")
+def revoke_artifact_share_link(
+    link_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ArtifactShareLinkRead:
+    """Manually revoke a share link so it can no longer be accessed."""
+    link = db.get(ArtifactShareLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+    _ensure_request_tenant(link.tenant_id, current_user)
+    _ensure_share_link_access(link, current_user)
+
+    link.is_revoked = True
+    link.revoked_at = utc_now()
+    link.revoked_by_user_id = current_user.id
+    link.updated_at = utc_now()
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    return _to_share_link_read(link, utc_now())
+
+
+def _rotate_share_link_token(
+    db: Session,
+    link: ArtifactShareLink,
+    new_expires_at: datetime,
+    current_user: User,
+    now: datetime,
+) -> str:
+    total_ttl = max(1, int((new_expires_at - now).total_seconds()))
+    new_token = artifact_share_mod.mint_artifact_share_token(
+        tenant_id=link.tenant_id,
+        session_id=link.session_id,
+        owner_kind=link.owner_kind,
+        owner_id=link.owner_id,
+        path=link.path,
+        ttl_seconds=total_ttl,
+    )
+    new_token_hash = hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+    new_url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{new_token}"
+
+    old_token = link.token or ""
+    if old_token:
+        old_token_hash = hashlib.sha256(old_token.encode("utf-8")).hexdigest()
+        if old_token_hash != new_token_hash:
+            db.add(
+                ArtifactShareLink(
+                    tenant_id=link.tenant_id,
+                    session_id=link.session_id,
+                    owner_kind=link.owner_kind,
+                    owner_id=link.owner_id,
+                    path=link.path,
+                    title=link.title,
+                    token=old_token,
+                    token_hash=old_token_hash,
+                    url=link.url,
+                    created_by_user_id=link.created_by_user_id,
+                    created_by_username=link.created_by_username,
+                    ttl_seconds=link.ttl_seconds,
+                    expires_at=link.expires_at,
+                    is_revoked=True,
+                    revoked_at=now,
+                    revoked_by_user_id=current_user.id,
+                    view_count=link.view_count,
+                    last_viewed_at=link.last_viewed_at,
+                    created_at=link.created_at,
+                    updated_at=now,
+                )
+            )
+
+    link.token = new_token
+    link.token_hash = new_token_hash
+    link.url = new_url
+    link.ttl_seconds = total_ttl
+    link.expires_at = new_expires_at
+    link.is_revoked = False
+    link.revoked_at = None
+    link.revoked_by_user_id = None
+    return new_url
+
+
+def _sync_share_link_bound_tasks(
+    db: Session,
+    link: ArtifactShareLink,
+    *,
+    title: str | None,
+    url: str,
+    now: datetime,
+) -> None:
+    try:
+        tasks = db.exec(
+            select(ScheduledTask).where(ScheduledTask.tenant_id == link.tenant_id)
+        ).all()
+        for t in tasks:
+            meta = t.metadata_json if isinstance(t.metadata_json, dict) else {}
+            if str(meta.get("artifact_share_link_id") or "").strip() == link.id:
+                new_meta = dict(meta)
+                if title:
+                    new_meta["artifact_title"] = title
+                else:
+                    new_meta.pop("artifact_title", None)
+                new_meta["artifact_share_url"] = url
+                t.metadata_json = new_meta
+                t.updated_at = now
+                db.add(t)
+    except Exception as e:
+        logger.warning("Failed to sync bound tasks for link %s: %s", link.id, e)
+
+
+@router.patch("/artifacts/share-links/{link_id}")
+def update_artifact_share_link(
+    link_id: str,
+    req: UpdateShareLinkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ArtifactShareLinkRead:
+    """Update title and/or expiration time of a share link."""
+    link = db.get(ArtifactShareLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+    _ensure_request_tenant(link.tenant_id, current_user)
+    _ensure_share_link_access(link, current_user)
+
+    now = utc_now()
+    has_changes = False
+    new_title = link.title
+
+    if req.title is not None:
+        trimmed = req.title.strip()
+        if len(trimmed) > 200:
+            raise HTTPException(status_code=400, detail="报告名称不能超过 200 个字符")
+        if (link.title or "").startswith(DEMO_SHARE_TITLE_PREFIX) and not trimmed.startswith(DEMO_SHARE_TITLE_PREFIX):
+            raise HTTPException(
+                status_code=400,
+                detail=f"演示数据链接的名称必须保留{DEMO_SHARE_TITLE_PREFIX}前缀",
+            )
+        target_title = trimmed if trimmed else None
+        if target_title != link.title:
+            link.title = target_title
+            new_title = target_title
+            has_changes = True
+
+    if req.expires_at is not None:
+        raw_exp = req.expires_at
+        if raw_exp.tzinfo is not None:
+            raw_exp = raw_exp.astimezone(UTC).replace(tzinfo=None)
+
+        if link.is_revoked:
+            raise HTTPException(
+                status_code=400,
+                detail="已作废的分享链接不能修改有效期，请重新生成链接",
+            )
+
+        if raw_exp <= now + timedelta(seconds=60):
+            raise HTTPException(status_code=400, detail="到期时间必须晚于当前时间")
+
+        if abs((raw_exp - link.expires_at).total_seconds()) > 1:
+            _rotate_share_link_token(db, link, raw_exp, current_user, now)
+            has_changes = True
+
+    if has_changes:
+        link.updated_at = now
+        db.add(link)
+        _sync_share_link_bound_tasks(db, link, title=new_title, url=link.url, now=now)
+        db.commit()
+        db.refresh(link)
+
+    return _to_share_link_read(link, now)
+
+
+
+@router.post("/artifacts/share-links/{link_id}/extend")
+def extend_artifact_share_link(
+    link_id: str,
+    req: ExtendShareLinkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ArtifactShareLinkRead:
+    """Extend the expiration time of a share link and re-sign the capability token."""
+    link = db.get(ArtifactShareLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+    _ensure_request_tenant(link.tenant_id, current_user)
+    _ensure_share_link_access(link, current_user)
+
+    if link.is_revoked:
+        raise HTTPException(
+            status_code=400,
+            detail="已作废的分享链接不能延期，请重新生成链接",
+        )
+
+    now = utc_now()
+    add_seconds = (req.days * 86400) if req.days is not None else (req.ttl_seconds or (7 * 86400))
+    base_time = link.expires_at if (not link.is_revoked and link.expires_at > now) else now
+    new_expires_at = base_time + timedelta(seconds=add_seconds)
+
+    _rotate_share_link_token(db, link, new_expires_at, current_user, now)
+    link.updated_at = now
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    return _to_share_link_read(link, now)
+
+
+
+@router.delete("/artifacts/share-links/{link_id}")
+def delete_artifact_share_link(
+    link_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Delete a share link: revoke the signed token and keep the row for audit.
+
+    Hard-deleting the row would orphan the stateless signed token: the viewer
+    only checks revocation/expiry when it can find the row, so a deleted record
+    used to keep serving the artifact until the token's own ``exp``. We therefore
+    soft-delete (``is_revoked=True``) so ``/artifacts/view/{token}`` rejects it
+    immediately while the audit trail survives.
+    """
+    link = db.get(ArtifactShareLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+    _ensure_request_tenant(link.tenant_id, current_user)
+    _ensure_share_link_access(link, current_user)
+
+    if not link.is_revoked:
+        link.is_revoked = True
+        link.revoked_at = utc_now()
+        link.revoked_by_user_id = current_user.id
+        link.updated_at = utc_now()
+        db.add(link)
+        db.commit()
+    return {"success": True, "deleted_id": link_id, "revoked": True}
+
+
+@router.post("/artifacts/share-links/{link_id}/bind-scheduled-task", response_model=BindScheduledTaskResponse)
+def bind_artifact_share_link_to_scheduled_task(
+    link_id: str,
+    req: BindScheduledTaskRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> BindScheduledTaskResponse:
+    """Bind an HTML artifact share link to a scheduled task for periodic push notifications."""
+    link = db.get(ArtifactShareLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="分享链接不存在")
+    tid = req.tenant_id or current_user.tenant_id
+    _ensure_request_tenant(tid, current_user)
+    if link.tenant_id != tid:
+        raise HTTPException(status_code=403, detail="跨租户访问被拒绝")
+
+    if (link.title or "").startswith(DEMO_SHARE_TITLE_PREFIX):
+        raise HTTPException(
+            status_code=400,
+            detail="演示数据报表不能绑定定时推送，请使用真实数据查询模板生成链接",
+        )
+
+    title_clean = (link.title or "业务数据分析报告").strip()
+    target_task_id = req.task_id or req.existing_task_id
+    is_new = req.create_new_task or (req.mode == "new")
+
+    if not is_new and target_task_id:
+        task = db.get(ScheduledTask, target_task_id)
+        if not task or task.tenant_id != tid:
+            raise HTTPException(status_code=404, detail="指定的定时任务不存在")
+        _ensure_task_access(task, current_user)
+        meta = dict(task.metadata_json or {})
+        meta["artifact_share_link_id"] = link.id
+        meta["artifact_title"] = title_clean
+        if req.feishu_webhook or req.feishu_chat_id:
+            fn = dict(meta.get("feishu_notify") or {})
+            fn["enabled"] = True
+            if req.feishu_webhook:
+                whs = list(fn.get("webhooks") or [])
+                wh_clean = req.feishu_webhook.strip()
+                if wh_clean and wh_clean not in whs:
+                    whs.append(wh_clean)
+                fn["webhooks"] = whs
+            if req.feishu_chat_id:
+                cids = list(fn.get("chat_ids") or [])
+                cid_clean = req.feishu_chat_id.strip()
+                if cid_clean and cid_clean not in cids:
+                    cids.append(cid_clean)
+                fn["chat_ids"] = cids
+            meta["feishu_notify"] = fn
+        task.metadata_json = meta
+        task.updated_at = utc_now()
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return BindScheduledTaskResponse(
+            ok=True,
+            task_id=task.id,
+            task_title=task.title,
+            schedule_type=task.schedule_type,
+            url=link.url,
+        )
+
+    # Create a new scheduled task
+    agent_id = req.agent_id
+    if not agent_id:
+        agent = db.exec(
+            select(AgentProfile)
+            .where(AgentProfile.tenant_id == tid)
+            .order_by(AgentProfile.is_overall.desc(), AgentProfile.created_at.asc())
+        ).first()
+        agent_id = agent.id if agent else "agent_overall"
+
+    task_title = req.task_title or f"【定时推送】{title_clean}"
+    times = [t.strip() for t in req.times if t.strip()]
+    if not times:
+        times = [req.time.strip() if req.time else "09:00"]
+
+    schedule_cfg: dict[str, Any] = {
+        "time": times[0],
+        "times": times,
+        "interval_minutes": req.interval_minutes or 60,
+    }
+
+    fn_cfg: dict[str, Any] = {
+        "enabled": bool(req.feishu_webhook or req.feishu_chat_id),
+        "webhooks": [req.feishu_webhook.strip()] if req.feishu_webhook and req.feishu_webhook.strip() else [],
+        "chat_ids": [req.feishu_chat_id.strip()] if req.feishu_chat_id and req.feishu_chat_id.strip() else [],
+        "mobiles": [],
+        "open_ids": [],
+    }
+
+    metadata = {
+        "artifact_share_link_id": link.id,
+        "artifact_title": title_clean,
+        "feishu_notify": fn_cfg,
+    }
+
+    new_task = ScheduledTask(
+        tenant_id=tid,
+        agent_id=agent_id,
+        created_by_user_id=current_user.id,
+        title=task_title,
+        prompt=(
+            f"定时播报并推送 HTML 业务报告。\n\n"
+            f"报告标题: {title_clean}\n\n"
+            f"服务端会在飞书卡片中附加报告访问按钮；播报正文不要自行拼接链接或 token。"
+        ),
+        schedule_type=req.schedule_type or "daily",
+        schedule_json=schedule_cfg,
+        status="active",
+        metadata_json=metadata,
+    )
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+
+    return BindScheduledTaskResponse(
+        ok=True,
+        task_id=new_task.id,
+        task_title=new_task.title,
+        schedule_type=new_task.schedule_type,
+        url=link.url,
+    )
+
+
+@router.get("/artifacts/share-links/recent-reports")
+def list_recent_reports_for_sharing(
+    tenant_id: str | None = None,
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> list[dict[str, Any]]:
+    """List recent HTML reports/artifacts across sessions to easily pick and share."""
+    tid = tenant_id or current_user.tenant_id
+    _ensure_request_tenant(tid, current_user)
+
+    messages = db.exec(
+        select(Message)
+        .where(
+            Message.tenant_id == tid,
+            Message.role == "assistant",
+        )
+        .order_by(Message.created_at.desc())
+        .limit(100)
+    ).all()
+
+    seen = set()
+    results: list[dict[str, Any]] = []
+    readable_session_ids: set[str] = set()
+
+    def _can_read_session(session_id: str) -> bool:
+        if is_admin_user(current_user):
+            return True
+        if session_id in readable_session_ids:
+            return True
+        try:
+            _get_readable_chat_session(db, tid, current_user, session_id)
+        except HTTPException:
+            return False
+        readable_session_ids.add(session_id)
+        return True
+
+    for msg in messages:
+        if not _can_read_session(msg.session_id):
+            continue
+        artifacts = (msg.metadata_json or {}).get("harness_artifacts", [])
+        for art in artifacts:
+            path = str(art.get("path") or "")
+            if _is_html_previewable(path):
+                key = (msg.session_id, path)
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "session_id": msg.session_id,
+                        "task_frame_id": art.get("task_frame_id") or art.get("owner_id"),
+                        "owner_kind": art.get("owner_kind") or "harness_frame",
+                        "owner_id": art.get("owner_id") or art.get("task_frame_id"),
+                        "path": path,
+                        "display_name": art.get("display_name") or Path(path).name,
+                        "size": art.get("size"),
+                        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                    })
+                    if len(results) >= limit:
+                        return results
+    return results
+
+
+def _synthesize_report_spec_from_prompt(
+    prompt: str,
+    custom_title: str | None = None,
+    preferred_renderer: str | None = None,
+) -> dict[str, Any]:
+    text = prompt.lower()
+    cst_now = datetime.now(UTC) + timedelta(hours=8)
+    date_str = cst_now.strftime("%Y-%m-%d")
+
+    is_sales = any(k in text for k in ["销", "sale", "门店", "业绩", "达成", "达播", "净销", "gmv", "电商", "大盘"])
+    is_inventory = any(k in text for k in ["库存", "采购", "入库", "出库", "供应链", "周转", "sku", "备货"])
+    is_service = any(k in text for k in ["客服", "工单", "客户", "服务", "满意度", "响应", "投诉"])
+
+    if preferred_renderer in ("sales_report", "generic_table"):
+        renderer = preferred_renderer
+    elif is_sales:
+        renderer = "sales_report"
+    else:
+        renderer = "generic_table"
+
+    if renderer == "sales_report" or is_sales:
+        title = custom_title or (
+            f"销售业务综合分析与达成看板 ({date_str})"
+            if "周" not in text
+            else f"近7天销售业绩与渠道大屏 ({date_str})"
+        )
+        return {
+            "title": title,
+            "subtitle": f"AI 语义分析生成 · 统计截止至 {date_str}",
+            "renderer": "sales_report",
+            "summary": (
+                f"根据需求指令「{prompt}」完成全维度数据聚合。核心业务指标表现稳健，"
+                "线下直营旗舰店与线上达播渠道形成良好协同，重点大区目标达成率超 100%。"
+            ),
+            "kpis": [
+                {"label": "大盘总净销", "value": "412.8万", "delta": "+14.2%", "tone": "up"},
+                {"label": "自营净销", "value": "236.5万", "delta": "+9.1%", "tone": "up"},
+                {"label": "达播净销", "value": "176.3万", "delta": "+21.8%", "tone": "up"},
+                {"label": "综合达成率", "value": "106.5%", "delta": "+6.5%", "tone": "up"},
+            ],
+            "rows": [
+                {"category": "华东大区", "item": "杭州西湖直营店", "净销_万": 118.5, "运营净销_万": 68.2, "达播净销_万": 50.3, "达成率": "112%"},
+                {"category": "华东大区", "item": "上海淮海路旗舰店", "净销_万": 96.2, "运营净销_万": 58.0, "达播净销_万": 38.2, "达成率": "106%"},
+                {"category": "华东大区", "item": "南京新街口中心店", "净销_万": 78.4, "运营净销_万": 46.1, "达播净销_万": 32.3, "达成率": "102%"},
+                {"category": "华南大区", "item": "深圳万象城店", "净销_万": 82.6, "运营净销_万": 49.0, "达播净销_万": 33.6, "达成率": "108%"},
+                {"category": "华南大区", "item": "广州天河城店", "净销_万": 69.1, "运营净销_万": 41.5, "达播净销_万": 27.6, "达成率": "98%"},
+                {"category": "华北大区", "item": "北京三里屯店", "净销_万": 88.0, "运营净销_万": 52.3, "达播净销_万": 35.7, "达成率": "105%"},
+            ],
+            "column_labels": {
+                "category": "所属大区",
+                "item": "门店/渠道",
+                "净销_万": "总净销(万)",
+                "运营净销_万": "自营净销(万)",
+                "达播净销_万": "达播净销(万)",
+                "达成率": "目标达成率",
+            },
+        }
+    elif is_inventory:
+        title = custom_title or f"供应链库存周转与备货分析看板 ({date_str})"
+        return {
+            "title": title,
+            "subtitle": f"AI 语义分析生成 · 统计截止至 {date_str}",
+            "renderer": "generic_table",
+            "summary": (
+                f"根据指令「{prompt}」生成供应链分析报表。当前全仓周转天数稳定在 18.5 天，"
+                "重点爆品现货率 98.2%，部分热销款已触发自动安全补货预警。"
+            ),
+            "kpis": [
+                {"label": "在库总件数", "value": "128,450", "delta": "+5.2%", "tone": "up"},
+                {"label": "周转天数", "value": "18.5天", "delta": "-2.1天", "tone": "up"},
+                {"label": "现货满足率", "value": "98.2%", "delta": "+1.4%", "tone": "up"},
+                {"label": "预警品类数", "value": "3类", "delta": "-2类", "tone": "up"},
+            ],
+            "rows": [
+                {"品类": "核心服饰系列", "主仓库存": "45,200", "华东分仓": "18,400", "华南分仓": "15,800", "周转天数": "16.2", "状态": "正常"},
+                {"品类": "当季新品鞋履", "主仓库存": "28,600", "华东分仓": "12,100", "华南分仓": "9,800", "周转天数": "19.5", "状态": "正常"},
+                {"品类": "配饰及周边", "主仓库存": "32,150", "华东分仓": "14,200", "华南分仓": "11,500", "周转天数": "22.8", "状态": "关注"},
+                {"品类": "联名限定款", "主仓库存": "22,500", "华东分仓": "8,900", "华南分仓": "7,600", "周转天数": "12.0", "状态": "紧俏"},
+            ],
+            "column_labels": {
+                "品类": "商品品类",
+                "主仓库存": "中央主仓",
+                "华东分仓": "华东仓存",
+                "华南分仓": "华南仓存",
+                "周转天数": "周转周期(天)",
+                "状态": "库存健康度",
+            },
+        }
+    elif is_service:
+        title = custom_title or f"客户服务质量与工单时效看板 ({date_str})"
+        return {
+            "title": title,
+            "subtitle": f"AI 语义分析生成 · 统计截止至 {date_str}",
+            "renderer": "generic_table",
+            "summary": (
+                f"根据指令「{prompt}」汇总客户服务分析数据。本期平均工单处理时长缩短至 14.2 分钟，"
+                "一次性解决率达到 92.4%，用户满意度综合评分为 4.88 分。"
+            ),
+            "kpis": [
+                {"label": "工单处理量", "value": "12,680件", "delta": "+8.4%", "tone": "up"},
+                {"label": "平均响应时长", "value": "45秒", "delta": "-12秒", "tone": "up"},
+                {"label": "一次解决率", "value": "92.4%", "delta": "+3.1%", "tone": "up"},
+                {"label": "满意度评分", "value": "4.88分", "delta": "+0.05", "tone": "up"},
+            ],
+            "rows": [
+                {"渠道": "在线客服群", "接入总量": "5,420", "平均解决时长": "12.5分钟", "解决率": "94.6%", "满意度": "4.92"},
+                {"渠道": "企业飞书服务台", "接入总量": "3,890", "平均解决时长": "15.1分钟", "解决率": "93.2%", "满意度": "4.89"},
+                {"渠道": "微信客服", "接入总量": "2,150", "平均解决时长": "16.8分钟", "解决率": "90.1%", "满意度": "4.82"},
+                {"渠道": "VIP专属通道", "接入总量": "1,220", "平均解决时长": "8.2分钟", "解决率": "98.5%", "满意度": "4.97"},
+            ],
+            "column_labels": {
+                "渠道": "服务接入渠道",
+                "接入总量": "工单总数",
+                "平均解决时长": "平均时效",
+                "解决率": "解决率",
+                "满意度": "满意度(5分制)",
+            },
+        }
+    else:
+        title = custom_title or f"综合业务数据分析大屏 ({date_str})"
+        return {
+            "title": title,
+            "subtitle": f"AI 语义分析生成 · 统计截止至 {date_str}",
+            "renderer": "generic_table",
+            "summary": (
+                f"根据需求描述「{prompt}」提炼核心业务数据指标。各大维度业务表现良好，"
+                "协同配合紧密，整体运行处于预定轨道范围内。"
+            ),
+            "kpis": [
+                {"label": "核心综合指标", "value": "98.6分", "delta": "+2.4%", "tone": "up"},
+                {"label": "业务活跃度", "value": "1,850", "delta": "+15.2%", "tone": "up"},
+                {"label": "完成度", "value": "94.8%", "delta": "+4.1%", "tone": "up"},
+            ],
+            "rows": [
+                {"维度": "核心业务板块A", "指标值": "850", "环比": "+12.4%", "状态": "良好"},
+                {"维度": "核心业务板块B", "指标值": "620", "环比": "+8.9%", "状态": "平稳"},
+                {"维度": "核心业务板块C", "指标值": "380", "环比": "+24.1%", "状态": "高速增长"},
+            ],
+            "column_labels": {
+                "维度": "分析维度",
+                "指标值": "业务数值",
+                "环比": "环比增长",
+                "状态": "运行状态",
+            },
+        }
+
+
+@router.post("/artifacts/share-links/semantic-generate")
+def semantic_generate_share_link(
+    request: SemanticGenerateShareLinkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> ArtifactShareLinkRead:
+    """Generate a full standalone HTML report directly from natural language semantics, and mint a share link."""
+    from app.reporting.errors import ReportError
+    from app.reporting.spec import SPEC_KEYS, build_report_from_spec
+    from app.reporting.writer import write_report_html
+
+    tid = request.tenant_id or current_user.tenant_id
+    _ensure_request_tenant(tid, current_user)
+
+    prompt = (request.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="需求描述不能为空")
+
+    # 1. Resolve or create chat session
+    if request.session_id:
+        session = db.get(ChatSession, request.session_id)
+        if not session or session.tenant_id != tid:
+            raise HTTPException(status_code=404, detail="指定的会话不存在")
+    else:
+        session = ChatSession(
+            id=new_id("session"),
+            tenant_id=tid,
+            user_id=current_user.id,
+            title=request.title or f"语义报表：{prompt[:18]}",
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    # 2. Record task frame
+    frame_id = new_id("task")
+    frame_record = HarnessTaskFrameRecord(
+        id=new_id("htask"),
+        tenant_id=tid,
+        session_id=session.id,
+        task_id=frame_id,
+        source_turn_id=new_id("turn"),
+        status="completed",
+    )
+    db.add(frame_record)
+    db.commit()
+
+    # 3. 取数：有 data_template_id 时只用真实查询结果；否则生成明确标记的“演示数据”。
+    demo = not request.data_template_id
+    wants_push = bool(request.schedule_push and request.schedule_push.enabled)
+    if demo and wants_push:
+        raise HTTPException(
+            status_code=400,
+            detail="演示报表不能配置定时推送，请先提供 data_template_id 绑定真实数据查询模板",
+        )
+
+    spec: dict[str, Any] | None = None
+    if request.data_template_id:
+        from app.data_query.service import execute_query_by_id
+
+        try:
+            query_res = execute_query_by_id(db, request.data_template_id, tid, {})
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"数据查询失败：{exc}") from exc
+        rows = list(query_res.rows or [])
+        columns = list(query_res.columns or [])
+        if not rows:
+            raise HTTPException(status_code=400, detail="查询结果为空，未生成报表")
+        spec = {
+            "title": request.title or "数据查询报表",
+            "subtitle": f"数据源：{request.data_template_id} · 共 {len(rows)} 行",
+            "renderer": "generic_table",
+            "summary": f"本报表由数据查询模板 `{request.data_template_id}` 的真实查询结果生成。",
+            "rows": rows,
+            "column_labels": {str(c): str(c) for c in columns},
+        }
+    else:
+        # 3a. Generate spec (LLM first, smart synthesis fallback) — 仅用于演示模式
+        try:
+            from app.db.models import ModelConfig
+            model_config = db.exec(
+                select(ModelConfig).where(
+                    ModelConfig.tenant_id == tid,
+                    ModelConfig.is_default == True,
+                )
+            ).first()
+            if not model_config:
+                model_config = db.exec(
+                    select(ModelConfig).where(ModelConfig.tenant_id == tid)
+                ).first()
+
+            if model_config and getattr(model_config, "api_key_encrypted", None):
+                from app.llm import LLMClient
+                client = LLMClient(model_config)
+                system_prompt = (
+                    "你是一个企业级 BI 报表与数据分析专家。根据用户的语义需求和报表偏好，"
+                    "生成一份结构化报表 spec JSON 配置。\n"
+                    "输出必须是严格合法的 JSON 对象，包含：\n"
+                    "- title (string): 报表主标题\n"
+                    "- subtitle (string, 可选): 副标题/统计周期\n"
+                    "- renderer (string): 'sales_report' 或 'generic_table'\n"
+                    "- summary (string): 核心分析与结论摘要 markdown\n"
+                    "- kpis (array): 3-5个指标卡，每个含 label, value, delta, tone ('up'|'down'|'flat')\n"
+                    "- rows (array): 5-15行明细数据对象\n"
+                    "- column_labels (object, 可选): 字段名中文标签映射\n"
+                )
+                raw_spec = client.generate_json(
+                    system_prompt,
+                    {"prompt": prompt, "title_hint": request.title, "renderer_hint": request.renderer},
+                )
+                if isinstance(raw_spec, dict) and raw_spec.get("title") and raw_spec.get("rows"):
+                    spec = {k: v for k, v in raw_spec.items() if k in SPEC_KEYS}
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, LLMError):
+            spec = None
+
+        if not spec:
+            spec = _synthesize_report_spec_from_prompt(
+                prompt=prompt,
+                custom_title=request.title,
+                preferred_renderer=request.renderer,
+            )
+        spec["title"] = f"【演示数据】{spec.get('title') or request.title or '语义报表'}"
+        spec["subtitle"] = "演示数据 · 未连接真实数据源，不可用于业务决策"
+
+    # 4. Build and write HTML
+    try:
+        doc = build_report_from_spec(spec, tenant_id=tid)
+        published = write_report_html(
+            db=db,
+            tenant_id=tid,
+            session_id=session.id,
+            owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+            owner_id=frame_id,
+            document=doc,
+        )
+    except ReportError as exc:
+        raise HTTPException(status_code=400, detail=f"报表构建失败: {exc}")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"报表落盘失败: {exc}")
+
+    # 5. Assistant message record
+    assistant_msg = Message(
+        id=new_id("msg"),
+        tenant_id=tid,
+        session_id=session.id,
+        role="assistant",
+        content=f"已通过语义需求「{prompt}」生成 HTML 独立报表大屏《{published.display_name}》。",
+        metadata_json={"harness_artifacts": [published.artifact]},
+    )
+    db.add(assistant_msg)
+    db.commit()
+
+    # 6. Mint capability token & persist ArtifactShareLink
+    days = request.days if request.days and request.days > 0 else 7
+    ttl = days * 86400
+    token = artifact_share_mod.mint_artifact_share_token(
+        tenant_id=tid,
+        session_id=session.id,
+        owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+        owner_id=frame_id,
+        path=published.path,
+        ttl_seconds=ttl,
+    )
+    payload = artifact_share_mod.decode_artifact_share_token(token)
+    url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{token}"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    exp_dt = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
+
+    if demo:
+        display_title = f"【演示数据】{request.title or published.display_name or Path(published.path).name}"
+    else:
+        display_title = (
+            request.title
+            or spec.get("title")
+            or published.display_name
+            or Path(published.path).name
+        )
+
+    share_record = ArtifactShareLink(
+        tenant_id=tid,
+        session_id=session.id,
+        owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+        owner_id=frame_id,
+        path=published.path,
+        title=display_title,
+        token=token,
+        token_hash=token_hash,
+        url=url,
+        created_by_user_id=current_user.id,
+        created_by_username=current_user.display_name or current_user.username,
+        ttl_seconds=ttl,
+        expires_at=exp_dt,
+        is_revoked=False,
+    )
+    db.add(share_record)
+    db.commit()
+    db.refresh(share_record)
+
+    bound_task_id: str | None = None
+    bound_task_title: str | None = None
+    if request.schedule_push and request.schedule_push.enabled:
+        sp = request.schedule_push
+        agent_id = sp.agent_id
+        if not agent_id:
+            agent = db.exec(
+                select(AgentProfile)
+                .where(AgentProfile.tenant_id == tid)
+                .order_by(AgentProfile.is_overall.desc(), AgentProfile.created_at.asc())
+            ).first()
+            agent_id = agent.id if agent else "agent_overall"
+
+        task_title = sp.task_title or f"【定时推送】{display_title}"
+        times = [t.strip() for t in sp.times if t.strip()]
+        if not times:
+            times = [sp.time.strip() if sp.time else "09:00"]
+        schedule_cfg = {
+            "time": times[0],
+            "times": times,
+            "interval_minutes": sp.interval_minutes or 60,
+        }
+        fn_cfg = {
+            "enabled": bool(sp.feishu_webhook or sp.feishu_chat_id),
+            "webhooks": [sp.feishu_webhook.strip()] if sp.feishu_webhook and sp.feishu_webhook.strip() else [],
+            "chat_ids": [sp.feishu_chat_id.strip()] if sp.feishu_chat_id and sp.feishu_chat_id.strip() else [],
+            "mobiles": [],
+            "open_ids": [],
+        }
+        new_task = ScheduledTask(
+            tenant_id=tid,
+            agent_id=agent_id,
+            created_by_user_id=current_user.id,
+            title=task_title,
+            prompt=(
+                f"定时播报并推送 HTML 业务报告。\n\n"
+                f"报告标题: {display_title}\n\n"
+                f"服务端会在飞书卡片中附加报告访问按钮；播报正文不要自行拼接链接或 token。"
+            ),
+            schedule_type=sp.schedule_type or "daily",
+            schedule_json=schedule_cfg,
+            status="active",
+            metadata_json={
+                "artifact_share_link_id": share_record.id,
+                "artifact_title": display_title,
+                "feishu_notify": fn_cfg,
+            },
+        )
+        db.add(new_task)
+        db.commit()
+        db.refresh(new_task)
+        bound_task_id = new_task.id
+        bound_task_title = new_task.title
+
+    return _to_share_link_read(
+        share_record,
+        utc_now(),
+        bound_task_id=bound_task_id,
+        bound_task_title=bound_task_title,
+    )
+
 
 
 @router.get("/sessions/{session_id}/events")

@@ -20,4 +20,5 @@ export enum EnterpriseRoute {
   Accounts = '/enterprise/accounts',
   Models = '/enterprise/models',
   RuntimeSettings = '/enterprise/runtime-settings',
+  ShareLinks = '/enterprise/share-links',
 }

@@ -49,6 +49,18 @@ OWNER_KIND_PATTERN = rf"^{_OWNER_KIND_BODY}$"
 
 _REQUIRED_CLAIMS = ("tenant_id", "session_id", "path")
 _OWNER_KIND_RE = re.compile(_OWNER_KIND_BODY)
+# Signed tokens look like ``/api/chat/artifacts/view/<payload>.<sig>``; anything
+# that carries one (run summaries, LLM replies, trace_json) must be redacted
+# before it is persisted or pushed to IM.
+_VIEW_TOKEN_RE = re.compile(r"(/api/chat/artifacts/view/)[A-Za-z0-9_\-\.]+")
+
+
+def redact_share_tokens(text: str) -> str:
+    """Replace signed artifact-share tokens embedded in text with a marker."""
+
+    if not text:
+        return text
+    return _VIEW_TOKEN_RE.sub(r"\1[redacted]", text)
 
 
 def normalize_owner_kind(owner_kind: str | None) -> str:
@@ -198,4 +210,5 @@ __all__ = [
     "decode_artifact_share_token",
     "mint_artifact_share_token",
     "normalize_owner_kind",
+    "redact_share_tokens",
 ]

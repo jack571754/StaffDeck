@@ -1713,3 +1713,35 @@ class TeamTaskBid(SQLModel, table=True):
     score: Optional[float] = None
     score_rationale: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ArtifactShareLink(SQLModel, table=True):
+    """HTML 报告与产物外链分享管理模型：记录分享链接、支持设置有效期、一键作废与访问统计。"""
+
+    __tablename__ = "artifact_share_links"
+    __table_args__ = (
+        Index("ix_artifact_share_links_tenant_session", "tenant_id", "session_id"),
+    )
+
+    id: str = Field(default_factory=lambda: new_id("ashare"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    session_id: str = Field(index=True)
+    owner_kind: str = Field(default="harness_frame", index=True)
+    owner_id: str = Field(index=True)
+    path: str = Field(index=True)
+    title: str | None = Field(default=None, index=True)
+    token: str = Field(index=True)
+    token_hash: str = Field(index=True)
+    url: str
+    created_by_user_id: str | None = Field(default=None, index=True)
+    created_by_username: str | None = Field(default=None)
+    ttl_seconds: int = Field(default=7 * 24 * 3600)
+    expires_at: datetime = Field(index=True)
+    is_revoked: bool = Field(default=False, index=True)
+    revoked_at: datetime | None = None
+    revoked_by_user_id: str | None = None
+    view_count: int = Field(default=0)
+    last_viewed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now, index=True)
+    updated_at: datetime = Field(default_factory=utc_now)
+

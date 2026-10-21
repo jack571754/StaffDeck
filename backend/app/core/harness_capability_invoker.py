@@ -665,18 +665,75 @@ class HarnessCapabilityInvoker:
         artifact = dict(published.artifact)
         artifact["sandbox_path"] = _sandbox_path(published.path)
         artifact["source"] = "harness.report_generate"
+
+        share_url = None
+        share_token = None
+        share_expires_at = None
+        share_link_id = None
+        try:
+            from datetime import UTC, datetime
+
+            from app.config import get_settings
+            from app.db.models import ArtifactShareLink
+            from app.security import artifact_share as artifact_share_mod
+
+            ttl = artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
+            share_token = artifact_share_mod.mint_artifact_share_token(
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+                owner_id=self.task_frame_id,
+                path=published.path,
+                ttl_seconds=ttl,
+            )
+            payload = artifact_share_mod.decode_artifact_share_token(share_token)
+            share_url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{share_token}"
+            token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+            exp_dt = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
+            share_expires_at = payload["exp"]
+
+            share_record = ArtifactShareLink(
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+                owner_id=self.task_frame_id,
+                path=published.path,
+                title=published.display_name or Path(published.path).name,
+                token=share_token,
+                token_hash=token_hash,
+                url=share_url,
+                created_by_user_id=getattr(self.session, "user_id", None) or "system",
+                created_by_username="AI Assistant",
+                ttl_seconds=ttl,
+                expires_at=exp_dt,
+                is_revoked=False,
+            )
+            self.db.add(share_record)
+            self.db.commit()
+            share_link_id = share_record.id
+        except (OSError, ValueError, RuntimeError, KeyError):
+            pass
+
+        notice_text = (
+            "独立 HTML 报告已生成并登记为本次任务的交付物（已自动生成 7 天有效期的访问链接），"
+            "用户可在会话中直接预览、下载，也可在「HTML 链接管理」中查看并分发；"
+            "请勿把链接或 token 写进回复正文。"
+        )
+        data_res = {
+            "path": published.path,
+            "display_name": published.display_name,
+            "size": published.size,
+            "sha256": published.sha256,
+            "notice": notice_text,
+        }
+        if share_link_id:
+            # 只回稳定引用；签名 token 绝不能进入模型上下文（会被复述进回复/消息/trace）
+            data_res["share_link_id"] = share_link_id
+            data_res["expires_at"] = share_expires_at
+
         return {
             "success": True,
-            "data": {
-                "path": published.path,
-                "display_name": published.display_name,
-                "size": published.size,
-                "sha256": published.sha256,
-                "notice": (
-                    "独立 HTML 报告已生成并登记为本次任务的交付物，用户可在会话中直接预览、"
-                    "下载或分享；请勿再把同样的表格粘贴进回复正文。"
-                ),
-            },
+            "data": data_res,
             "artifacts": [artifact],
         }
 

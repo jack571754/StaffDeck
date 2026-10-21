@@ -72,6 +72,7 @@ import ToolsPage, {
 } from "./pages/ToolsPage";
 import DataQueryPage from "./pages/data-query/DataQueryPage";
 import QueryTemplateEditorPage from "./pages/data-query/QueryTemplateEditorPage";
+import ShareLinksPage from "./pages/ShareLinksPage";
 import { useIsMobile } from "./hooks/use-mobile";
 import {
   Dialog,
@@ -171,6 +172,8 @@ function Shell({
               ? "/enterprise/tools"
               : location.pathname.startsWith("/enterprise/data-query")
                 ? "/enterprise/data-query"
+              : location.pathname.startsWith("/enterprise/share-links")
+                ? "/enterprise/share-links"
               : location.pathname.startsWith("/enterprise/teams")
                 ? "/enterprise/teams"
                 : location.pathname.startsWith("/enterprise/scheduled-tasks")
@@ -823,6 +826,12 @@ function Shell({
                 path="/enterprise/data-query"
                 element={
                   <DataQueryPage currentUser={auth.user} onLogout={onLogout} />
+                }
+              />
+              <Route
+                path="/enterprise/share-links"
+                element={
+                  <ShareLinksPage currentUser={auth.user} onLogout={onLogout} />
                 }
               />
               <Route

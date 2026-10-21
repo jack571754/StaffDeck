@@ -48,6 +48,7 @@ from app.scheduled_tasks.schema import (
 from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
 from app.security.permissions import is_admin_user as _is_admin_user
+from app.security.artifact_share import redact_share_tokens
 from app.security.tenant import ensure_tenant
 from app.skills.nesting import SopNestingError, expand_sop_for_execution
 
@@ -846,7 +847,7 @@ def _execute_prepared_scheduled_task(
     *,
     manual: bool,
 ) -> ScheduledTaskRun:
-    if getattr(task, "execution_mode", "agent") == "pipeline" and getattr(task, "pipeline_steps_json", None):
+    if getattr(task, "execution_mode", "agent") == "pipeline":
         from app.scheduled_tasks.pipeline import execute_pipeline_scheduled_task
 
         return execute_pipeline_scheduled_task(db, task, run, manual=manual)
@@ -878,7 +879,7 @@ def _execute_prepared_scheduled_task(
             raise RuntimeError("自动任务执行未返回完整结果")
         outcome = _scheduled_harness_outcome(db, run, result)
         run.status = str(outcome["status"])
-        run.result_summary = result.reply[:500]
+        run.result_summary = redact_share_tokens(result.reply)[:500]
         run.error = str(outcome.get("error") or "") or None
         run.trace_json = dict(outcome["trace"])
         run.finished_at = utc_now()
@@ -1280,7 +1281,63 @@ def automatic_task_message(task: ScheduledTask) -> str:
 
         info_lines.append("请使用上述配置通过飞书执行消息推送与播报。")
         base = base + "\n".join(info_lines)
+
+    share_title = str(metadata.get("artifact_title") or "").strip()
+    if share_title:
+        report_lines = [
+            "\n\n【关联推送 HTML 报告】",
+            f"- 报告标题: {share_title}",
+            "- 服务端会在飞书卡片中附加报告访问按钮；播报正文不要自行拼接链接或 token。",
+        ]
+        base = base + "\n".join(report_lines)
     return base
+
+
+def resolve_task_share_link_url(db: Session, task: ScheduledTask) -> str | None:
+    """返回任务绑定分享链接当前可用的 URL；剩余有效期不足 24h 时自动重签。
+
+    重签会原地更新链接行（不写墓碑），旧卡片里的 token 仍可用到它自己的 exp；
+    链接被撤回或不存在时返回 ``None`` —— 调用方必须跳过按钮，绝不能用旧
+    metadata URL 兜底，否则撤回语义会被绕过。
+    """
+
+    import hashlib
+
+    from app.config import get_settings
+    from app.db.models import ArtifactShareLink
+    from app.security import artifact_share as artifact_share_mod
+
+    metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
+    link_id = str(metadata.get("artifact_share_link_id") or "").strip()
+    if not link_id:
+        return None
+    link = db.get(ArtifactShareLink, link_id)
+    if not link or link.is_revoked:
+        return None
+
+    now = utc_now()
+    if (link.expires_at - now).total_seconds() > 86400:
+        return link.url
+
+    ttl = artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
+    token = artifact_share_mod.mint_artifact_share_token(
+        tenant_id=link.tenant_id,
+        session_id=link.session_id,
+        owner_kind=link.owner_kind,
+        owner_id=link.owner_id,
+        path=link.path,
+        ttl_seconds=ttl,
+    )
+    payload = artifact_share_mod.decode_artifact_share_token(token)
+    link.token = token
+    link.token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    link.url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{token}"
+    link.ttl_seconds = ttl
+    link.expires_at = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
+    link.updated_at = now
+    db.add(link)
+    db.commit()
+    return link.url
 
 
 def _scheduled_task_sop_id(task: ScheduledTask) -> str | None:
