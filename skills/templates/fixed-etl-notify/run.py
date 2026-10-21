@@ -217,6 +217,51 @@ def init_dedup_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pushed_snapshots (
+                task_id TEXT PRIMARY KEY,
+                push_date TEXT,
+                pushed_at TEXT,
+                snapshot_json TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_last_push_snapshot(task_id: str = "") -> tuple[dict[str, dict[str, float]] | None, str | None]:
+    """读取上一次成功推送的指标快照（若跨天则失效）。"""
+    init_dedup_db()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DEDUP_DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT push_date, pushed_at, snapshot_json FROM pushed_snapshots WHERE task_id = ?",
+            (task_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        push_date, pushed_at, snapshot_json = row
+        if push_date != today_str:
+            return None, None
+        try:
+            return json.loads(snapshot_json), pushed_at
+        except Exception:
+            return None, None
+
+
+def record_push_snapshot(snapshot: dict[str, Any], task_id: str = "") -> None:
+    """记录本次推送的指标快照作为下次增量对比基准。"""
+    init_dedup_db()
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_str = datetime.now(timezone.utc).strftime("%H:%M")
+    with sqlite3.connect(DEDUP_DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pushed_snapshots VALUES (?, ?, ?, ?)",
+            (task_id, today_str, now_str, json.dumps(snapshot)),
+        )
         conn.commit()
 
 
@@ -444,13 +489,51 @@ def push_feishu_card(
             ),
         }
 
+    current_sales_snapshot: dict[str, dict[str, float]] = {}
     if mode == "broadcast" and HAS_SHARED_SALES_CARD:
+        last_metrics, prev_time = get_last_push_snapshot(task_id or "")
+        for item in items:
+            cat = str(item.get("category") or item.get("_channel") or "").strip()
+            id_name = str(item.get("item") or item.get("name") or item.get("sku_id") or "").strip()
+            key = f"{cat}:{id_name}" if cat else id_name
+            if not key:
+                continue
+            try:
+                net = float(item.get("净销_万") or item.get("price") or 0.0)
+                ops = float(item.get("运营净销_万") or 0.0)
+                live = float(item.get("达播净销_万") or 0.0)
+                current_sales_snapshot[key] = {"net": net, "ops": ops, "live": live}
+            except (ValueError, TypeError):
+                continue
+
+            if is_first_push:
+                item["环比增量_万"] = 0.0
+                item["运营增量_万"] = 0.0
+                item["达播增量_万"] = 0.0
+                if "diff_amount" in item:
+                    item["diff_amount"] = 0.0
+            elif last_metrics:
+                prev = last_metrics.get(key)
+                if not prev and id_name:
+                    for k, v in last_metrics.items():
+                        if k.endswith(f":{id_name}") or k == id_name:
+                            prev = v
+                            break
+                if prev:
+                    item["环比增量_万"] = round(net - float(prev.get("net", net)), 2)
+                    item["diff_amount"] = item["环比增量_万"]
+                    if "运营净销_万" in item or "运营增量_万" in item:
+                        item["运营增量_万"] = round(ops - float(prev.get("ops", ops)), 2)
+                    if "达播净销_万" in item or "达播增量_万" in item:
+                        item["达播增量_万"] = round(live - float(prev.get("live", live)), 2)
+
         payload = build_sales_feishu_card(
             items,
             title=task_title or "📊 实时销售播报",
             is_first_push=is_first_push,
             at_users=target_users,
             should_at_all=should_at_all,
+            prev_push_time=prev_time,
         )
     else:
         # 格式化巡检/通用卡片明细
@@ -601,6 +684,8 @@ def push_feishu_card(
                             str(item.get("current_price") or item.get("price") or ""),
                         )
                     record_daily_pushed(task_id or "")
+                    if current_sales_snapshot:
+                        record_push_snapshot(current_sales_snapshot, task_id or "")
                     sent_cnt = resp_json.get("sent_count", 0)
                     failed_cnt = resp_json.get("failed_count", 0)
                     msg = f"成功发送至 {sent_cnt} 个目标"
@@ -622,6 +707,8 @@ def push_feishu_card(
                     str(item.get("current_price") or item.get("price") or ""),
                 )
             record_daily_pushed(task_id or "")
+            if current_sales_snapshot:
+                record_push_snapshot(current_sales_snapshot, task_id or "")
             return {"push_status": "success", "pushed_count": len(items)}
         return {"push_status": "failed", "message": f"飞书返回 HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:  # noqa: BLE001

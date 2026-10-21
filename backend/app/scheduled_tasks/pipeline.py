@@ -15,10 +15,6 @@ from sqlmodel import Session, select
 from app.api.mock import FeishuAppNotifyRequest, feishu_app_notify
 from app.data_query.service import execute_query_by_id
 from app.db.models import ChatSession, Message, ScheduledTask, ScheduledTaskRun, utc_now
-
-logger = logging.getLogger(__name__)
-
-
 from app.scheduled_tasks.renderers import (
     CARD_RENDERERS,
     build_generic_feishu_card,
@@ -26,6 +22,8 @@ from app.scheduled_tasks.renderers import (
     get_card_renderer,
 )
 from app.scheduled_tasks.renderers.base import fmt_diff_styled, fmt_val_styled
+
+logger = logging.getLogger(__name__)
 
 # Backward compatibility alias
 _fmt_val_styled = fmt_val_styled
@@ -37,13 +35,113 @@ __all__ = [
     "_build_generic_feishu_card",
     "_fmt_diff_styled",
     "_fmt_val_styled",
+    "apply_push_incremental_diff",
     "build_generic_feishu_card",
     "build_sales_feishu_card",
     "execute_pipeline_scheduled_task",
+    "extract_sales_push_snapshot",
     "get_card_renderer",
     "is_task_first_push_today",
+    "sanitize_hourly_cumulative_trend",
 ]
 
+
+def sanitize_hourly_cumulative_trend(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """对 24 小时分时段累计数据执行 Forward-Fill 结转与当前小时大盘快照校准。
+
+    业务背景：
+    分时走势图展示的是「当日累计销售额」。当定时任务在整点过几分钟（如 09:03）执行时，
+    当前小时由于各店铺异步抓取时延，仅有部分店铺入库，导致当前小时的累计值断崖式低于上一小时。
+    保底校准规则：
+    1. 提取大盘/电商整体当前的最新累计总净销；
+    2. 按 00时..23时 顺序遍历，保证累计序列单调不减（Forward-Fill）；
+    3. 当前最后一个有数据的小时若低于大盘总净销，向前补齐至大盘总净销；
+    4. 未到达的未来时段保持 0.0。
+    """
+    total_net: float | None = None
+    for r in rows:
+        cat = str(r.get("category") or "").strip()
+        item = str(r.get("item") or r.get("name") or "").strip()
+        if (cat == "大盘" and item == "电商整体") or item == "电商整体":
+            try:
+                total_net = float(r.get("净销_万") or r.get("price") or 0.0)
+                break
+            except (ValueError, TypeError):
+                pass
+
+    hourly_rows = [
+        r for r in rows
+        if str(r.get("category") or "").strip() in ("24小时环比", "hourly_trend")
+    ]
+    if not hourly_rows:
+        return rows
+
+    def _parse_hour(r: dict[str, Any]) -> int:
+        it = str(r.get("item") or r.get("hour") or "").strip()
+        digits = "".join(ch for ch in it if ch.isdigit())
+        return int(digits) if digits else -1
+
+    valid_entries: list[tuple[int, dict[str, Any]]] = []
+    for r in hourly_rows:
+        hr_val = _parse_hour(r)
+        if 0 <= hr_val <= 23:
+            valid_entries.append((hr_val, r))
+    valid_entries.sort(key=lambda x: x[0])
+
+    if not valid_entries:
+        return rows
+
+    last_active_idx = -1
+    for idx, (_h, r) in enumerate(valid_entries):
+        curr_val = float(r.get("运营净销_万") or r.get("净销_万") or 0.0)
+        if curr_val > 0:
+            last_active_idx = idx
+
+    if last_active_idx < 0:
+        return rows
+
+    max_seen = 0.0
+    for idx, (_h, r) in enumerate(valid_entries):
+        if idx > last_active_idx:
+            continue
+
+        curr_val = float(r.get("运营净销_万") or r.get("净销_万") or 0.0)
+        if idx == last_active_idx and total_net is not None and total_net > max_seen:
+            curr_val = max(curr_val, total_net)
+
+        if curr_val < max_seen:
+            curr_val = max_seen
+        else:
+            max_seen = curr_val
+
+        curr_val = round(curr_val, 2)
+        r["运营净销_万"] = curr_val
+        r["净销_万"] = curr_val
+
+        if "运营增量_万" in r:
+            yest_val = float(r.get("运营增量_万") or 0.0)
+            r["环比增量_万"] = round(curr_val - yest_val, 2)
+
+    return rows
+
+
+def _run_has_successful_push(run: ScheduledTaskRun) -> bool:
+    """该 run 是否真的成功推送过飞书（notify 步骤存在且 notify_res.ok）。
+
+    仅凭 ``run.status == "succeeded"`` 不够：只取数、推送被关闭的 run 同样会标记
+    succeeded，若把它算作“当日已推送”，当天真正的首推会被误判为非首推，增量归零失效。
+    """
+
+    trace = run.trace_json if isinstance(run.trace_json, dict) else {}
+    for step in trace.get("step_results") or []:
+        if not isinstance(step, dict):
+            continue
+        if step.get("type") not in ("skill_notify", "feishu_notify", "notify"):
+            continue
+        notify_res = step.get("notify_res")
+        if isinstance(notify_res, dict) and notify_res.get("ok"):
+            return True
+    return False
 
 
 def is_task_first_push_today(
@@ -95,7 +193,7 @@ def is_task_first_push_today(
 
     succeeded_today = [
         r for r in runs
-        if r.created_at and (
+        if r.created_at and _run_has_successful_push(r) and (
             r.created_at.replace(tzinfo=UTC).astimezone(cst)
             if r.created_at.tzinfo is None
             else r.created_at.astimezone(cst)
@@ -103,6 +201,101 @@ def is_task_first_push_today(
     ]
 
     return len(succeeded_today) == 0
+
+
+def extract_sales_push_snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """从查询结果行中提取核心指标与各维度累计值快照。"""
+    snapshot: dict[str, dict[str, float]] = {}
+    for r in rows:
+        cat = str(r.get("category") or "").strip()
+        item = str(r.get("item") or r.get("name") or "").strip()
+        key = f"{cat}:{item}" if cat else item
+        if not key:
+            continue
+        try:
+            net = float(r.get("净销_万") or r.get("price") or 0.0)
+            ops = float(r.get("运营净销_万") or 0.0)
+            live = float(r.get("达播净销_万") or 0.0)
+            snapshot[key] = {
+                "net": net,
+                "ops": ops,
+                "live": live,
+            }
+        except (ValueError, TypeError):
+            continue
+    return snapshot
+
+
+def apply_push_incremental_diff(
+    rows: list[dict[str, Any]],
+    task: ScheduledTask,
+    is_first_push: bool,
+    db: Session,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
+    """基于上一次成功推送的历史快照，在内存中重新计算各维度与大盘的增量差值。
+
+    返回: (处理后的行列表, 本次快照数据字典, 上次推送时间字符串或None)
+    """
+    rows = sanitize_hourly_cumulative_trend(rows)
+    current_snapshot = extract_sales_push_snapshot(rows)
+    cst = timezone(timedelta(hours=8))
+    today_cst_str = datetime.now(cst).strftime("%Y-%m-%d")
+
+    metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
+    last_record = metadata.get("last_push_snapshot")
+    prev_push_time: str | None = None
+    last_metrics: dict[str, dict[str, float]] | None = None
+
+    if not is_first_push and isinstance(last_record, dict) and last_record.get("date") == today_cst_str:
+        last_metrics = last_record.get("metrics")
+        prev_push_time = last_record.get("pushed_at")
+
+    # 如果是当日首次推送，所有增量统一归零（保证首播不出现异常跨日大差值）
+    if is_first_push:
+        for r in rows:
+            cat = str(r.get("category") or "").strip()
+            if cat in ("24小时环比", "hourly_trend"):
+                continue
+            r["环比增量_万"] = 0.0
+            r["运营增量_万"] = 0.0
+            r["达播增量_万"] = 0.0
+            if "diff_amount" in r:
+                r["diff_amount"] = 0.0
+        return rows, current_snapshot, None
+
+    # 如果非首次推送且存在上一轮成功推送快照，执行快照差值计算
+    if last_metrics:
+        for r in rows:
+            cat = str(r.get("category") or "").strip()
+            if cat in ("24小时环比", "hourly_trend"):
+                continue
+            item = str(r.get("item") or r.get("name") or "").strip()
+            key = f"{cat}:{item}" if cat else item
+            prev = last_metrics.get(key)
+            if not prev and item:
+                for k, v in last_metrics.items():
+                    if k.endswith(f":{item}") or k == item:
+                        prev = v
+                        break
+
+            if prev:
+                curr_net = float(r.get("净销_万") or r.get("price") or 0.0)
+                prev_net = float(prev.get("net", curr_net))
+                diff_net = round(curr_net - prev_net, 2)
+                r["环比增量_万"] = diff_net
+                r["diff_amount"] = diff_net
+
+                if "运营净销_万" in r or "运营增量_万" in r:
+                    curr_ops = float(r.get("运营净销_万") or 0.0)
+                    prev_ops = float(prev.get("ops", curr_ops))
+                    r["运营增量_万"] = round(curr_ops - prev_ops, 2)
+
+                if "达播净销_万" in r or "达播增量_万" in r:
+                    curr_live = float(r.get("达播净销_万") or 0.0)
+                    prev_live = float(prev.get("live", curr_live))
+                    r["达播增量_万"] = round(curr_live - prev_live, 2)
+
+    return rows, current_snapshot, prev_push_time
 
 
 def execute_pipeline_scheduled_task(
@@ -122,6 +315,9 @@ def execute_pipeline_scheduled_task(
     steps = task.pipeline_steps_json or []
     query_rows: list[dict[str, Any]] = []
     step_results: list[dict[str, Any]] = []
+    # Notify 分支才会赋值；空 steps / 仅 query / 推送关闭的任务也必须能收尾。
+    prev_push_time: str | None = None
+    current_snapshot: dict[str, dict[str, float]] = {}
     is_first_push = is_task_first_push_today(task, run, db)
     if is_first_push:
         logger.info(
@@ -159,12 +355,13 @@ def execute_pipeline_scheduled_task(
                 params = dict(step.get("params") or {})
                 params["is_first_push"] = is_first_push
                 query_res = execute_query_by_id(db, template_id, task.tenant_id, params)
-                query_rows = query_res.rows
+                step_rows = list(query_res.rows or [])
+                query_rows.extend(step_rows)
                 step_results.append({
                     "step": idx,
                     "type": "query",
                     "template_id": template_id,
-                    "rows_count": len(query_rows),
+                    "rows_count": len(step_rows),
                     "execution_time_ms": query_res.execution_time_ms,
                     "is_first_push": is_first_push,
                 })
@@ -172,7 +369,7 @@ def execute_pipeline_scheduled_task(
                     "Pipeline step %d (query): template %s returned %d rows in %.2fms (is_first_push=%s)",
                     idx,
                     template_id,
-                    len(query_rows),
+                    len(step_rows),
                     query_res.execution_time_ms,
                     is_first_push,
                 )
@@ -190,6 +387,15 @@ def execute_pipeline_scheduled_task(
                     })
                     continue
 
+                # 核心：计算较上一轮实际推送的增量差值
+                from app.reporting.sales_metrics import inject_dabo_matrix_rows
+
+                query_rows = inject_dabo_matrix_rows(query_rows)
+
+                processed_rows, current_snapshot, prev_push_time = apply_push_incremental_diff(
+                    query_rows, task, is_first_push, db
+                )
+
                 renderer_name = (
                     step.get("renderer")
                     or (step.get("params") or {}).get("renderer")
@@ -197,12 +403,74 @@ def execute_pipeline_scheduled_task(
                     or "sales_card"
                 )
                 renderer_func = get_card_renderer(renderer_name)
+                card_params = dict(step.get("card_params") or {})
+                if prev_push_time and "prev_push_time" not in card_params:
+                    card_params["prev_push_time"] = prev_push_time
+
                 card_payload = renderer_func(
-                    query_rows,
+                    processed_rows,
                     title=task.title,
                     is_first_push=is_first_push,
-                    **(step.get("card_params") or {}),
+                    **card_params,
                 )
+
+                from app.scheduled_tasks.service import resolve_task_share_link_url
+
+                try:
+                    from app.reporting.realtime_dashboard_syncer import sync_task_artifact_report
+
+                    sync_task_artifact_report(db, task, query_rows)
+                except Exception as sync_err:  # noqa: BLE001
+                    logger.warning("Pipeline step %d: failed to sync artifact report: %s", idx, sync_err)
+
+                artifact_url = resolve_task_share_link_url(db, task) or ""
+                if not artifact_url and not str(metadata.get("artifact_share_link_id") or "").strip():
+                    # 旧任务只在 metadata 里存过 URL（没有 link_id），保留兼容
+                    artifact_url = str(metadata.get("artifact_share_url") or "").strip()
+                artifact_title = str(metadata.get("artifact_title") or "在线交互式 HTML 报告").strip()
+                if artifact_url and isinstance(card_payload, dict):
+                    card_obj = card_payload.get("card") if isinstance(card_payload.get("card"), dict) else card_payload
+                    is_schema_v2 = card_obj.get("schema") == "2.0" or "body" in card_obj
+                    btn_text = f"📊 查看完整 HTML 报告: {artifact_title}"
+                    if is_schema_v2:
+                        card_body = card_obj.get("body", {}) if isinstance(card_obj.get("body"), dict) else {}
+                        elements = card_body.get("elements")
+                        if isinstance(elements, list):
+                            elements.append({
+                                "tag": "button",
+                                "text": {
+                                    "tag": "plain_text",
+                                    "content": btn_text,
+                                },
+                                "type": "primary",
+                                "behaviors": [
+                                    {
+                                        "type": "open_url",
+                                        "default_url": artifact_url,
+                                        "pc_url": artifact_url,
+                                        "android_url": artifact_url,
+                                        "ios_url": artifact_url,
+                                    }
+                                ],
+                            })
+                    else:
+                        card_body = card_obj.get("body", {}) if isinstance(card_obj.get("body"), dict) else {}
+                        elements = card_body.get("elements") or card_obj.get("elements")
+                        if isinstance(elements, list):
+                            elements.append({
+                                "tag": "action",
+                                "actions": [
+                                    {
+                                        "tag": "button",
+                                        "text": {
+                                            "tag": "plain_text",
+                                            "content": btn_text,
+                                        },
+                                        "type": "primary",
+                                        "url": artifact_url,
+                                    }
+                                ],
+                            })
                 notify_req = FeishuAppNotifyRequest(
                     scheduled_task_id=task.id,
                     tenant_id=task.tenant_id,
@@ -222,7 +490,25 @@ def execute_pipeline_scheduled_task(
                 if not notify_res.get("ok"):
                     err = notify_res.get("error") or "飞书推送失败"
                     raise RuntimeError(f"飞书推送失败: {err}")
+
+                # 推送成功，原子持久化本次快照作为下次执行的增量对比基准
+                if current_snapshot:
+                    cst = timezone(timedelta(hours=8))
+                    now_cst = datetime.now(cst)
+                    updated_meta = dict(task.metadata_json or {})
+                    updated_meta["last_push_snapshot"] = {
+                        "date": now_cst.strftime("%Y-%m-%d"),
+                        "pushed_at": now_cst.strftime("%H:%M"),
+                        "metrics": current_snapshot,
+                    }
+                    task.metadata_json = updated_meta
+                    db.add(task)
+                    db.commit()
+
                 logger.info("Pipeline step %d (notify): push succeeded: %s", idx, notify_res)
+
+            else:
+                raise ValueError(f"未知的流水线步骤类型: {step_type}")
 
         # Mark succeeded
         run.status = "succeeded"
@@ -239,6 +525,8 @@ def execute_pipeline_scheduled_task(
             "steps_count": len(steps),
             "step_results": step_results,
             "rows_count": len(query_rows),
+            "snapshot_applied": bool(prev_push_time),
+            "prev_push_time": prev_push_time,
         }
         run.finished_at = utc_now()
 

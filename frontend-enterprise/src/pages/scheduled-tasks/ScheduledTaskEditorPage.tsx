@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { notify } from '@/components/ui/app-toast';
+import { copyTextToClipboard } from '@/lib/clipboard';
 import { getClientTimeZone } from '@/lib/timezone';
 
 import AppHeader from '@/components/AppHeader';
@@ -25,6 +26,8 @@ import {
   Bot,
   CheckCircle2,
   Copy,
+  ExternalLink,
+  FileCode,
   Link2,
   Plus,
   RotateCw,
@@ -36,6 +39,8 @@ import {
   Users,
   X,
 } from 'lucide-react';
+
+import FeishuChatPicker from './FeishuChatPicker';
 
 import SearchableSelect, { type SearchableSelectOption } from '@/components/SearchableSelect';
 
@@ -110,6 +115,27 @@ function ScheduledTaskEditorPage({
   const [mobileInput, setMobileInput] = useState('');
   const [webhookInput, setWebhookInput] = useState('');
   const [newTimeInput, setNewTimeInput] = useState('13:00');
+  const [shareLinks, setShareLinks] = useState<
+    Array<{ id: string; title: string | null; url: string; created_at: string; status: string }>
+  >([]);
+  const [selectedShareLinkId, setSelectedShareLinkId] = useState<string>('');
+
+  const shareLinkOptions: SearchableSelectOption[] = useMemo(
+    () => [
+      { value: '', label: '不关联任何 HTML 报告' },
+      ...shareLinks.map((link) => ({
+        value: link.id,
+        label: link.title || '未命名数据大屏',
+        keywords: [link.title || '', link.id],
+      })),
+    ],
+    [shareLinks],
+  );
+
+  const currentShareLink = useMemo(
+    () => shareLinks.find((l) => l.id === selectedShareLinkId) || null,
+    [shareLinks, selectedShareLinkId],
+  );
 
   const dailyTimes = values.times && values.times.length > 0 ? values.times : [values.time || '09:00'];
 
@@ -245,6 +271,23 @@ function ScheduledTaskEditorPage({
       )
       .then((res) => {
         if (!cancelled) setFeishuRecipients(res || []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{ items: Array<{ id: string; title: string | null; url: string; created_at: string; status: string }> }>(
+        '/api/chat/artifacts/share-links?status=active',
+      )
+      .then((res) => {
+        if (!cancelled && res?.items) {
+          setShareLinks(res.items);
+        }
       })
       .catch(() => {});
     return () => {
@@ -477,6 +520,7 @@ function ScheduledTaskEditorPage({
   useEffect(() => {
     if (!isEdit) {
       setValues(INITIAL_VALUES);
+      setSelectedShareLinkId('');
       return;
     }
     if (!taskId) return;
@@ -487,6 +531,11 @@ function ScheduledTaskEditorPage({
         setAgentId(row.agent_id);
         setTaskMetadata(row.metadata || {});
         setValues(taskToFormValues(row));
+        if (row.metadata?.artifact_share_link_id) {
+          setSelectedShareLinkId(String(row.metadata.artifact_share_link_id));
+        } else {
+          setSelectedShareLinkId('');
+        }
       })
       .catch((error) => notify.error(error instanceof Error ? error.message : '加载定时任务失败'))
       .finally(() => setLoading(false));
@@ -563,6 +612,18 @@ function ScheduledTaskEditorPage({
       delete metadata.sop_version_policy;
       delete metadata.sop_version;
     }
+    if (selectedShareLinkId) {
+      const boundLink = shareLinks.find((l) => l.id === selectedShareLinkId);
+      if (boundLink) {
+        metadata.artifact_share_link_id = boundLink.id;
+        metadata.artifact_share_url = boundLink.url;
+        metadata.artifact_title = boundLink.title || '数据报表';
+      }
+    } else {
+      delete metadata.artifact_share_link_id;
+      delete metadata.artifact_share_url;
+      delete metadata.artifact_title;
+    }
     const payload = {
       tenant_id: TENANT_ID,
       agent_id: agentId,
@@ -590,6 +651,11 @@ function ScheduledTaskEditorPage({
       } else {
         setTaskMetadata(saved.metadata || {});
         setValues(taskToFormValues(saved));
+        if (saved.metadata?.artifact_share_link_id) {
+          setSelectedShareLinkId(String(saved.metadata.artifact_share_link_id));
+        } else {
+          setSelectedShareLinkId('');
+        }
       }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '保存定时任务失败');
@@ -688,7 +754,7 @@ function ScheduledTaskEditorPage({
               </Label>
               <Textarea
                 id="task-prompt"
-                rows={7}
+                rows={6}
                 maxLength={10000}
                 className={cn(errors.prompt && 'border-destructive')}
                 placeholder="描述员工每次执行时需要做什么，可以包含拆解要求、输出格式和注意事项。"
@@ -770,10 +836,9 @@ function ScheduledTaskEditorPage({
               <Label htmlFor="task-description" className={FIELD_LABEL_CLASS}>
                 内部备注
               </Label>
-              <Textarea
+              <Input
                 id="task-description"
-                rows={3}
-                placeholder="可选，用于说明这个定时任务的来源和目的"
+                placeholder="可选，用于说明这个定时任务的业务来源和目的"
                 value={values.description || ''}
                 onChange={(event) => update('description', event.target.value)}
               />
@@ -1043,13 +1108,13 @@ function ScheduledTaskEditorPage({
               </div>
               <div>
                 <h3 className="text-[14px] font-semibold text-[#18181a] flex items-center gap-2">
-                  飞书消息通知配置
+                  飞书消息通知与大屏推送
                   <span className="rounded-full bg-[#e8f0ff] px-2 py-0.5 text-[11px] font-medium text-[#3370ff]">
                     独立配置 · 任务隔离
                   </span>
                 </h3>
                 <p className="text-[12px] text-[#858b9c]">
-                  每个定时任务独立配置推送目标（群聊、责任人、Webhook），任务间互不影响。
+                  任务执行完成后，自动向群聊、责任人或 Webhook 推送卡片，并可随附在线交互大屏。
                 </p>
               </div>
             </div>
@@ -1151,9 +1216,118 @@ function ScheduledTaskEditorPage({
             </div>
           )}
 
-          {values.feishu_notify.enabled && (
-            <div className="mt-[20px] flex flex-col gap-[20px]">
-              {/* 子模块 1: 飞书自建应用通道 (多群聊 + 责任人私聊) */}
+          <div className="mt-[20px] flex flex-col gap-[20px]">
+            {/* 子模块 0: 随附在线 HTML 交互大屏 */}
+            <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] p-[16px] flex flex-col gap-[14px]">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="flex size-[22px] items-center justify-center rounded-[6px] bg-[#3370ff]/10 text-[#3370ff]">
+                    <FileCode className="size-3.5" />
+                  </div>
+                  <h4 className="text-[13px] font-semibold text-[#18181a]">
+                    随附在线 HTML 交互大屏
+                  </h4>
+                  <span className="rounded-full bg-[#f1f3f7] px-2 py-0.5 text-[10px] font-medium text-[#5a6275]">
+                    可选
+                  </span>
+                </div>
+                <a
+                  href="/enterprise/share-links"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[12px] text-[#3370ff] hover:underline flex items-center gap-1 cursor-pointer"
+                >
+                  <span>管理全部 HTML 链接</span>
+                  <ExternalLink className="size-3" />
+                </a>
+              </div>
+
+              {currentShareLink ? (
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3.5 rounded-[10px] border border-[#dbeafe] bg-[#f8faff]">
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
+                    <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[#2563eb]/10 text-[#2563eb]">
+                      <FileCode className="size-5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[13px] font-semibold text-[#1e3a8a] truncate">
+                          {currentShareLink.title || '未命名数据大屏'}
+                        </span>
+                        <span className="rounded-full bg-[#dcfce7] px-2 py-0.5 text-[10px] font-medium text-[#15803d] shrink-0">
+                          已绑定 · 有效
+                        </span>
+                      </div>
+                      <span className="text-[11px] font-mono text-[#6b7280] truncate block max-w-full">
+                        {currentShareLink.url}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        void copyTextToClipboard(currentShareLink.url);
+                        notify.success('大屏地址已复制');
+                      }}
+                      className="h-7 text-[12px] gap-1 cursor-pointer"
+                    >
+                      <Copy className="size-3" />
+                      复制链接
+                    </Button>
+                    <a
+                      href={currentShareLink.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-[12px] font-medium text-[#2563eb] hover:underline px-2 py-1"
+                    >
+                      <span>在浏览器预览</span>
+                      <ExternalLink className="size-3" />
+                    </a>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setSelectedShareLinkId('')}
+                      className="h-7 text-[12px] text-[#858b9c] hover:text-[#d20b0b] px-2 cursor-pointer"
+                    >
+                      移除随附
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-[6px]">
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1">
+                      <SearchableSelect
+                        value={selectedShareLinkId}
+                        onValueChange={(val) => setSelectedShareLinkId(val)}
+                        options={shareLinkOptions}
+                        placeholder="选择要随卡片附带的在线 HTML 报告（可选）"
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => window.open('/enterprise/share-links', '_blank')}
+                      className="shrink-0 text-[12px] text-[#3370ff] border-[#3370ff]/30 hover:bg-[#3370ff]/5 cursor-pointer"
+                    >
+                      <Plus className="size-3.5 mr-1" />
+                      语义新建 HTML 报告
+                    </Button>
+                  </div>
+                  <p className="text-[12px] leading-[18px] text-[#858b9c]">
+                    绑定后，任务执行并向飞书推送卡片时，将附带此交互式报告直达卡片。
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {values.feishu_notify.enabled ? (
+              <>
+                {/* 子模块 1: 飞书自建应用通道 (多群聊 + 责任人私聊) */}
               <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] p-[16px] flex flex-col gap-[16px]">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -1224,11 +1398,12 @@ function ScheduledTaskEditorPage({
                   )}
                 </div>
 
+                <div className="grid w-full max-w-[1080px] grid-cols-1 items-start gap-6 lg:grid-cols-2">
                 {/* 1.1 目标群聊多选 */}
                 <div className="flex flex-col gap-[8px]">
                   <div className="flex items-center justify-between">
                     <Label className={FIELD_LABEL_CLASS}>
-                      目标群聊（可多选多个群）
+                      目标群聊
                     </Label>
                     <span className="text-[12px] text-[#858b9c]">
                       已选{' '}
@@ -1239,76 +1414,29 @@ function ScheduledTaskEditorPage({
                     </span>
                   </div>
 
-                  {feishuChats.length === 0 ? (
-                    <div
-                      className={cn(
-                        'rounded-[8px] border border-dashed bg-white p-[16px] text-center text-[12px]',
-                        chatsError
-                          ? 'border-[#f38989] text-[#d20b0b]'
-                          : 'border-[#ccd3e0] text-[#858b9c]',
-                      )}
-                    >
-                      {chatsError
-                        ? chatsError
-                        : loadingChats
-                          ? '正在连接飞书应用拉取群聊列表中...'
-                          : boundAppUnavailable
-                            ? '所选飞书应用已停用，无法拉取群聊或反查手机号。'
-                            : '未检测到应用机器人已加入的飞书群聊。请在飞书群中将本应用机器人拉入群聊，然后点击右上角「刷新应用群列表」即可多选勾选。'}
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-[8px] max-h-[220px] overflow-y-auto p-1 border border-[#eef0f4] rounded-[8px] bg-white">
-                      {feishuChats.map((chat) => {
-                        const isSelected = (values.feishu_notify.chat_ids || []).includes(
-                          chat.chat_id,
-                        );
-                        return (
-                          <div
-                            key={chat.chat_id}
-                            onClick={() => {
-                              if (appTargetDisabled) return;
-                              toggleChat(chat.chat_id, chat.name);
-                            }}
-                            className={cn(
-                              'flex items-center gap-[10px] p-[10px] rounded-[8px] border transition-all',
-                              appTargetDisabled &&
-                                'cursor-not-allowed border-[#eef0f4] bg-white opacity-60',
-                              !appTargetDisabled &&                                (isSelected
-                                  ? 'cursor-pointer border-[#3370ff] bg-[#3370ff]/5 ring-1 ring-[#3370ff]/30'
-                                  : 'cursor-pointer border-[#eef0f4] bg-white hover:border-[#ccd3e0] hover:bg-[#fafbfc]'),
-                            )}
-                          >
-                            <Checkbox
-                              checked={isSelected}
-                              onCheckedChange={() => toggleChat(chat.chat_id, chat.name)}
-                              className="pointer-events-none"
-                            />
-                            <div className="flex size-[28px] shrink-0 items-center justify-center rounded-full bg-[#f0f2f5] text-[#858b9c]">
-                              <Users className="size-3.5" />
-                            </div>
-                            <div className="flex flex-col min-w-0 flex-1">
-                              <span className="text-[13px] font-medium text-[#18181a] truncate">
-                                {chat.name}
-                              </span>
-                              <span className="text-[11px] text-[#858b9c] font-mono truncate">
-                                {chat.chat_id}
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                  <FeishuChatPicker
+                    key={selectedBindingId}
+                    chats={feishuChats}
+                    selected={(values.feishu_notify.chat_ids || []).map((id, index) => ({
+                      chat_id: id,
+                      name: feishuChats.find((chat) => chat.chat_id === id)?.name
+                        || values.feishu_notify.chat_names?.[index] || '未命名群聊',
+                    }))}
+                    onToggle={toggleChat}
+                    disabled={appTargetDisabled}
+                    loading={loadingChats}
+                    error={chatsError}
+                  />
                   <p className="text-[12px] leading-[18px] text-[#858b9c]">
-                    勾选的群聊将在任务执行完毕后并行接收卡片，支持按需多选多个业务群或监控群。
+                    按群名称搜索，可选择多个群接收任务卡片。
                   </p>
                 </div>
 
                 {/* 1.2 责任人 (私聊直达 · 支持 OpenID / 手机号) */}
-                <div className="flex flex-col gap-[8px] pt-[8px] border-t border-[#eef0f4]">
+                <div className="flex min-w-0 flex-col gap-[8px] border-t border-[#eef0f4] pt-4 lg:border-l lg:border-t-0 lg:pl-6 lg:pt-0">
                   <div className="flex items-center justify-between">
                     <Label className={FIELD_LABEL_CLASS}>
-                      接收责任人 (私聊直达 · 支持飞书 OpenID / 手机号)
+                      接收责任人
                     </Label>
                     <span className="text-[12px] text-[#858b9c]">
                       已添加{' '}
@@ -1395,12 +1523,12 @@ function ScheduledTaskEditorPage({
                   )}
 
                   {/* 输入框与添加按钮 */}
-                  <div className="flex items-center gap-[8px]">
-                    <div className="relative flex-1">
+                  <div className="flex w-full max-w-[480px] flex-wrap items-center gap-[8px]">
+                    <div className="relative min-w-[160px] flex-1">
                       <Smartphone className="pointer-events-none absolute left-[10px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
                       <Input
                         className="pl-[30px]"
-                        placeholder="输入责任人 OpenID (ou_...) 或手机号，支持逗号或空格分隔，按回车添加"
+                        placeholder="输入 OpenID 或手机号，回车添加"
                         value={mobileInput}
                         disabled={appTargetDisabled}
                         onChange={(e) => setMobileInput(e.target.value)}
@@ -1424,107 +1552,130 @@ function ScheduledTaskEditorPage({
                     </Button>
                   </div>
 
-                  <div className="rounded-[8px] bg-[#fffbe6] border border-[#ffe58f] p-[10px] text-[12px] text-[#ad6800] flex flex-col gap-1.5">
-                    <p className="font-medium flex items-center gap-1">
-                      <AlertCircle className="size-3.5 shrink-0" />
-                      手机号推送提示（飞书权限说明）：
-                    </p>
+                  <details className="rounded-[8px] border border-[#eef0f4] bg-white p-[10px] text-[12px] text-[#858b9c]">
+                    <summary className="cursor-pointer text-[#626b7d]">
+                      <AlertCircle className="mr-1 inline-block size-3.5 align-text-bottom" />
+                      手机号推送与权限说明
+                    </summary>
                     <p className="leading-[18px]">
                       通过手机号私聊需飞书自建应用开通敏感权限 <code>contact:user.phone:readonly</code>。若未开通，飞书官方会拒绝返回用户标识。
                     </p>
                     <p className="leading-[18px] text-[#593800]">
                       <strong>💡 免权限 20 秒直达方案：</strong>让该责任人在飞书中搜索机器人（或应用名称）发送任意私聊（如发“你好”），系统即可自动识别并在上方的「快捷添加系统已绑定用户」中出现，点击 <strong>+</strong> 即可 100% 稳定私聊推送！
                     </p>
-                  </div>
+                  </details>
+                </div>
                 </div>
               </div>
 
-              {/* 子模块 2: 自定义群机器人 Webhook 通道 (多选/支持多个) */}
-              <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] p-[16px] flex flex-col gap-[14px]">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="size-2 rounded-full bg-[#ff7f00]" />
-                    <h4 className="text-[13px] font-semibold text-[#18181a]">
-                      自定义群机器人 Webhook 通道
-                    </h4>
-                    <span className="rounded-full bg-[#fff2e5] px-2 py-0.5 text-[10px] font-medium text-[#ff7f00]">
-                      支持配置多个 Webhook
+                {/* 子模块 2: 自定义群机器人 Webhook 通道 (多选/支持多个) */}
+                <div className="rounded-[12px] border border-[#eef0f4] bg-[#fafbfc] p-[16px] flex flex-col gap-[14px]">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="size-2 rounded-full bg-[#ff7f00]" />
+                      <h4 className="text-[13px] font-semibold text-[#18181a]">
+                        自定义群机器人 Webhook 通道
+                      </h4>
+                      <span className="rounded-full bg-[#fff2e5] px-2 py-0.5 text-[10px] font-medium text-[#ff7f00]">
+                        支持配置多个 Webhook
+                      </span>
+                    </div>
+                    <span className="text-[12px] text-[#858b9c]">
+                      已配置{' '}
+                      <strong className="text-[#ff7f00]">
+                        {(values.feishu_notify.webhooks || []).length}
+                      </strong>{' '}
+                      个机器人
                     </span>
                   </div>
-                  <span className="text-[12px] text-[#858b9c]">
-                    已配置{' '}
-                    <strong className="text-[#ff7f00]">
-                      {(values.feishu_notify.webhooks || []).length}
-                    </strong>{' '}
-                    个机器人
-                  </span>
-                </div>
 
-                {/* 已添加 Webhook 列表 */}
-                {(values.feishu_notify.webhooks || []).length > 0 && (
-                  <div className="flex flex-col gap-[6px]">
-                    {values.feishu_notify.webhooks.map((wh, idx) => (
-                      <div
-                        key={idx}
-                        className="flex items-center justify-between gap-[10px] p-[8px] px-[12px] rounded-[8px] bg-white border border-[#eef0f4]"
-                      >
-                        <div className="flex items-center gap-[8px] min-w-0 flex-1">
-                          <Link2 className="size-3.5 text-[#ff7f00] shrink-0" />
-                          <span className="text-[11px] font-mono text-[#858b9c] shrink-0">
-                            Webhook #{idx + 1}
-                          </span>
-                          <span
-                            className="text-[12px] font-mono text-[#18181a] truncate"
-                            title={wh}
-                          >
-                            {wh}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => removeWebhook(idx)}
-                          className="text-[#858b9c] hover:text-[#d20b0b] cursor-pointer p-1"
+                  {/* 已添加 Webhook 列表 */}
+                  {(values.feishu_notify.webhooks || []).length > 0 && (
+                    <div className="flex flex-col gap-[6px]">
+                      {values.feishu_notify.webhooks.map((wh, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between gap-[10px] p-[8px] px-[12px] rounded-[8px] bg-white border border-[#eef0f4]"
                         >
-                          <Trash2 className="size-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                          <div className="flex items-center gap-[8px] min-w-0 flex-1">
+                            <Link2 className="size-3.5 text-[#ff7f00] shrink-0" />
+                            <span className="text-[11px] font-mono text-[#858b9c] shrink-0">
+                              Webhook #{idx + 1}
+                            </span>
+                            <span
+                              className="text-[12px] font-mono text-[#18181a] truncate"
+                              title={wh}
+                            >
+                              {wh}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeWebhook(idx)}
+                            className="text-[#858b9c] hover:text-[#d20b0b] cursor-pointer p-1"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
-                {/* Webhook 输入行 */}
-                <div className="flex items-center gap-[8px]">
-                  <div className="relative flex-1">
-                    <Link2 className="pointer-events-none absolute left-[10px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
-                    <Input
-                      className="pl-[30px]"
-                      placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-                      value={webhookInput}
-                      onChange={(e) => setWebhookInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          addWebhooks(webhookInput);
-                        }
-                      }}
-                    />
+                  {/* Webhook 输入行 */}
+                  <div className="flex items-center gap-[8px]">
+                    <div className="relative flex-1">
+                      <Link2 className="pointer-events-none absolute left-[10px] top-1/2 size-[14px] -translate-y-1/2 text-[#858b9c]" />
+                      <Input
+                        className="pl-[30px]"
+                        placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                        value={webhookInput}
+                        onChange={(e) => setWebhookInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            addWebhooks(webhookInput);
+                          }
+                        }}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="shrink-0 text-[13px]"
+                      onClick={() => addWebhooks(webhookInput)}
+                    >
+                      <Plus className="size-3.5 mr-1" />
+                      添加 Webhook
+                    </Button>
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="shrink-0 text-[13px]"
-                    onClick={() => addWebhooks(webhookInput)}
-                  >
-                    <Plus className="size-3.5 mr-1" />
-                    添加 Webhook
-                  </Button>
+                  <p className="text-[12px] leading-[18px] text-[#858b9c]">
+                    适用于向未接入应用机器人的群或外部供应商飞书群群机器人派发卡片，支持添加多个 Webhook，调度中心将并行全部投递。
+                  </p>
                 </div>
-                <p className="text-[12px] leading-[18px] text-[#858b9c]">
-                  适用于向未接入应用机器人的群或外部供应商飞书群群机器人派发卡片，支持添加多个 Webhook，调度中心将并行全部投递。
+              </>
+            ) : (
+              <div className="rounded-[12px] border border-dashed border-[#d8dce6] bg-[#fbfcfd] p-[24px] text-center flex flex-col items-center justify-center gap-2">
+                <div className="flex size-[40px] items-center justify-center rounded-full bg-[#f1f3f7] text-[#858b9c]">
+                  <Bell className="size-5" />
+                </div>
+                <p className="text-[13px] font-semibold text-[#18181a]">
+                  当前未启用飞书消息通知推送
                 </p>
+                <p className="text-[12px] text-[#858b9c] max-w-[480px]">
+                  开启后，定时任务每次唤醒执行完成，都将自动将执行概况卡片及上方绑定的大屏直达链接推送至指定飞书群聊、责任人或 Webhook。
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => updateNotify('enabled', true)}
+                  className="mt-1 text-[12px] text-[#3370ff] border-[#3370ff]/30 hover:bg-[#3370ff]/5 cursor-pointer"
+                >
+                  立即启用飞书推送
+                </Button>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </section>
       </div>
     </div>

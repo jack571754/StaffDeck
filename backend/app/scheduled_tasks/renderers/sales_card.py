@@ -14,8 +14,41 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from app.reporting.sales_metrics import (
+    build_dabo_matrix_table_elements,
+    format_influencer_top_lines,
+    is_dabo_row,
+)
 from app.scheduled_tasks.renderers.base import fmt_diff_styled, fmt_val_styled
 from app.scheduled_tasks.renderers.generic_table import build_generic_feishu_card
+
+CANONICAL_BRAND_ORDER: tuple[str, ...] = (
+    "电商整体",
+    "可复美整体",
+    "天猫可复美",
+    "抖音可复美",
+    "京东可复美",
+    "唯品会可复美",
+    "微信视频号可复美",
+    "小红书可复美",
+    "可丽金整体",
+    "天猫可丽金",
+    "抖音可丽金",
+    "京东可丽金",
+    "唯品会可丽金",
+    "微信视频号可丽金",
+    "小红书可丽金",
+    "巨子生物",
+    "可预",
+    "分销",
+    "以我",
+)
+_CANONICAL_ORDER_MAP = {name: i for i, name in enumerate(CANONICAL_BRAND_ORDER)}
+
+
+def _build_dabo_top5_lines(dabo_rows: list[dict[str, Any]]) -> list[str]:
+    """Aggregate and format top 5 influencer real-time sales rows (in 万元)."""
+    return format_influencer_top_lines(dabo_rows, limit=5, empty_fallback="")
 
 
 def build_sales_feishu_card(
@@ -34,11 +67,17 @@ def build_sales_feishu_card(
     summary_row: dict[str, Any] | None = None
     pos_increment_shops: list[dict[str, Any]] = []
     neg_increment_shops: list[dict[str, Any]] = []
+    dabo_top_rows: list[dict[str, Any]] = []
 
     for r in rows:
         cat = str(r.get("category") or r.get("_channel") or "")
         item = str(r.get("item") or r.get("name") or "")
-        if cat in ("24小时环比", "hourly_trend"):
+        stat_dim = str(r.get("统计维度") or "").strip()
+        if is_dabo_row(r):
+            dabo_top_rows.append(r)
+        elif stat_dim or (not cat and not item):
+            continue
+        elif cat in ("24小时环比", "hourly_trend"):
             hourly_rows.append(r)
         elif cat == "大盘" and item == "电商整体":
             summary_row = r
@@ -95,6 +134,8 @@ def build_sales_feishu_card(
         update_time = update_time[5:16]
 
     card_title = title or f"📊 实时销售播报 · {update_time}（当日累计）"
+    prev_push_time = _kwargs.get("prev_push_time")
+    prev_diff_note = f"（对比 {prev_push_time} 播报）" if prev_push_time else ""
 
     # Assemble elements
     elements: list[dict[str, Any]] = [
@@ -177,14 +218,14 @@ def build_sales_feishu_card(
                     f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{tot_net:.2f}万**"
                     f"（当日首次播报，增量计为 <font color='grey'>0.00万</font>，不对比前一日数据），"
                     f"其中运营端 **{tot_ops:.2f}万**（增量 <font color='grey'>0.00万</font>）；"
-                    f"达播端 **{tot_live:.2f}万**（增量 <font color='grey'>0.00万</font>），各渠道运行平稳。"
+                    f"达播端 **{tot_live:.2f}万**（增量 <font color='grey'>0.00万</font>）。"
                 )
                 if is_first_push
                 else (
                     f"📢 **整体销售播报**：截止 {update_time}，电商整体净销 **{tot_net:.2f}万**"
-                    f"（较上一时刻增量 {fmt_diff_styled(tot_diff, is_core=True)}，"
+                    f"（较上一时刻增量{prev_diff_note} {fmt_diff_styled(tot_diff, is_core=True)}，"
                     f"其中运营端 **{tot_ops:.2f}万**，较上一时刻增量 {fmt_diff_styled(tot_ops_diff, is_core=True)}；"
-                    f"达播端 **{tot_live:.2f}万**，较上一时刻增量 {fmt_diff_styled(tot_live_diff, is_core=True)}），各渠道运行平稳。"
+                    f"达播端 **{tot_live:.2f}万**，较上一时刻增量 {fmt_diff_styled(tot_live_diff, is_core=True)}）。"
                 )
             ),
             "text_align": "left",
@@ -192,8 +233,9 @@ def build_sales_feishu_card(
         },
     ]
 
-    # Dynamic Top 5 shops
-    if not is_first_push and (pos_increment_shops or neg_increment_shops):
+    # Dynamic Top 5 shops & Top 5 influencer sales
+    dabo_lines = _build_dabo_top5_lines(dabo_top_rows)
+    if not is_first_push and (pos_increment_shops or dabo_lines or neg_increment_shops):
         pos_lines = []
         for i, s in enumerate(pos_increment_shops[:5], 1):
             name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
@@ -201,21 +243,12 @@ def build_sales_feishu_card(
             diff = float(s.get("环比增量_万") or s.get("diff_amount") or 0)
             pos_lines.append(f"{i}. **{name}**\n   增量: <font color='green'>**+{diff:.2f}万**</font> | 净销: {net:.2f}万")
 
-        neg_lines = []
-        for i, s in enumerate(neg_increment_shops[:5], 1):
-            name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
-            net = float(s.get("净销_万") or s.get("price") or 0)
-            diff = float(s.get("环比增量_万") or s.get("diff_amount") or 0)
-            diff_str = f"{diff:.2f}万" if diff < 0 else f"-{abs(diff):.2f}万"
-            neg_lines.append(f"{i}. **{name}**\n   增量: <font color='red'>**{diff_str}**</font> | 净销: {net:.2f}万")
-
-        if not neg_lines:
-            neg_lines = ["*(其余活跃店铺增量均为正或持平)*"]
+        right_lines = dabo_lines if dabo_lines else ["*(暂无达人实时销售数据)*"]
 
         elements.extend([
             {
                 "tag": "markdown",
-                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行（较上一时刻 Top 5）**",
+                "content": "**🏪 实时销售数据汇报：店铺增量与达人销售排行（Top 5）**",
                 "text_align": "left",
                 "text_size": "normal",
             },
@@ -248,7 +281,7 @@ def build_sales_feishu_card(
                         "elements": [
                             {
                                 "tag": "markdown",
-                                "content": "📉 <font color='red'>**负增量预警 Top 5**</font>\n" + "\n".join(neg_lines),
+                                "content": "🏆 <font color='blue'>**达人销售TOP 5**</font>\n" + "\n".join(right_lines),
                                 "text_size": "normal",
                             }
                         ],
@@ -257,20 +290,41 @@ def build_sales_feishu_card(
             },
         ])
     elif is_first_push:
-        elements.extend([
-            {
+        elements.append({
+            "tag": "markdown",
+            "content": "**🏪 实时销售数据汇报：店铺增量与达人销售排行**\n<font color='grey'>*(当日首次播报，增量统一计为 0.00万，不展示上一时刻店铺增量排行)*</font>",
+            "text_align": "left",
+            "text_size": "normal",
+        })
+        if dabo_lines:
+            elements.append({
                 "tag": "markdown",
-                "content": "**🏪 实时销售数据汇报：店铺正负增量动态排行**\n<font color='grey'>*(当日首次播报，增量统一计为 0.00万，不展示上一时刻店铺增量排行)*</font>",
+                "content": "🏆 <font color='blue'>**达人销售TOP 5**</font>\n" + "\n".join(dabo_lines),
                 "text_align": "left",
                 "text_size": "normal",
-            },
-            {"tag": "hr"},
-        ])
+            })
+        elements.append({"tag": "hr"})
 
-    # Table rows
+    # Table rows: strictly canonical and ordered
+    # Missing summary rows must not expose raw platform or live-stream detail rows.
+    final_brand_rows = sorted(
+        (item for item in brand_rows if item[0] in _CANONICAL_ORDER_MAP),
+        key=lambda item: _CANONICAL_ORDER_MAP[item[0]],
+    )
+
     table_rows: list[dict[str, Any]] = []
-    for display_name, r in brand_rows:
-        is_core_row = display_name in ("电商整体", "可复美整体", "可丽金整体")
+    for display_name, r in final_brand_rows:
+        is_core_row = display_name in (
+            "电商整体",
+            "可复美整体",
+            "可丽金整体",
+            "巨子生物",
+            "可预",
+            "分销",
+            "以我",
+            "1'me以我旗舰",
+            "1'me以我旗舰店",
+        )
         brand_label = f"**{display_name}**" if is_core_row else display_name
         net_diff_val = 0.0 if is_first_push else (r.get("环比增量_万") or r.get("diff_amount"))
         ops_diff_val = 0.0 if is_first_push else r.get("运营增量_万")
@@ -310,27 +364,26 @@ def build_sales_feishu_card(
                 "bold": True,
                 "lines": 1,
             },
-            "page_size": 10,
+            "page_size": 20,
         },
     ])
+
+    # 达播实时销售明细表格 (分平台 / 品牌 / 重点达人)
+    dabo_matrix_elements = build_dabo_matrix_table_elements(rows, is_first_push=is_first_push)
+    if dabo_matrix_elements:
+        elements.extend(dabo_matrix_elements)
 
     # 24h Hourly chart
     if hourly_rows:
         chart_values = []
-        if is_first_push:
-            for hr in hourly_rows:
-                h_str = str(hr.get("item", ""))
-                v_today = float(hr.get("运营净销_万") or 0)
-                chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
-            chart_title = "24小时时段走势（今日累计，万元）"
-        else:
-            for hr in hourly_rows:
-                h_str = str(hr.get("item", ""))
-                v_today = float(hr.get("运营净销_万") or 0)
-                v_yest = float(hr.get("运营增量_万") or 0)
-                chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
-                chart_values.append({"hour": h_str, "type": "昨日", "value": v_yest})
-            chart_title = "24小时时段走势环比（今日 vs 昨日，万元）"
+        # Yesterday's hourly series is independent of the previous push snapshot.
+        for hr in hourly_rows:
+            h_str = str(hr.get("item", ""))
+            v_today = float(hr.get("运营净销_万") or 0)
+            v_yest = float(hr.get("运营增量_万") or 0)
+            chart_values.append({"hour": h_str, "type": "今日", "value": v_today})
+            chart_values.append({"hour": h_str, "type": "昨日", "value": v_yest})
+        chart_title = "24小时时段走势环比（今日 vs 昨日，万元）"
 
         elements.append({
             "tag": "chart",
