@@ -9,6 +9,7 @@ import string
 import threading
 import time
 from datetime import datetime, timedelta
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
@@ -2448,7 +2449,7 @@ def recall_feishu_message(
     if not binding:
         from app.channels.feishu_binding import resolve_feishu_binding
 
-        binding, _ = resolve_feishu_binding(db, tenant_id=tenant_id)
+        binding, _ = resolve_feishu_binding(db, tenant_id, msg.binding_id)
     if not binding:
         raise HTTPException(status_code=400, detail="未找到用于撤回的飞书应用绑定凭证")
 
