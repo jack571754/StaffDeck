@@ -1,63 +1,29 @@
-# ==========================================
-# 阶段 1: 前端静态资源构建 (Node.js 20)
-# ==========================================
-FROM node:20-bookworm-slim AS frontend-builder
+# Build both the customized console and the Harness v3 Node runtime.
+FROM node:22-bookworm-slim AS runtime-builder
+RUN apt-get update && apt-get install -y --no-install-recommends python3 git ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+RUN python3 prepare.py --without-backend --no-cli-link
 
-WORKDIR /build/frontend-enterprise
-
-# 先复制依赖定义，利用 Docker 缓存层
-COPY frontend-enterprise/package*.json ./
-RUN npm config set registry https://registry.npmmirror.com && npm ci --no-audit --no-fund
-
-# 复制前端完整源码并构建生产 bundle
-COPY frontend-enterprise/ ./
-RUN npm run build
-
-# ==========================================
-# 阶段 2: Python 后端与一体化运行环境 (Python 3.11)
-# ==========================================
 FROM python:3.11-slim-bookworm AS runner
-
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ULTRARAG_DATA_DIR=/app/data \
     DATABASE_URL=sqlite:////app/data/skill_agent_loop.db \
-    APP_PORT=5173
-
-# 安装基础运行系统依赖与沙箱工具 (bubblewrap)
-RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
+    STAFFDECK_DISTRIBUTION_MANIFEST=/app/distribution/manifest.json \
+    STAFFDECK_INSTALL_ROOT=/app \
+    ULTRARAG_HOST=0.0.0.0 \
+    ULTRARAG_PORT=5173 \
+    STAFFDECK_HEADLESS=true
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    bubblewrap \
-    bash \
-    procps \
+    curl ca-certificates bubblewrap bash procps libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
-
-# 创建非 root 业务运行用户 (UID 1000)
 RUN useradd -m -u 1000 -s /bin/bash staffdeck
-
+COPY --from=runtime-builder /usr/local/bin/node /usr/local/bin/node
 WORKDIR /app
-
-# 利用独立 requirements.txt 预先安装 Python 依赖库，最大化利用 Docker 缓存
-COPY deploy/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
-    pip install --no-cache-dir -r /app/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-
-# 复制后端源码并以可编辑模式注册
-COPY backend /app/backend
-RUN pip install --no-cache-dir --no-deps -e /app/backend -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-
-# 复制阶段 1 前端构建产物 (dist)
-COPY --from=frontend-builder /build/frontend-enterprise/dist /app/frontend-enterprise/dist
-
-# 创建持久化数据目录并授予 staffdeck 用户权限
+COPY --from=runtime-builder /app /app
+RUN pip install --no-cache-dir ./backend && python packaging/distribution/install_dependencies.py
 RUN mkdir -p /app/data && chown -R staffdeck:staffdeck /app
-
 USER staffdeck
-WORKDIR /app/backend
-
 EXPOSE 5173
-
-# 启动单端口整合服务 (支持 API + 前端 SPA 静态托管)
-CMD ["python", "-m", "uvicorn", "single_port_app:app", "--host", "0.0.0.0", "--port", "5173"]
+CMD ["python", "launch.py"]

@@ -21,13 +21,18 @@ from sqlalchemy import and_, or_, update
 from sqlmodel import Session, select
 from starlette.background import BackgroundTask
 
-from app.agents.branching import model_for_agent, visible_published_skills
+from app.agents.branching import model_for_agent
 from app.channels.service_outbox import stage_channel_delivery
 from app.config import get_settings
 from app.core import AgentLoop
 from app.core.artifact_owners import resolve_artifact_owner
 from app.core.cancellation import cancel_chat_turn, is_chat_turn_cancelled
-from app.core.capability_manifest import CapabilityManifestBuilder
+from app.core.handoff_reply_service import (  # noqa: F401 - legacy import compatibility
+    resume_human_handoff_async as _resume_human_handoff_async,
+)
+from app.core.handoff_reply_service import (
+    resume_human_handoff_worker as _resume_human_handoff_worker,  # noqa: F401
+)
 from app.core.harness_turn_store import HarnessTurnStore
 from app.core.slash_commands import SlashCommandRead, slash_command_catalog
 from app.db import engine, get_session
@@ -196,13 +201,20 @@ class HumanHandoffReplyRequest(BaseModel):
 
 
 def session_read(
-    row: ChatSession, *, is_scheduled: bool = False, team_name: str | None = None
+    row: ChatSession,
+    *,
+    is_scheduled: bool = False,
+    team_name: str | None = None,
+    agent_name: str | None = None,
+    agent_available: bool | None = None,
 ) -> ChatSessionRead:
     return ChatSessionRead(
         id=row.id,
         tenant_id=row.tenant_id,
         user_id=row.user_id,
         agent_id=row.agent_id,
+        agent_name=agent_name,
+        agent_available=agent_available,
         title=row.title,
         active_skill_id=row.active_skill_id,
         active_step_id=row.active_step_id,
@@ -256,10 +268,11 @@ def _schedule_session_title_summary(
     user_id: str,
     session_id: str,
     agent_id: str | None,
+    *, data_services=None,
 ) -> None:
     if not session_id:
         return
-    job_key = f"{tenant_id}:{user_id}:{session_id}"
+    job_key = f"{getattr(data_services, 'namespace', 'oss-local')}:{tenant_id}:{user_id}:{session_id}"
     with _session_title_summary_jobs_lock:
         if job_key in _session_title_summary_jobs:
             return
@@ -267,16 +280,17 @@ def _schedule_session_title_summary(
 
     def run() -> None:
         try:
-            _summarize_session_title_once(tenant_id, user_id, session_id, agent_id)
+            _summarize_session_title_once(tenant_id, user_id, session_id, agent_id, data_services=data_services)
         finally:
             with _session_title_summary_jobs_lock:
                 _session_title_summary_jobs.discard(job_key)
 
-    thread = threading.Thread(
-        target=run,
-        daemon=True,
-    )
-    thread.start()
+    from staffdeck_harness.runtime.jobs import enqueue_runtime_job
+    try:
+        enqueue_runtime_job("session.title", run, registry=getattr(data_services, "registry", None))
+    except Exception:
+        with _session_title_summary_jobs_lock:
+            _session_title_summary_jobs.discard(job_key)
 
 
 def _summarize_session_title_once(
@@ -284,13 +298,16 @@ def _summarize_session_title_once(
     user_id: str,
     session_id: str,
     agent_id: str | None,
+    *, data_services=None,
 ) -> None:
+    def session_factory():
+        return data_services.session(None, purpose="session.title") if data_services else Session(engine)
     try:
         for attempt in range(8):
             messages: list[Message] = []
             model_config = None
             effective_agent_id = agent_id
-            with Session(engine) as db:
+            with session_factory() as db:
                 session = db.exec(
                     select(ChatSession).where(
                         ChatSession.id == session_id,
@@ -321,7 +338,16 @@ def _summarize_session_title_once(
                     messages = []
                 else:
                     effective_agent_id = agent_id or session.agent_id
-                    model_config = model_for_agent(db, tenant_id, effective_agent_id)
+                    if data_services:
+                        from staffdeck_harness.composition.sources import resolve_source
+                        from staffdeck_harness.contracts.manifest import SlotName
+                        from staffdeck_harness.contracts.sources import SourceContext
+                        from staffdeck_harness.modules.registry import peek_registry
+                        model_config = resolve_source(getattr(data_services, "registry", None) or peek_registry(),
+                            SlotName.STAFF_SOURCE, db).model(SourceContext(tenant_id, effective_agent_id,
+                            session_id, "web", user_id))
+                    else:
+                        model_config = model_for_agent(db, tenant_id, effective_agent_id)
 
             if not messages:
                 if attempt < 7:
@@ -350,7 +376,7 @@ def _summarize_session_title_once(
                         if title_turn_id:
                             traced_payload.setdefault("turn_id", title_turn_id)
                             traced_payload.setdefault("user_message_id", title_turn_id)
-                        with Session(engine) as span_db:
+                        with session_factory() as span_db:
                             _persist_relay_only_event(
                                 span_db,
                                 tenant_id,
@@ -371,7 +397,7 @@ def _summarize_session_title_once(
             if not title:
                 return
 
-            with Session(engine) as db:
+            with session_factory() as db:
                 session = db.exec(
                     select(ChatSession).where(
                         ChatSession.id == session_id,
@@ -465,161 +491,11 @@ def _normalized_session_event_payload(row: AgentEvent) -> dict[str, object]:
     return normalized
 
 
-def _apply_handoff_reply(
-    db: Session,
-    row: HumanHandoffRequest,
-    reply: str,
-    *,
-    answered_by_user_id: str | None,
-    source: str = "web",
-) -> None:
-    """把一条 pending handoff 置为 answered 并触发 SOP 恢复。
+def _apply_handoff_reply(db, row, reply, *, answered_by_user_id, source="web"):
+    from app.core.handoff_reply_service import apply_handoff_reply
 
-    供网页 API(reply_human_handoff)与飞书 intake 回复分支复用。
-    调用前需已完成权限校验与状态校验;本函数负责落库 + 事件 + 异步恢复。
-    source: "web" 或 "feishu",由调用方显式指定(不再靠 user_id 前缀推断)。
-    """
-    now = utc_now()
-    row.status = "answered"
-    row.human_reply = reply
-    row.answered_at = now
-    row.updated_at = now
-    row.resume_payload_json = {
-        **(row.resume_payload_json or {}),
-        "answered_by_user_id": answered_by_user_id,
-    }
-    db.add(row)
-
-    chat_session = db.get(ChatSession, row.session_id)
-    if chat_session and chat_session.tenant_id == row.tenant_id:
-        chat_session.status = "active"
-        chat_session.awaiting_input_json = None
-        chat_session.slots_json = {
-            **dict(chat_session.slots_json or {}),
-            "handoff_requested": False,
-            "handoff_completed": True,
-        }
-        chat_session.summary = f"最近回复：{reply[:120]}"
-        chat_session.updated_at = now
-        db.add(chat_session)
-    db.add(
-        AgentEvent(
-            tenant_id=row.tenant_id,
-            session_id=row.session_id,
-            event_type="human_handoff_answered",
-            payload_json={
-                "handoff_id": row.id,
-                "agent_id": row.agent_id,
-                "trigger_skill_id": row.trigger_skill_id,
-                "trigger_step_id": row.trigger_step_id,
-                "answered_by_user_id": answered_by_user_id,
-                "reply_preview": reply[:180],
-                "source": source,
-            },
-            created_at=now,
-        )
-    )
-    db.commit()
-    db.refresh(row)
-    _resume_human_handoff_async(row.id)
-
-
-def _resume_human_handoff_async(handoff_id: str) -> None:
-    thread = threading.Thread(target=_resume_human_handoff_worker, args=(handoff_id,), daemon=True)
-    thread.start()
-
-
-def _resume_human_handoff_worker(handoff_id: str) -> None:
-    try:
-        with Session(engine) as db:
-            handoff = db.get(HumanHandoffRequest, handoff_id)
-            if not handoff or handoff.status != "answered" or not handoff.human_reply:
-                return
-            chat_session = db.get(ChatSession, handoff.session_id)
-            if not chat_session or chat_session.tenant_id != handoff.tenant_id:
-                return
-            resume_payload = dict(handoff.resume_payload_json or {})
-            original_channel = str(resume_payload.get("channel") or "").strip()
-            original_binding_id = str(
-                resume_payload.get("channel_binding_id") or ""
-            ).strip()
-            original_account_key = str(
-                resume_payload.get("channel_account_key") or ""
-            ).strip()
-            original_target = resume_payload.get("channel_target")
-            if original_channel:
-                chat_session.channel = original_channel
-            if original_binding_id:
-                chat_session.channel_binding_id = original_binding_id
-            if original_account_key:
-                chat_session.channel_account_key = original_account_key
-            if isinstance(original_target, dict) and original_target:
-                chat_session.channel_target_json = dict(original_target)
-            elif chat_session.channel_target_json:
-                # Legacy handoffs predate the target snapshot. Keep the target
-                # already anchored on the session, especially a WeCom group chatid.
-                chat_session.channel_target_json = dict(chat_session.channel_target_json)
-            db.add(chat_session)
-            metadata = dict(handoff.metadata_json or {})
-            if metadata.get("resume_started_at"):
-                return
-            now = utc_now()
-            metadata["resume_started_at"] = now.isoformat()
-            handoff.metadata_json = metadata
-            db.add(handoff)
-            db.add(
-                AgentEvent(
-                    tenant_id=handoff.tenant_id,
-                    session_id=handoff.session_id,
-                    event_type="human_handoff_resume_started",
-                    payload_json={
-                        "handoff_id": handoff.id,
-                        "agent_id": handoff.agent_id,
-                        "trigger_skill_id": handoff.trigger_skill_id,
-                        "trigger_step_id": handoff.trigger_step_id,
-                    },
-                    created_at=now,
-                )
-            )
-            db.commit()
-
-            # 会话属主是恢复请求的权威 user:渠道身份重绑(懒建账号→web 账号)会迁移
-            # session.user_id,而 handoff.requester_user_id 是创建时的快照,可能已过期;
-            # 优先旧快照会触发 harness 的 session-user 围栏校验失败。
-            request = ChatTurnRequest(
-                tenant_id=handoff.tenant_id,
-                session_id=handoff.session_id,
-                agent_id=handoff.agent_id or chat_session.agent_id,
-                user_id=chat_session.user_id or handoff.requester_user_id or None,
-                message=handoff.human_reply,
-                channel="human_handoff_resume",
-                debug=False,
-            )
-            AgentLoop(db).handle_turn(request)
-            # resume turn 完成后不再写 resume_finished_at 标记:
-            # _inject_handoff_context 已改为用 request.channel == "human_handoff_resume"
-            # 判定 resume turn,时序可靠,无需事后标记。
-    except Exception as exc:
-        with Session(engine) as db:
-            handoff = db.get(HumanHandoffRequest, handoff_id)
-            if not handoff:
-                return
-            metadata = dict(handoff.metadata_json or {})
-            metadata["resume_failed_at"] = utc_now().isoformat()
-            metadata["resume_error"] = str(exc)[:300]
-            handoff.status = "failed"
-            handoff.metadata_json = metadata
-            handoff.updated_at = utc_now()
-            db.add(handoff)
-            db.add(
-                AgentEvent(
-                    tenant_id=handoff.tenant_id,
-                    session_id=handoff.session_id,
-                    event_type="human_handoff_resume_failed",
-                    payload_json={"handoff_id": handoff.id, "error": str(exc)[:300]},
-                )
-            )
-            db.commit()
+    return apply_handoff_reply(db, row, reply, answered_by_user_id=answered_by_user_id,
+                              source=source, resume=_resume_human_handoff_async)
 
 
 def _maybe_handle_scheduled_task_request(
@@ -1124,13 +1000,24 @@ def list_slash_commands(
         agent_id,
         current_user,
     )
-    skills = discoverable_sops(visible_published_skills(db, tenant_id, agent.id))
-    manifest = CapabilityManifestBuilder(db).build(
-        tenant_id,
-        agent.id,
-        None,
-        None,
-    )
+    from types import SimpleNamespace
+
+    from app.config import get_settings
+    from staffdeck_harness.capabilities.manifest import SnapshotManifestBuilder
+    from staffdeck_harness.composition.compiler import CompositionCompiler
+    from staffdeck_harness.composition.sources import resolve_staff
+    from staffdeck_harness.contracts.sop import SopDefinition
+    from staffdeck_harness.contracts.sources import SourceContext
+    from staffdeck_harness.modules.registry import get_registry
+    from staffdeck_harness.security.profile import Guard, get_profile
+    registry, profile = get_registry(get_settings()), get_profile(get_settings())
+    staff, identity = resolve_staff(registry, db, SourceContext(tenant_id, agent.id, user_id=current_user.id), profile)
+    snapshot = CompositionCompiler().compile(staff, generation=registry.generation, strict=False)
+    skills = discoverable_sops([SopDefinition(v.row_id, tenant_id, v.skill_id, v.version,
+        v.name, dict(v.content)) for v in staff.sops if snapshot.sop(v.skill_id)])
+    manifest = SnapshotManifestBuilder(SimpleNamespace(db=db, registry=registry, snapshot=snapshot,
+        user_message_id=None, session=None, security_context=identity, guard=Guard("staff", profile))).build(
+            tenant_id, agent.id, None, None)
     return slash_command_catalog(skills, manifest)
 
 
@@ -1182,6 +1069,7 @@ def chat_turn(
         update={
             "user_id": current_user.id,
             "context_injection": None,
+            "scheduled_task_id": None,
             "message_visibility": "visible",
         }
     )
@@ -1212,7 +1100,8 @@ def chat_turn(
         scheduled_response = _maybe_handle_scheduled_task_request(db, request, chat_session)
         if scheduled_response:
             response, _draft = scheduled_response
-            _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
+            from staffdeck_harness.runtime.services import runtime_services
+            _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id, data_services=runtime_services(db))
             return response
         data_query_resp = _maybe_handle_data_query_request(db, request, chat_session)
         if data_query_resp:
@@ -1220,7 +1109,8 @@ def chat_turn(
             _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
             return response
     response = AgentLoop(db).handle_turn(request)
-    _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id)
+    from staffdeck_harness.runtime.services import runtime_services
+    _schedule_session_title_summary(request.tenant_id, request.user_id, response.session_id, request.agent_id, data_services=runtime_services(db))
     if team_tl_team is not None:
         # TL 回复后处理:解析派任务块并创建任务(与 tl_chat 端点同语义);
         # 后处理失败不影响本轮回复
@@ -1262,6 +1152,7 @@ def chat_stream(
         update={
             "user_id": current_user.id,
             "context_injection": None,
+            "scheduled_task_id": None,
             "message_visibility": "visible",
         }
     )
@@ -1291,6 +1182,8 @@ def chat_stream(
         )
 
     relay_ready = threading.Event()
+    from staffdeck_harness.runtime.services import runtime_services
+    data_services = runtime_services(db)
     worker_done = threading.Event()
     source_session_id = {"value": request.session_id or ""}
     worker_terminal = {"seen": False}
@@ -1308,7 +1201,7 @@ def chat_stream(
     def run_stream_worker() -> None:
         span_sink_token = None
         try:
-            with Session(engine) as worker_db:
+            with data_services.session(None, purpose="stream-worker") as worker_db:
                 span_turn_id = {"value": ""}
 
                 def persist_span(event_type: str, payload: dict[str, object]) -> None:
@@ -1416,6 +1309,7 @@ def chat_stream(
                             request.user_id,
                             response.session_id,
                             request.agent_id,
+                            data_services=data_services,
                         )
                         return
                     data_query_resp = _maybe_handle_data_query_request(worker_db, request, chat_session)
@@ -1501,6 +1395,7 @@ def chat_stream(
                             request.user_id,
                             event_source_session_id,
                             request.agent_id,
+                            data_services=data_services,
                         )
                         continue
                     if item["event"] == "complete":
@@ -1510,6 +1405,7 @@ def chat_stream(
                             request.user_id,
                             event_source_session_id,
                             request.agent_id,
+                            data_services=data_services,
                         )
                         if team_tl_team_id is not None:
                             # 团队 TL 会话:complete 后做派任务后处理(与 tl_chat 端点同语义);
@@ -1564,9 +1460,10 @@ def chat_stream(
                             )
         except Exception as exc:
             logger.exception("chat stream worker failed")
+            unavailable = _is_chat_agent_unavailable(exc, request.agent_id)
             session_id = source_session_id["value"] or request.session_id or ""
             if session_id:
-                with Session(engine) as error_db:
+                with data_services.session(None, purpose="stream-error") as error_db:
                     chat_session = error_db.get(ChatSession, session_id)
                     if chat_session:
                         _persist_chat_turn_interrupted(
@@ -1576,6 +1473,10 @@ def chat_stream(
                             request.client_turn_id or "",
                             str(exc) or "stream worker failed",
                             error_details={
+                                **(
+                                    {"error_code": "AGENT_UNAVAILABLE", "message": "此数字员工不再可用"}
+                                    if unavailable else {}
+                                ),
                                 "error_type": exc.__class__.__name__,
                                 "error_traceback": traceback.format_exc()[-STREAM_INTERRUPTED_TRACEBACK_CHAR_LIMIT:],
                             },
@@ -1587,7 +1488,7 @@ def chat_stream(
             logger.exception("chat stream worker stopped with base exception")
             session_id = source_session_id["value"] or request.session_id or ""
             if session_id:
-                with Session(engine) as error_db:
+                with data_services.session(None, purpose="stream-error") as error_db:
                     chat_session = error_db.get(ChatSession, session_id)
                     if chat_session:
                         _persist_chat_turn_interrupted(
@@ -1611,7 +1512,7 @@ def chat_stream(
                 reset_span_sink(span_sink_token)
             session_id = source_session_id["value"] or request.session_id or ""
             if session_id and not worker_terminal["seen"]:
-                with Session(engine) as final_db:
+                with data_services.session(None, purpose="stream-finalize") as final_db:
                     chat_session = final_db.get(ChatSession, session_id)
                     if chat_session:
                         changed = _persist_chat_turn_interrupted(
@@ -1639,7 +1540,7 @@ def chat_stream(
             session_id = source_session_id["value"]
             emitted = False
             if session_id:
-                with Session(engine) as relay_db:
+                with data_services.session(None, purpose="stream-relay") as relay_db:
                     rows = _events_after_cursor(relay_db, request.tenant_id, session_id, initial_cursor)
                 for row in rows:
                     payload = row.payload_json or {}
@@ -1667,7 +1568,7 @@ def chat_stream(
                 return
             if time.monotonic() > deadline:
                 if session_id:
-                    with Session(engine) as timeout_db:
+                    with data_services.session(None, purpose="stream-timeout") as timeout_db:
                         chat_session = timeout_db.get(ChatSession, session_id)
                         if chat_session:
                             _persist_chat_turn_interrupted(
@@ -2223,6 +2124,8 @@ def create_chat_session(
         agent_id=request.agent_id,
         title=title,
     )
+    from staffdeck_harness.runtime.session_binding import bind_session
+    bind_session(db, row, created=True)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -2304,11 +2207,14 @@ def list_chat_sessions(
         team.id: team.name
         for team in db.exec(select(Team).where(Team.id.in_(team_ids))).all()
     } if team_ids else {}
+    from staffdeck_harness.runtime.staff_directory import staff_names
+    agent_names = staff_names(db, tenant_id, [row.agent_id for row in rows if row.agent_id])
     return [
         session_read(
             row,
             is_scheduled=row.id in scheduled_session_ids,
             team_name=team_names.get(row.team_id) if row.team_id else None,
+            agent_name=agent_names.get(row.agent_id or ""),
         )
         for row in rows
     ]
@@ -2325,7 +2231,23 @@ def get_chat_session(
     _ensure_request_tenant(tenant_id, current_user)
     row = _get_readable_chat_session(db, tenant_id, current_user, session_id)
     team = db.get(Team, row.team_id) if row.team_id else None
-    return session_read(row, team_name=team.name if team else None)
+    from staffdeck_harness.runtime.staff_directory import staff_names
+    names = staff_names(db, tenant_id, [row.agent_id] if row.agent_id else [])
+    available = None
+    if row.agent_id:
+        try:
+            _ensure_chat_agent_available(db, tenant_id, row.agent_id, current_user)
+            available = True
+        except HTTPException as exc:
+            # Reading one's history does not grant execution rights. Outages remain unknown.
+            if isinstance(exc.detail, dict) and exc.detail.get("code") == "AGENT_UNAVAILABLE":
+                available = False
+    return session_read(
+        row,
+        team_name=team.name if team else None,
+        agent_name=names.get(row.agent_id or ""),
+        agent_available=available,
+    )
 
 
 @router.put("/sessions/{session_id}", response_model=ChatSessionRead)
@@ -4047,6 +3969,58 @@ def reply_human_handoff(
     return human_handoff_read(row)
 
 
+class HumanHandoffCreateRequest(BaseModel):
+    tenant_id: str
+    message_id: str | None = None
+    message_ids: list[str] = []
+    reasons: list[str] = []
+    note: str = ""
+    include_feedback: bool = False
+
+
+@router.post("/sessions/{session_id}/handoffs", response_model=HumanHandoffRead)
+def create_human_handoff(
+    session_id: str,
+    request: HumanHandoffCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> HumanHandoffRead:
+    """用户在会话里主动转人工：复用 SOP 节点转人工的建单逻辑，处理人按数字员工负责人解析。"""
+    from app.core.human_handoff_service import HumanHandoffService
+    from app.observability import EventLog
+    from app.session.session_schema import StepAgentResult
+
+    _ensure_request_tenant(request.tenant_id, current_user)
+    chat_session = _get_readable_chat_session(db, request.tenant_id, current_user, session_id)
+    if chat_session.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the session owner can request a handoff")
+    service = HumanHandoffService(db, EventLog(db))
+    reason_text = "；".join(item for item in request.reasons if item)
+    question = "；".join(item for item in (reason_text, request.note.strip()) if item)
+    row = service.create(
+        request.tenant_id,
+        chat_session,
+        StepAgentResult(action="handoff", reply=question or None, handoff=True),
+        current_step_resolver=lambda: None,
+        assignee_resolver=lambda tenant_id, agent_id, fallback: service.assignee_user_id(
+            tenant_id, agent_id, fallback, tenant_admin_resolver=service.tenant_admin_user_id
+        ),
+        context_summary=service.context_summary,
+        pending_question=service.pending_question,
+    )
+    row.metadata_json = {
+        **dict(row.metadata_json or {}),
+        "source": "user_request",
+        "reasons": request.reasons,
+        "note": request.note,
+        "message_ids": request.message_ids or ([request.message_id] if request.message_id else []),
+    }
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return human_handoff_read(row)
+
+
 @router.post("/messages/{message_id}/feedback")
 def upsert_message_feedback(
     message_id: str,
@@ -4261,21 +4235,62 @@ def _user_can_read_handoff_session(db: Session, tenant_id: str, current_user: Us
     return db.exec(statement).first() is not None
 
 
+def _is_chat_agent_unavailable(exc: Exception, agent_id: str | None) -> bool:
+    from staffdeck_harness.contracts.errors import ModuleSdkError, PermissionDenied
+
+    if not isinstance(exc, ModuleSdkError):
+        return False
+    if exc.code == "STAFF_NOT_FOUND":
+        return True
+    if not isinstance(exc, PermissionDenied):
+        return False
+    return exc.message == "target Staff unavailable" or (
+        exc.details.get("operation") == "staff.use/v1"
+        and exc.details.get("resource_type") == "agent"
+        and exc.details.get("resource") == agent_id
+    )
+
+
 def _ensure_chat_agent_available(
     db: Session,
     tenant_id: str,
     agent_id: str | None,
     current_user: User,
-) -> AgentProfile:
+):
     if not agent_id:
         raise HTTPException(status_code=400, detail="Agent is required")
     ensure_tenant(db, tenant_id)
-    row = db.get(AgentProfile, agent_id)
-    if not row or row.tenant_id != tenant_id or row.status != "active" or row.is_overall:
-        raise HTTPException(status_code=404, detail="Agent not available")
-    if not _chat_agent_visible_to_user(row, current_user):
-        raise HTTPException(status_code=403, detail="Agent not available")
-    return row
+    from app.config import get_settings
+    from staffdeck_harness.composition.sources import authorize_staff
+    from staffdeck_harness.contracts.errors import ModuleSdkError, PermissionDenied
+    from staffdeck_harness.contracts.sources import SourceContext
+    from staffdeck_harness.modules.registry import get_registry
+    from staffdeck_harness.security.profile import get_profile
+    settings = get_settings()
+    try:
+        _, _, ref = authorize_staff(get_registry(settings), db,
+            SourceContext(tenant_id, agent_id, user_id=current_user.id), get_profile(settings))
+    except PermissionDenied as exc:
+        if _is_chat_agent_unavailable(exc, agent_id):
+            code = 404 if exc.message == "target Staff unavailable" else 403
+            raise HTTPException(
+                status_code=code,
+                detail={"code": "AGENT_UNAVAILABLE", "message": "此数字员工不再可用"},
+            ) from exc
+        raise HTTPException(status_code=403, detail=exc.to_dict()) from exc
+    except ModuleSdkError as exc:
+        status = 404 if exc.code == "STAFF_NOT_FOUND" else 503
+        detail = (
+            {"code": "AGENT_UNAVAILABLE", "message": "此数字员工不再可用"}
+            if status == 404 else exc.to_dict()
+        )
+        raise HTTPException(status_code=status, detail=detail) from exc
+    if ref.attributes.get("is_overall"):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "AGENT_UNAVAILABLE", "message": "此数字员工不再可用"},
+        )
+    return ref
 
 
 def _bind_request_to_session_agent(
@@ -4287,6 +4302,7 @@ def _bind_request_to_session_agent(
     if chat_session.agent_id:
         if request.agent_id and request.agent_id != chat_session.agent_id:
             raise HTTPException(status_code=409, detail="Session is already bound to another agent")
+        _ensure_chat_agent_available(db, request.tenant_id, chat_session.agent_id, current_user)
         return request.model_copy(update={"agent_id": chat_session.agent_id})
 
     agent = _ensure_chat_agent_available(db, request.tenant_id, request.agent_id, current_user)
@@ -4922,7 +4938,7 @@ def _harness_event_trace_line(
         if action == "tool":
             display_tool_name = _resolve_tool_label(tool_name, tool_names)
             return {
-                "id": f"harness_action_{frame_id}_{iteration or event.id}",
+                "id": f"harness_action_{frame_id}_{payload.get('call_id') or iteration or event.id}",
                 "kind": "tool",
                 "text": f"调用能力 {display_tool_name}" if display_tool_name else "调用能力",
                 "detail": f"第 {iteration} 个动作" if iteration else None,
@@ -4950,14 +4966,15 @@ def _harness_event_trace_line(
             "mcpApp": mcp_app,
             "state": "completed",
         }
-    if event_type == "harness_tool_completed":
-        success = bool(payload.get("success"))
+    if event_type in {"harness_tool_completed", "harness_tool_result"}:
+        success = bool(payload.get("success")) if 'success' in payload else payload.get('is_error') is False
         error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
         error_detail = " · ".join(
             part
             for part in (
                 str(error.get("code") or "").strip(),
                 str(error.get("message") or "").strip(),
+                f"{payload['duration_ms'] / 1000:.2f} s" if isinstance(payload.get('duration_ms'), (int, float)) else '',
             )
             if part
         )
@@ -4971,7 +4988,7 @@ def _harness_event_trace_line(
             else None
         )
         return {
-            "id": f"harness_action_{frame_id}_{iteration or event.id}",
+            "id": f"harness_action_{frame_id}_{payload.get('call_id') or iteration or event.id}",
             "kind": "tool",
             "text": (
                 f"能力调用完成 {display_tool_name}"
@@ -4984,6 +5001,8 @@ def _harness_event_trace_line(
             ),
             "detail": error_detail or None,
             "output": output or None,
+            "code": _trace_payload_text(payload.get('arguments')) or None,
+            "language": 'json',
             "outputLanguage": _trace_payload_language(output) if output else None,
             "outputTitle": "查看能力结果" if output else None,
             "collapsible": bool(output),
@@ -5176,6 +5195,11 @@ def _event_trace_lines(
     step_names: dict[str, dict[str, str]] | None = None,
     tool_names: dict[str, str] | None = None,
 ) -> list[dict]:
+    if event.event_type in {'composition_snapshot_compiled', 'capability_manifest_resolved'}:
+        from staffdeck_harness.runtime.trace_names import merge_trace_names
+        merge_trace_names(event.payload_json or {}, skill_names,
+                          step_names if step_names is not None else {},
+                          tool_names if tool_names is not None else {})
     line = _event_trace_line(event, skill_names, skill_hint, step_names, tool_names)
     if not line:
         return []
@@ -5244,6 +5268,7 @@ def _event_trace_line(
         "harness_action_created",
         "harness_mcp_app_view",
         "harness_tool_completed",
+        "harness_tool_result",
         "harness_step_timeout",
     }:
         return _harness_event_trace_line(

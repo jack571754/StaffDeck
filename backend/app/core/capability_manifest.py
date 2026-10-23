@@ -17,6 +17,7 @@ from app.capabilities.local_general_skill import package_from_row
 from app.core.task_request_compiler import (
     CapabilityDescriptor,
     CapabilityManifest,
+    current_step_authorization_skill_ids,
     current_step_capability_refs,
 )
 from app.db.models import (
@@ -34,9 +35,9 @@ from app.harness import (
     register_skill_script_tools,
 )
 from app.harness.sandbox import available_backend
-from app.skills.tool_authorization import current_sop_tool_authorization
 
 RESERVED_HARNESS_CAPABILITY_NAMES = {
+    "lark_cli",
     "capability_search",
     "capability_describe",
     "list_published_deliverables",
@@ -44,7 +45,6 @@ RESERVED_HARNESS_CAPABILITY_NAMES = {
     "exec_command",
     "run_skill_script",
     "knowledge_search",
-    "lark_cli",
     "external_task_status",
     "data_query_search",
     "data_query_execute",
@@ -70,17 +70,14 @@ class CapabilityManifestBuilder:
         if agent_id and get_agent(self.db, tenant_id, agent_id) is None:
             raise CapabilityAuthorizationError("当前员工不存在、已归档或不属于该租户。")
         refs = current_step_capability_refs(skill, step_id)
-        authorization = current_sop_tool_authorization(tenant_id, skill, step_id)
+        authorization_skill_ids = current_step_authorization_skill_ids(skill, step_id)
         available: list[CapabilityDescriptor] = []
         unavailable: list[CapabilityDescriptor] = []
 
         available.extend(_internal_capability_descriptors())
-        lark_descriptor = _lark_cli_descriptor(self.db, tenant_id, agent_id)
-        if lark_descriptor is not None:
-            if lark_descriptor.available:
-                available.append(lark_descriptor)
-            else:
-                unavailable.append(lark_descriptor)
+        lark = _lark_cli_descriptor(self.db, tenant_id, agent_id)
+        if lark is not None:
+            available.append(lark)
         ui_config = self.db.get(UIConfig, tenant_id)
         sandbox_enabled = bool(getattr(ui_config, "sandbox_enabled", False))
 
@@ -197,10 +194,12 @@ class CapabilityManifestBuilder:
                     )
                 )
                 continue
-            explicitly_allowed = authorization.explicitly_allows(row)
+            explicitly_allowed = any(tool_by_ref.get(ref) is row for ref in refs["tool_ids"])
             if scope == "sop_specific" and not explicitly_allowed:
                 continue
-            if not authorization.permits_skill(row):
+            if row.allowed_skills_json and not authorization_skill_ids.intersection(
+                str(value).strip() for value in row.allowed_skills_json if str(value).strip()
+            ):
                 if explicitly_allowed:
                     unavailable.append(
                         _unavailable(
@@ -392,27 +391,9 @@ def _lark_cli_descriptor(
     )
 
 
+
 def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
     return [
-        CapabilityDescriptor(
-            capability_id="builtin.external_task.status",
-            name="external_task_status",
-            kind="internal",
-            description=(
-                "Query a StaffDeck detached business task by task_id. Use this when the user asks "
-                "for the status of a previously submitted #taskid. Only the current user's tasks "
-                "are visible."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "minLength": 1},
-                },
-                "required": ["task_id"],
-                "additionalProperties": False,
-            },
-            metadata={"provider": "harness", "side_effect": "read"},
-        ),
         CapabilityDescriptor(
             capability_id="builtin.deliverables.list",
             name="list_published_deliverables",

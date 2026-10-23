@@ -43,6 +43,11 @@ HTML_BODY = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+
+
 def _test_engine():
     engine = create_engine(
         "sqlite://",

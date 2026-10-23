@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from pydantic import ValidationError
+
 import base64
 import json
 import re
 import zipfile
 from collections.abc import Iterator
 from io import BytesIO
-from time import sleep
+from time import monotonic, sleep
 from xml.etree import ElementTree
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -91,6 +94,32 @@ router = APIRouter(
 )
 
 
+def validate_published_sop(db: Session, tenant_id: str, agent_id: str | None, sop_id: str) -> None:
+    """Validate the published instance through the same module sources/compiler as runtime."""
+    from app.config import get_settings
+    from staffdeck_harness.composition.sources import validate_configuration
+    from staffdeck_harness.contracts.errors import ModuleSdkError
+    from staffdeck_harness.contracts.sources import SourceContext
+    from staffdeck_harness.modules.registry import get_registry
+    db.flush()
+    try:
+        validate_configuration(get_registry(get_settings()), db, SourceContext(tenant_id, agent_id), sop_id=sop_id)
+    except (ModuleSdkError, ValueError, LookupError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"SOP 模块装配无效：{exc}") from exc
+
+
+def _read_persisted_skill_content(value):
+    """Keep malformed persisted drafts inspectable; writes and execution stay strict."""
+    try:
+        content, _warnings = skill_card_with_unique_step_ids(skill_card_from_persisted(value))
+        return content, []
+    except ValidationError as exc:
+        if not isinstance(value, dict):
+            raise
+        return deepcopy(value), [item["msg"] for item in exc.errors(include_input=False, include_url=False)]
+
+
 def skill_read(
     row: Skill,
     stats: dict[str, dict[str, float | int]] | None = None,
@@ -100,9 +129,7 @@ def skill_read(
     skill_stats = _stats_for(all_stats, row.skill_id, row.version)
     total_stats = all_stats.get(row.skill_id, {})
     recent_skill_stats = (recent_stats or {}).get(row.skill_id, {})
-    content, _warnings = skill_card_with_unique_step_ids(
-        skill_card_from_persisted(row.content_json)
-    )
+    content, validation_errors = _read_persisted_skill_content(row.content_json)
     branch_meta = getattr(row, "agent_branch_meta", {}) or {}
     return SkillRead(
         id=row.id,
@@ -113,6 +140,7 @@ def skill_read(
         business_domain=row.business_domain,
         description=row.description,
         content=content,
+        validation_errors=validation_errors,
         status=row.status,
         call_count=int(skill_stats.get("call_count", 0)),
         positive_feedback_count=int(skill_stats.get("positive_feedback_count", 0)),
@@ -145,9 +173,7 @@ def skill_version_read(
     row: SkillVersion, stats: dict[str, dict[str, float | int]] | None = None
 ) -> SkillVersionRead:
     skill_stats = _stats_for(stats or {}, row.skill_id, row.version)
-    content, _warnings = skill_card_with_unique_step_ids(
-        skill_card_from_persisted(row.content_json)
-    )
+    content, validation_errors = _read_persisted_skill_content(row.content_json)
     return SkillVersionRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -157,6 +183,7 @@ def skill_version_read(
         business_domain=row.business_domain,
         description=row.description,
         content=content,
+        validation_errors=validation_errors,
         status=row.status,
         call_count=int(skill_stats.get("call_count", 0)),
         positive_feedback_count=int(skill_stats.get("positive_feedback_count", 0)),
@@ -169,18 +196,18 @@ def skill_version_read(
 
 
 def _branch_version_read(row: AgentSkillBranchVersion) -> SkillVersionRead:
-    content, _warnings = skill_card_with_unique_step_ids(
-        skill_card_from_persisted(row.content_json)
-    )
+    content, validation_errors = _read_persisted_skill_content(row.content_json)
+    data = content if isinstance(content, dict) else content.model_dump()
     return SkillVersionRead(
         id=row.id,
         tenant_id=row.tenant_id,
         skill_id=row.skill_id,
         version=row.version,
-        name=content.name,
-        business_domain=content.business_domain,
-        description=content.description,
+        name=data.get("name") or row.skill_id,
+        business_domain=data.get("business_domain"),
+        description=data.get("description"),
         content=content,
+        validation_errors=validation_errors,
         status=row.status,
         call_count=0,
         positive_feedback_count=0,
@@ -209,7 +236,7 @@ def list_skills(
 
 
 def _validate_handoff_assignees(db: Session, content: SkillCard, tenant_id: str) -> None:
-    """校验 SOP 人工节点的处理人:必须存在、同租户、source='web'(内部成员)。
+    """校验 SOP 人工节点的处理人:由当前身份目录确认存在、同租户且启用。
 
     assignee_notify_channel 为 None 时按默认投递(网页收件箱,可达则渠道通知);
     为 "web" 时仅网页端;为具体渠道时要求该渠道支持私聊通知(有可用适配器),
@@ -224,26 +251,10 @@ def _validate_handoff_assignees(db: Session, content: SkillCard, tenant_id: str)
     if not assignee_specs:
         return
     assignee_ids = {user_id for user_id, _ in assignee_specs}
-    rows = db.exec(
-        select(User).where(
-            User.tenant_id == tenant_id,
-            User.id.in_(assignee_ids),
-        )
-    ).all()
-    found_ids = {row.id for row in rows}
-    internal_ids = {row.id for row in rows if row.source == "web"}
-    missing = assignee_ids - found_ids
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"人工节点处理人不存在或不在当前租户: {', '.join(sorted(missing))}",
-        )
-    non_internal = assignee_ids - internal_ids
-    if non_internal:
-        raise HTTPException(
-            status_code=400,
-            detail=f"人工节点处理人必须是内部成员(web 账号),不可使用渠道客户或群聊虚拟账号: {', '.join(sorted(non_internal))}",
-        )
+    from staffdeck_harness.runtime.identity_directory import require_internal_member, resolve_members
+    members = resolve_members(db, tenant_id, sorted(assignee_ids))
+    for user_id in sorted(assignee_ids):
+        require_internal_member(db, tenant_id, user_id, materialize=True, resolved=members)
     channel_specs = {
         (user_id, channel)
         for user_id, channel in assignee_specs
@@ -383,6 +394,8 @@ def create_skill(
             binding_status,
             metadata_json=creator_metadata,
         )
+    if request.status == "published":
+        validate_published_sop(db, request.tenant_id, agent_id, row.skill_id)
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
@@ -459,24 +472,45 @@ def update_skill(
             row.skill_id,
             normalized_content.model_dump(),
         )
+        if branch.status == "active" and binding.status == "active":
+            validate_published_sop(db, request.tenant_id, agent.id, row.skill_id)
         db.commit()
         projected = project_skill_with_branch(row, branch, binding.status)
         stats = _skill_stats(db, request.tenant_id)
         return skill_read(projected, stats, _recent_skill_stats(db, request.tenant_id, stats))
     ensure_open_gallery_admin(request.tenant_id, current_user)
+    # A content edit preserves availability. Lifecycle changes use the explicit
+    # publish/archive/draft routes so existing employee bindings are not disabled.
+    if request.status is not None and request.status != row.status:
+        raise HTTPException(status_code=409, detail={
+            "code": "SOP_LIFECYCLE_ACTION_REQUIRED",
+            "message": "内容保存不能改变 SOP 可用状态，请使用独立的启用或停用操作",
+        })
+    db.exec(select(Skill).where(Skill.id == row.id).with_for_update()).one()
+    db.refresh(row)
+    history = db.exec(select(SkillVersion.version).where(
+        SkillVersion.tenant_id == row.tenant_id,
+        SkillVersion.skill_id == row.skill_id,
+    )).all()
+    floor = max([row.version, *history], key=_sop_version_key)
+    if _sop_version_key(normalized_content.version) <= _sop_version_key(floor):
+        major, minor, patch = _sop_version_key(floor)
+        normalized_content = normalized_content.model_copy(update={
+            "version": f"{major}.{minor}.{patch + 1}"
+        })
     row.version = normalized_content.version
     row.name = normalized_content.name
     row.business_domain = normalized_content.business_domain
     row.description = normalized_content.description
     row.content_json = normalized_content.model_dump()
     _sync_skill_tool_bindings(db, request.tenant_id, row.skill_id, row.content_json)
-    if request.status:
-        row.status = request.status
     row.updated_at = utc_now()
     db.add(row)
+    if row.status == "published":
+        validate_published_sop(db, request.tenant_id, agent_id, row.skill_id)
+    _upsert_skill_version(db, row, commit=False)
     db.commit()
     db.refresh(row)
-    _upsert_skill_version(db, row)
     stats = _skill_stats(db, request.tenant_id)
     return skill_read(row, stats, _recent_skill_stats(db, request.tenant_id, stats))
 
@@ -516,6 +550,7 @@ def publish_skill(
         db.add(branch)
         _sync_skill_tool_bindings(db, tenant_id, row.skill_id, branch.content_json)
         ensure_private_resource_binding(db, tenant_id, agent.id, "skill", row.id, "active")
+        validate_published_sop(db, tenant_id, agent.id, row.skill_id)
         db.commit()
         projected = project_skill_with_branch(row, branch, "active")
         stats = _skill_stats(db, tenant_id)
@@ -528,6 +563,7 @@ def publish_skill(
     db.add(row)
     db.flush()
     ensure_open_gallery_binding(db, tenant_id, "skill", row.id, "active")
+    validate_published_sop(db, tenant_id, agent_id, row.skill_id)
     db.commit()
     db.refresh(row)
     _upsert_skill_version(db, row)
@@ -1021,6 +1057,7 @@ def _run_rewrite_stream_job(job_id: str, skill_id: str, request_data: dict[str, 
 def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
     last_seq = max(0, after_seq)
     yield _sse("job_attached", {"job_id": job_id, "after_seq": after_seq})
+    last_sent = monotonic()
     while True:
         job, events = stream_jobs.snapshot(job_id, last_seq)
         if not job:
@@ -1029,9 +1066,13 @@ def _stream_skill_job(job_id: str, after_seq: int = 0) -> Iterator[str]:
         for event in events:
             last_seq = event.seq
             yield _sse_event(event, job_id)
+            last_sent = monotonic()
         if job.status in {"succeeded", "failed"} and not events:
             yield _sse("job_complete", {"job_id": job_id, "status": job.status, "error": job.error})
             return
+        if monotonic() - last_sent >= 15:
+            yield ": keepalive\n\n"
+            last_sent = monotonic()
         sleep(0.15)
 
 
@@ -1527,7 +1568,12 @@ def _recent_skill_stats(
     return recent_stats
 
 
-def _upsert_skill_version(db: Session, row: Skill) -> SkillVersion:
+def _sop_version_key(version: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", version.strip())
+    return tuple(int(part or 0) for part in match.groups()) if match else (0, 0, 0)
+
+
+def _upsert_skill_version(db: Session, row: Skill, *, commit: bool = True) -> SkillVersion:
     existing = db.exec(
         select(SkillVersion).where(
             SkillVersion.tenant_id == row.tenant_id,
@@ -1543,7 +1589,10 @@ def _upsert_skill_version(db: Session, row: Skill) -> SkillVersion:
         existing.status = row.status
         existing.updated_at = utc_now()
         db.add(existing)
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         db.refresh(existing)
         return existing
     version_row = SkillVersion(
@@ -1557,7 +1606,10 @@ def _upsert_skill_version(db: Session, row: Skill) -> SkillVersion:
         status=row.status,
     )
     db.add(version_row)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(version_row)
     return version_row
 

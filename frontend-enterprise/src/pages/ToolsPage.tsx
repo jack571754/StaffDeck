@@ -6,7 +6,6 @@ import { Activity, Copy, FlaskConical, RotateCcw, TerminalSquare, Users, XCircle
 import { pinyin } from 'pinyin-pro';
 
 import { api, TENANT_ID } from '../api/client';
-import { useToolTest } from '../hooks/useToolTest';
 import { isEnterpriseAdmin, type EnterpriseAuthUser } from '../auth';
 import AppHeader from '@/components/AppHeader';
 import CapabilityScopeLoading from '@/components/CapabilityScopeLoading';
@@ -68,7 +67,8 @@ import {
   visibleEmployeeAgents,
 } from '../employee';
 import { useClientPagination } from '../hooks/useClientPagination';
-import { isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
+import { useToolTest } from '../hooks/useToolTest';
+import { persistSharedAgentScope, isTeamScope, readEmployeeScope } from '../lib/agent-scope-storage';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import type {
   AgentProfileRead,
@@ -431,7 +431,7 @@ export default function ToolsPage({ currentUser, onLogout }: ToolPageProps = {})
       });
       setImportOpen(false);
       if (targetAgentId !== agentId) {
-        window.localStorage.setItem(ENTERPRISE_AGENT_STORAGE_KEY, targetAgentId);
+        persistSharedAgentScope(targetAgentId);
         window.dispatchEvent(new CustomEvent('ultrarag-enterprise-agent-scope-change', { detail: { agentId: targetAgentId } }));
         setAgentId(targetAgentId);
       } else {
@@ -2429,11 +2429,11 @@ function ToolProbeCard({ values }: { values: ToolFormValues }) {
   );
 }
 
-export function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; standalone?: boolean }) {
+function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead; standalone?: boolean }) {
   const [testJson, setTestJson] = useState(() => JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
-  const tracking = useToolTest(tool.id, currentAgentQuery(), tool.execution_policy?.poll_interval_seconds);
-  const testResult = tracking.result;
-  const loading = tracking.busy;
+  const testRun = useToolTest(tool.id);
+  const testResult = testRun.result === null ? '' : JSON.stringify(testRun.result, null, 2);
+  const loading = testRun.busy;
 
   useEffect(() => {
     setTestJson(JSON.stringify(exampleFromSchema(tool.input_schema), null, 2));
@@ -2447,7 +2447,12 @@ export function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead
       notify.error('测试参数不是合法 JSON');
       return;
     }
-    await tracking.submit(argumentsJson);
+    try {
+      const agentQuery = currentAgentQuery();
+      await testRun.submit(`/api/enterprise/tools/${tool.id}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`, argumentsJson);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '调用失败');
+    }
   }
 
   return (
@@ -2461,7 +2466,7 @@ export function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead
         </span>
       )}
       extra={(
-        <UIButton disabled={loading || Boolean(tracking.taskId)} onClick={() => void test()} className={PRIMARY_BUTTON_CLASS}>
+        <UIButton disabled={loading} onClick={() => void test()} className={PRIMARY_BUTTON_CLASS}>
           <ExperimentOutlined />
           调用
         </UIButton>
@@ -2480,7 +2485,6 @@ export function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead
         <Textarea
           rows={8}
           className={MONO_INPUT_CLASS}
-          disabled={tracking.parametersLocked}
           value={testJson}
           onChange={(event) => setTestJson(event.target.value)}
         />
@@ -2488,12 +2492,11 @@ export function SavedToolTestCard({ tool, standalone = false }: { tool: ToolRead
       <div className="flex flex-col gap-[10px]">
         <div className="flex items-center justify-between gap-[10px]">
           <span className={SUBSECTION_TITLE_CLASS}>调用结果</span>
-          <StatusBadge tone={tracking.status === '已完成' || tracking.status === '已返回' ? 'green' : 'gray'}>{tracking.status}</StatusBadge>
+          <StatusBadge tone={testRun.status === 'completed' ? 'green' : 'gray'}>
+            {testRun.status === 'tracking_blocked' ? '跟踪已暂停，请检查权限或模块；勿重复提交' : loading ? '任务进行中' : testRun.status === 'completed' ? '已完成' : testRun.status ? '任务已结束，请查看结果' : '等待调用'}
+          </StatusBadge>
         </div>
-        {tracking.error && <p role="alert" className="text-sm text-red-600">{tracking.error}</p>}
-        {tracking.taskId && !loading && (
-          <UIButton onClick={tracking.retryStatus}>重新查询状态（不重新提交）</UIButton>
-        )}
+        {testRun.queryError && <p role="status" className="text-[13px] text-amber-700">状态查询暂不可用，正在重试查询，不会重复提交：{testRun.queryError}</p>}
         {testResult ? (
           <CodeBlock className="max-h-[340px] whitespace-pre-wrap wrap-break-word" code={testResult} language="json" />
         ) : (

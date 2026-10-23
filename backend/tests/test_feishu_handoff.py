@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -20,6 +21,17 @@ from app.db.models import (
     User,
     utc_now,
 )
+
+
+@pytest.fixture(autouse=True)
+def standalone_channel_handoff(monkeypatch):
+    """Test the legacy outbox with an explicit local assembly and channel adapter."""
+    from app.channels.adapters import base
+    from app.channels.adapters.wecom import WeComAdapter
+    from staffdeck_harness.security.oss_local import build_oss_local_profile
+    monkeypatch.setattr("staffdeck_harness.modules.registry._active", None)
+    monkeypatch.setattr("staffdeck_harness.security.profile._active", build_oss_local_profile())
+    monkeypatch.setitem(base._adapters, "wecom", WeComAdapter())
 
 
 class FakeEvents:
@@ -854,9 +866,9 @@ def test_run_wecom_handoff_reply_records_wecom_source(monkeypatch) -> None:
             db_arg.commit()
             resumed.append(source)
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: "corp_1"
         try:
@@ -936,9 +948,9 @@ def test_run_wecom_handoff_reply_uses_latest_delivered_notice(monkeypatch) -> No
             db_arg.commit()
             resumed.append(row.id)
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: "corp_1"
         try:
@@ -1013,9 +1025,9 @@ def test_run_wecom_handoff_reply_accepts_explicit_handoff_id(monkeypatch) -> Non
             db_arg.commit()
             resumed.append(row.id)
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: "corp_1"
         try:
@@ -1549,9 +1561,9 @@ def test_try_handle_feishu_handoff_reply_matches_and_answers_handoff(monkeypatch
                 db_arg.commit()
                 resumed.append((row.id, source))
 
-            import app.api.chat as chat_api
+            import app.core.handoff_reply_service as chat_api
 
-            monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+            monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
             handled = _try_handle_feishu_handoff_reply(
                 db, binding, inbound, event,
@@ -1669,9 +1681,9 @@ def test_try_handle_feishu_handoff_reply_consumes_already_answered_notice(monkey
             def fake_apply(db_arg, row, reply, *, answered_by_user_id, source="web"):
                 applied.append((row.id, reply))
 
-            import app.api.chat as chat_api
+            import app.core.handoff_reply_service as chat_api
 
-            monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+            monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
             handled = _try_handle_feishu_handoff_reply(db, binding, inbound, event, {})
             assert handled is True
@@ -1735,9 +1747,9 @@ def test_try_handle_feishu_handoff_reply_consumes_reply_to_ack_message(monkeypat
             def fake_apply(db_arg, row, reply, *, answered_by_user_id, source="web"):
                 applied.append((row.id, reply))
 
-            import app.api.chat as chat_api
+            import app.core.handoff_reply_service as chat_api
 
-            monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+            monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
             handled = _try_handle_feishu_handoff_reply(db, binding, inbound, event, {})
             assert handled is True
@@ -1807,9 +1819,9 @@ def test_process_inbound_quote_reply_without_prefix_answers_handoff(monkeypatch)
                 db_arg.commit()
                 applied.append((row.id, reply, source))
 
-            import app.api.chat as chat_api
+            import app.core.handoff_reply_service as chat_api
 
-            monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+            monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
             inbound = ChannelInbound(
                 channel="feishu",
@@ -1905,9 +1917,9 @@ def test_process_inbound_quote_reply_to_answered_notice_consumes_without_new_ses
             def fake_apply(db_arg, row, reply, *, answered_by_user_id, source="web"):
                 applied.append((row.id, reply))
 
-            import app.api.chat as chat_api
+            import app.core.handoff_reply_service as chat_api
 
-            monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+            monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
             inbound = ChannelInbound(
                 channel="feishu",
@@ -2015,9 +2027,9 @@ def test_run_handoff_reply_command_matches_by_identity(monkeypatch) -> None:
             db_arg.commit()
             resumed.append((row.id, source))
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: ""
@@ -2183,9 +2195,9 @@ def test_run_handoff_reply_command_rejects_multiple_pending(monkeypatch) -> None
             db_arg.commit()
             resumed.append(row.id)
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: ""
@@ -2310,9 +2322,9 @@ def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
             db_arg.commit()
             resumed.append(row.id)
 
-        import app.api.chat as chat_api
+        import app.core.handoff_reply_service as chat_api
 
-        monkeypatch.setattr(chat_api, "_apply_handoff_reply", fake_apply)
+        monkeypatch.setattr(chat_api, "apply_handoff_reply", fake_apply)
 
         original = intake_mod.external_account_scope
         intake_mod.external_account_scope = lambda _db, _b: ""
@@ -2329,7 +2341,8 @@ def test_run_handoff_reply_command_matches_by_parent_id(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_apply_handoff_reply_records_source_feishu() -> None:
+def test_apply_handoff_reply_records_source_feishu(monkeypatch) -> None:
+    monkeypatch.setattr("app.api.chat._resume_human_handoff_async", lambda hid: None)
     from app.api.chat import _apply_handoff_reply
     from app.db.models import AgentEvent
 
@@ -2359,7 +2372,8 @@ def test_apply_handoff_reply_records_source_feishu() -> None:
         assert events[0].payload_json["source"] == "feishu"
 
 
-def test_apply_handoff_reply_records_source_web_by_default() -> None:
+def test_apply_handoff_reply_records_source_web_by_default(monkeypatch) -> None:
+    monkeypatch.setattr("app.api.chat._resume_human_handoff_async", lambda hid: None)
     from app.api.chat import _apply_handoff_reply
     from app.db.models import AgentEvent
 

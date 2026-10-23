@@ -68,7 +68,6 @@ from app.harness.sandbox import parse_network_policy
 from app.knowledge.citations import knowledge_citations_from_results
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
-from app.skills.tool_authorization import current_sop_tool_authorization
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 
@@ -168,6 +167,7 @@ class HarnessCapabilityInvoker:
                 if name in self._descriptors
             }
         )
+        self.module_invoke = None
 
     def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self._raise_if_cancelled()
@@ -177,24 +177,31 @@ class HarnessCapabilityInvoker:
         if descriptor is None:
             return _failure(
                 "TOOL_NOT_AVAILABLE",
-                "该能力不在当前 TaskFrame 的冻结清单中。",
+                "当前 TaskFrame 的可见清单中未找到该能力。先通过 capability_search 核对准确名称和绑定；本次未执行业务操作。",
+                executed=False, next_action="capability_search",
             )
         if name not in self._activated_names:
             return _failure(
                 "CAPABILITY_NOT_ACTIVATED",
-                "该能力尚未在当前 AgentLoop 中展开；请先调用 capability_describe。",
+                "该能力已在目录中，但尚未展开。先调用 capability_describe 获取完整 schema，再按定义调用；本次未执行业务操作。",
+                executed=False, next_action="capability_describe",
             )
         current_descriptor = self._currently_authorized_descriptor(descriptor)
         if current_descriptor is None:
             return _failure(
                 "CAPABILITY_AUTHORIZATION_REVOKED",
-                "该能力在当前 HarnessRun 执行前已被撤权、归档或改为不可用。",
+                "该能力的授权或配置已变化，当前执行被拒绝。请检查权限或绑定后重新装配，不要通过其他工具绕过；本次未执行业务操作。",
+                executed=False, next_action="check_authorization",
             )
         self._raise_if_cancelled()
         logical_action_key = self._logical_action_key(
             descriptor,
             arguments,
         )
+        if self.module_invoke is not None:
+            result = self.module_invoke(name, arguments, descriptor)
+            if result is not None:
+                return result
         if logical_action_key:
             replayed = self._replay_or_block(logical_action_key)
             if replayed is not None:
@@ -523,8 +530,6 @@ class HarnessCapabilityInvoker:
             return self._search_capabilities(arguments)
         if name == "capability_describe":
             return self._describe_capabilities(arguments)
-        if name == "external_task_status":
-            return self._external_task_status(arguments)
         if name == "list_published_deliverables":
             return self._list_published_deliverables(arguments)
         if name == "read_published_deliverable":
@@ -978,8 +983,10 @@ class HarnessCapabilityInvoker:
         )
         if not activated:
             return _failure(
-                "CAPABILITY_NOT_AVAILABLE",
-                "请求的能力不存在或已不可用。",
+                "CAPABILITY_AUTHORIZATION_REVOKED" if revoked else "CAPABILITY_NOT_AVAILABLE",
+                "请求能力的授权或配置已失效，请检查权限或绑定后重新装配。" if revoked else "当前可见目录中未找到请求的能力，请通过 capability_search 核对名称或 ID。",
+                executed=False, next_action="check_authorization" if revoked else "capability_search",
+                not_found=not_found, revoked=revoked,
             )
         return {
             "success": True,
@@ -1272,14 +1279,9 @@ class HarnessCapabilityInvoker:
             self.tenant_id,
             ToolCall(name=source_tool_name, arguments=resolved_arguments),
             active_skill_id=self.active_skill_id,
-            sop_authorization=current_sop_tool_authorization(
-                self.tenant_id, self.active_skill, self.active_step_id,
-            ),
             agent_id=self.agent_id,
             session_id=self.session.id,
             invocation_id=call_id,
-            task_frame_id=self.task_frame_id,
-            user_id=self.session.user_id,
             timeout_seconds_override=self._remaining_step_seconds(),
         )
         payload = result.model_dump(mode="json")

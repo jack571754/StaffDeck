@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 from app.db.models import ChatSession, Skill
 from app.session.session_schema import RouterDecision, TurnPlan
+from staffdeck_harness.sop.fields import slot_field_names
 
 
 class SlotHydrationPolicy:
     ALLOWED_MEMORY_KINDS = frozenset({"profile", "preference", "fact"})
-    SLOT_MEMORY_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    SLOT_MEMORY_KEY_ALIASES: ClassVar[dict[str, tuple[str, ...]]] = {
         "user_name": ("preferred_name",),
     }
 
@@ -177,7 +178,7 @@ class SlotHydrationPolicy:
         fields: set[str] = set()
         required_info = content.get("required_info")
         if isinstance(required_info, list):
-            fields.update(str(item) for item in required_info if str(item).strip())
+            fields.update(slot_field_names(required_info))
         nodes = content.get("nodes")
         if isinstance(nodes, list):
             for node in nodes:
@@ -185,7 +186,7 @@ class SlotHydrationPolicy:
                     continue
                 expected = node.get("expected_user_info")
                 if isinstance(expected, list):
-                    fields.update(str(item) for item in expected if str(item).strip())
+                    fields.update(slot_field_names(expected))
         return fields
 
     @classmethod

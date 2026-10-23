@@ -72,7 +72,7 @@ deployments, you can also override the launch at runtime with
 
 ```text
 Read https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.md.
-Clone the OpenBMB/StaffDeck repository, prepare Python 3.11 or newer and Node.js 20,
+Clone the OpenBMB/StaffDeck repository, prepare Python 3.11 or newer and Node.js 22.19+,
 create backend/.venv, install the backend and frontend dependencies, copy
 backend/.env.example to backend/.env, ask me for the OpenAI-compatible model
 endpoint and API key if they are missing, and use the commands documented for
@@ -107,6 +107,28 @@ plus /workspace/gallery before reporting success.
   - [Citation](#citation)
   - [License](#license)
   - [Acknowledgments](#acknowledgments)
+
+## OSS release and CLI
+
+This checkout contains the standalone OSS product and the Harness v3 runtime.
+See [installation and upgrades](INSTALL.md) and the [CLI guide](CLI.md).
+Use Python 3.11+ and Node.js **22.19+ within 22.x, or 24+**:
+
+```sh
+python3 prepare.py
+staffdeck serve
+# In another terminal:
+staffdeck login       # fresh installations: admin / admin
+staffdeck agent list
+staffdeck chat
+staffdeck chat --agent 财务
+```
+
+Fresh installations include IT, HR, Administration, Finance and Legal employees
+owned by `@admin`, with their SOPs, knowledge bases, skills and example connectors.
+Existing installations retain their accounts, data and encryption key.
+Configure a model before chatting; provider credentials are never shipped.
+[Release build instructions](packaging/RELEASE.md).
 
 ## Quick Start
 

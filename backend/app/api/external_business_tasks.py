@@ -51,8 +51,6 @@ def task_read(task: ExternalBusinessTask, db: Session) -> dict[str, Any]:
         "result": task.result_json or {},
         "error": task.error_json or {},
         "poll_attempts": task.poll_attempts,
-        "next_poll_at": task.next_poll_at.isoformat() if task.next_poll_at else None,
-        "expires_at": task.expires_at.isoformat() if task.expires_at else None,
         "created_at": task.created_at.isoformat(),
         "accepted_at": task.accepted_at.isoformat() if task.accepted_at else None,
         "finished_at": task.finished_at.isoformat() if task.finished_at else None,
@@ -96,6 +94,42 @@ def get_external_business_task(
     return task_read(rows[0], db)
 
 
+@enterprise_router.post('/{external_task_id}/resume-tracking')
+def resume_external_task_tracking(external_task_id: str, tenant_id: str = Query(...),
+        db: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
+    """Explicitly reauthorize status tracking, never resubmit the original business request."""
+    ensure_current_user_tenant(tenant_id, current_user)
+    task = db.get(ExternalBusinessTask, external_task_id)
+    if task is None or (task.tenant_id, task.user_id) != (tenant_id, current_user.id):
+        raise HTTPException(404, 'External business task not found')
+    if task.status != 'tracking_blocked' or not task.external_task_id or not task.status_url:
+        raise HTTPException(409, '只能恢复有供应商任务 ID 的已暂停状态跟踪，不会重放提交')
+    if (task.status_config_json or {}).get('_result_blocked'):
+        raise HTTPException(409, '结果监管未通过，需要审核结果策略并由供应商重新回调，不能自动重放')
+    from staffdeck_harness.runtime.external_tasks import resolve_task_tool
+    from staffdeck_harness.contracts.errors import ModuleSdkError
+    from app.db.models import utc_now
+    try:
+        with resolve_task_tool(db, task):
+            pass
+    except ModuleSdkError as exc:
+        raise HTTPException(409, exc.to_dict()) from None
+    from sqlalchemy import update
+    db.exec(update(ExternalBusinessTask).where(ExternalBusinessTask.id == task.id,
+        ExternalBusinessTask.tenant_id == tenant_id).values(id=ExternalBusinessTask.id)
+        .execution_options(synchronize_session=False))
+    db.refresh(task)
+    if task.status != 'tracking_blocked' or (task.status_config_json or {}).get('_result_blocked'):
+        db.rollback()
+        raise HTTPException(409, '任务状态已变化，请刷新；没有重新提交业务请求')
+    task.status = 'accepted'
+    task.next_poll_at = utc_now()
+    task.error_json = {}
+    db.add(task)
+    db.commit()
+    return task_read(task, db)
+
+
 @callback_router.post("/{task_id}/callback")
 def external_business_task_callback(
     task_id: str,
@@ -103,9 +137,24 @@ def external_business_task_callback(
     callback_token: str = Header(default="", alias="X-StaffDeck-Callback-Token"),
     db: Session = Depends(get_session),
 ) -> dict[str, Any]:
+    from staffdeck_harness.modules.registry import peek_registry
+    if peek_registry() is not None:
+        from staffdeck_harness.runtime.services import maintenance_sessions
+        # Resolve only through the currently selected storage module. An opaque
+        # task ID plus the per-task secret is the callback authority, not a user
+        # or tenant claim supplied by the Provider.
+        for runtime_db in maintenance_sessions():
+            task = runtime_db.get(ExternalBusinessTask, task_id)
+            if task is not None and verify_callback_token(task, callback_token):
+                return _apply_callback(runtime_db, task, request)
+        raise HTTPException(status_code=401, detail="Invalid callback credential")
     task = db.get(ExternalBusinessTask, task_id)
     if task is None or not verify_callback_token(task, callback_token):
         raise HTTPException(status_code=401, detail="Invalid callback credential")
+    return _apply_callback(db, task, request)
+
+
+def _apply_callback(db, task, request):
     if request.task_id and request.task_id != task.external_task_id:
         raise HTTPException(
             status_code=409,

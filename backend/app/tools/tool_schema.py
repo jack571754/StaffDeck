@@ -8,6 +8,7 @@ from app.capability_scope import CapabilityScope
 
 
 class ToolExecutionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     timeout_seconds: float = Field(ge=1, le=3600)
     execution_mode: Literal["sync", "detached"] = "sync"
     async_strategy: Literal["staffdeck_worker", "provider_task"] = "staffdeck_worker"
@@ -48,6 +49,12 @@ class ToolCreateRequest(BaseModel):
     allowed_skills: list[str] = Field(default_factory=list)
     capability_scope: CapabilityScope = "general"
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_detached_transport(self):
+        if self.execution_policy and self.execution_policy.execution_mode == "detached" and self.tool_type != "http":
+            raise ValueError("Detached execution is supported only for HTTP tools")
+        return self
 
 
 class ToolUpdateRequest(ToolCreateRequest):
@@ -123,7 +130,6 @@ class ToolResult(BaseModel):
 
 
 class ToolTestRequest(BaseModel):
-    client_request_id: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
     tenant_id: str
     arguments: dict[str, Any] = Field(default_factory=dict)
 

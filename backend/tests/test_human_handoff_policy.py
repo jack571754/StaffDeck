@@ -21,6 +21,14 @@ from app.session.session_schema import ChatTurnRequest, RouterDecision, StepAgen
 from app.session.slot_policy import strip_router_generated_message_slots
 
 
+@pytest.fixture(autouse=True)
+def standalone_handoff_policy(monkeypatch):
+    """Legacy policy fixtures are not a deployed modular Runtime or Base identity realm."""
+    from staffdeck_harness.security.oss_local import build_oss_local_profile
+    monkeypatch.setattr("staffdeck_harness.modules.registry._active", None)
+    monkeypatch.setattr("staffdeck_harness.security.profile._active", build_oss_local_profile())
+
+
 class FakeEvents:
     def __init__(self) -> None:
         self.records: list[tuple[str, str, str, dict]] = []
@@ -143,7 +151,6 @@ def test_handoff_requires_structured_step_declaration():
 
 def test_handoff_assignee_uses_agent_owner_metadata_before_admin():
     engine = _test_engine()
-    session_id = "session_wecom_group_resume"
     with Session(engine) as db:
         _admin, user, other = _seed_handoff_users(db)
         db.add(
@@ -733,8 +740,8 @@ def test_handoff_resume_worker_continues_original_session_once(monkeypatch):
         def handle_turn(self, request: ChatTurnRequest) -> None:
             handled_requests.append(request)
 
-    monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    monkeypatch.setattr("app.core.handoff_reply_service.engine", engine)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FakeAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         db.add(
@@ -804,8 +811,8 @@ def test_handoff_resume_worker_prefers_session_user_after_rebind(monkeypatch):
         def handle_turn(self, request: ChatTurnRequest) -> None:
             handled_requests.append(request)
 
-    monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    monkeypatch.setattr("app.core.handoff_reply_service.engine", engine)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FakeAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         # 会话属主已被迁移到 admin(重绑后);handoff 快照仍是旧的懒建账号 user。
@@ -853,8 +860,8 @@ def test_handoff_resume_worker_restores_original_wecom_group_target(monkeypatch)
         def handle_turn(self, request: ChatTurnRequest) -> None:
             handled_requests.append(request)
 
-    monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FakeAgentLoop)
+    monkeypatch.setattr("app.core.handoff_reply_service.engine", engine)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FakeAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         session = ChatSession(
@@ -920,8 +927,8 @@ def test_handoff_resume_worker_persists_failed_resume(monkeypatch):
         def handle_turn(self, request: ChatTurnRequest) -> None:
             raise RuntimeError(f"resume failed for {request.session_id}")
 
-    monkeypatch.setattr(chat_api, "engine", engine)
-    monkeypatch.setattr(chat_api, "AgentLoop", FailingAgentLoop)
+    monkeypatch.setattr("app.core.handoff_reply_service.engine", engine)
+    monkeypatch.setattr("app.core.agent_loop.AgentLoop", FailingAgentLoop)
     with Session(engine) as db:
         _admin, user, _other = _seed_handoff_users(db)
         db.add(
@@ -974,3 +981,45 @@ def test_router_generated_message_slots_are_not_persisted():
     )
 
     assert cleaned == {"product_id": "A1", "quantity": 1}
+
+
+def test_user_can_request_handoff_on_own_session():
+    engine = _test_engine()
+    with Session(engine) as db:
+        admin, user, other = _seed_handoff_users(db)
+        db.add(ChatSession(id="session_own", tenant_id="tenant_demo", user_id=user.id, agent_id="agent_demo"))
+        db.commit()
+
+        created = chat_api.create_human_handoff(
+            "session_own",
+            chat_api.HumanHandoffCreateRequest(
+                tenant_id="tenant_demo", message_id="m1", reasons=["答案不对"], note="请人工看下"
+            ),
+            current_user=user,
+            db=db,
+        )
+
+        assert created.status == "pending"
+        assert created.session_id == "session_own"
+        row = db.get(HumanHandoffRequest, created.id)
+        assert row.requester_user_id == user.id
+        assert row.metadata_json["source"] == "user_request"
+        assert row.metadata_json["reasons"] == ["答案不对"]
+        assert row.metadata_json["message_ids"] == ["m1"]
+
+
+def test_handoff_request_rejected_for_other_users_session():
+    engine = _test_engine()
+    with Session(engine) as db:
+        admin, user, other = _seed_handoff_users(db)
+        db.add(ChatSession(id="session_other", tenant_id="tenant_demo", user_id=other.id, agent_id="agent_demo"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            chat_api.create_human_handoff(
+                "session_other",
+                chat_api.HumanHandoffCreateRequest(tenant_id="tenant_demo"),
+                current_user=user,
+                db=db,
+            )
+        assert exc.value.status_code in {403, 404}

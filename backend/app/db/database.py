@@ -66,7 +66,8 @@ def init_db() -> None:
     _configure_sqlite_runtime()
     SQLModel.metadata.create_all(engine)
     _migrate_sqlite_skill_schema()
-    _purge_orphaned_chat_sessions()
+    if settings.startup_orphan_cleanup_enabled:
+        _purge_orphaned_chat_sessions()
 
 
 def _purge_orphaned_chat_sessions() -> None:
@@ -1298,7 +1299,9 @@ def _migrate_wechat_kf_accounts(conn, tables: set[str]) -> None:
     if "channel_bindings" in tables:
         rows = conn.execute(
             text(
-                "SELECT id, tenant_id, agent_id, team_id, config_json "
+                "SELECT id, tenant_id, agent_id, "
+                + ("team_id" if "team_id" in {column["name"] for column in inspect(conn).get_columns("channel_bindings")} else "NULL AS team_id")
+                + ", config_json "
                 "FROM channel_bindings WHERE channel = 'wechat_kf'"
             )
         ).mappings().all()
@@ -2279,13 +2282,15 @@ def _migrate_harness_v2_schema(conn, inspector, tables: set[str]) -> None:
 
 def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
     tenant_ids = _tenant_ids(conn, tables)
+    default_ids: dict[str, str] = {}
     if "knowledge_bases" in tables:
         for tenant_id in tenant_ids:
             default_id = _default_knowledge_base_id(tenant_id)
             existing = conn.execute(
-                text("SELECT id FROM knowledge_bases WHERE id = :id"),
-                {"id": default_id},
+                text("SELECT id FROM knowledge_bases WHERE tenant_id = :tenant_id AND (id = :id OR name = :name) ORDER BY CASE WHEN id = :id THEN 0 ELSE 1 END LIMIT 1"),
+                {"id": default_id, "tenant_id": tenant_id, "name": "默认知识库"},
             ).first()
+            default_ids[tenant_id] = str(existing[0]) if existing else default_id
             if not existing:
                 conn.execute(
                     text(
@@ -2330,7 +2335,7 @@ def _migrate_knowledge_base_schema(conn, inspector, tables: set[str]) -> None:
             if tenant_id:
                 conn.execute(
                     text(f"UPDATE {table_name} SET {column_name} = :knowledge_base_id WHERE tenant_id = :tenant_id AND ({column_name} IS NULL OR {column_name} = '')"),
-                    {"tenant_id": tenant_id, "knowledge_base_id": _default_knowledge_base_id(tenant_id)},
+                    {"tenant_id": tenant_id, "knowledge_base_id": default_ids.get(tenant_id, _default_knowledge_base_id(tenant_id))},
                 )
 
     resolved_version_ids: dict[str, str] = {}
@@ -2687,7 +2692,7 @@ def _seed_default_agents(conn, tables: set[str]) -> None:
         for agent_id, name, is_overall in (
             (_overall_agent_id(tenant_id), "整体智能体", True),
         ):
-            existing = conn.execute(text("SELECT id FROM agent_profiles WHERE id = :id"), {"id": agent_id}).first()
+            existing = conn.execute(text("SELECT id FROM agent_profiles WHERE tenant_id = :tenant_id AND (id = :id OR is_overall = 1)"), {"id": agent_id, "tenant_id": tenant_id}).first()
             if existing:
                 continue
             conn.execute(

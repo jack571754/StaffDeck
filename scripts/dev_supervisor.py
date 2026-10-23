@@ -250,7 +250,7 @@ def build_services() -> list[Service]:
                     str(backend_python),
                     "-m",
                     "uvicorn",
-                    "single_port_app:app",
+                    "staffdeck_harness.distribution.asgi:app" if (ROOT_DIR / "distribution/manifest.json").is_file() else "single_port_app:app",
                     "--host",
                     APP_HOST,
                     "--port",

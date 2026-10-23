@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.channels.storage import channel_session
+
 import asyncio
 import json
 import logging
@@ -13,11 +15,12 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
-from sqlalchemy import text, update
+from sqlalchemy import update
 from sqlalchemy.pool import NullPool
-from sqlmodel import Session, create_engine, select
+from sqlmodel import create_engine, select
 
 from app.channels.adapters.base import (
+    ManagedIngressLifecycle,
     ChannelInbound,
     ChannelInboundAttachment,
     register_channel_adapter,
@@ -29,7 +32,7 @@ from app.channels.media import (
     ensure_channel_media_size,
 )
 from app.db import engine
-from app.db.models import ChannelBinding, GeneralSkill, Skill, Tool, utc_now
+from app.db.models import ChannelBinding, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -84,31 +87,8 @@ def _split_wecom_text(text: str, max_bytes: int = 1800) -> list[str]:
 def _load_wecom_progress_names(
     binding: ChannelBinding,
 ) -> tuple[dict[str, str], dict[str, dict[str, str]], dict[str, str]]:
-    with Session(engine) as db:
-        skill_names: dict[str, str] = {}
-        step_names: dict[str, dict[str, str]] = {}
-        for skill in db.exec(select(Skill).where(Skill.tenant_id == binding.tenant_id)).all():
-            skill_names[skill.skill_id] = skill.name
-            steps = {
-                str(node.get("node_id") or "").strip(): str(node.get("name") or "").strip()
-                for node in (skill.content_json or {}).get("nodes") or []
-                if isinstance(node, dict)
-                and str(node.get("node_id") or "").strip()
-                and str(node.get("name") or "").strip()
-            }
-            if steps:
-                step_names[skill.skill_id] = steps
-        tool_names = {
-            tool.name: str(tool.display_name or tool.description or "").strip()
-            for tool in db.exec(select(Tool).where(Tool.tenant_id == binding.tenant_id)).all()
-            if str(tool.display_name or tool.description or "").strip()
-        }
-        for skill in db.exec(
-            select(GeneralSkill).where(GeneralSkill.tenant_id == binding.tenant_id)
-        ).all():
-            if skill.slug and skill.name:
-                tool_names[f"general_skill.{skill.slug}"] = skill.name
-    return skill_names, step_names, tool_names
+    # The same composition_snapshot_compiled event enriches every trace renderer.
+    return {}, {}, {}
 
 
 async def _download_wecom_media_limited(url: str, aes_key: str) -> tuple[bytes, str | None]:
@@ -369,6 +349,16 @@ class WeComStreamReply:
             if self._finished or self._failed:
                 return
             self._answer += delta
+            self._answer_started = True
+            self._animation_enabled = False
+            self._dirty = True
+            self._condition.notify_all()
+
+    def on_replace(self, text: str) -> None:
+        with self._condition:
+            if self._finished or self._failed or text == self._answer:
+                return
+            self._answer = text
             self._answer_started = True
             self._animation_enabled = False
             self._dirty = True
@@ -665,7 +655,7 @@ class WeComStreamManager:
         ) and not (reconcile_thread and reconcile_thread.is_alive())
 
     def ensure_binding(self, binding_id: str) -> None:
-        with Session(self._engine) as db:
+        with channel_session(self._engine) as db:
             binding = db.get(ChannelBinding, binding_id)
             if not binding or binding.status != "active":
                 return
@@ -794,14 +784,16 @@ class WeComStreamManager:
 
     def reconcile_once(self) -> None:
         """对比 DB 中 active 企微绑定与运行中线程，热启停 + connected 状态对账。"""
-        with Session(self._engine) as db:
+        with channel_session(self._engine) as db:
             rows = db.exec(
                 select(ChannelBinding).where(
                     ChannelBinding.channel == "wecom",
                     ChannelBinding.status == "active",
                 )
             ).all()
-        active_ids = {row.id for row in rows}
+        from app.channels.adapters.base import builtin_channel_enabled
+
+        active_ids = {row.id for row in rows} if builtin_channel_enabled("wecom") else set()
         with self._lock:
             active_ids -= self._paused
         for binding_id in active_ids - self.running_binding_ids():
@@ -876,7 +868,7 @@ class WeComStreamManager:
         config_revision: int | None = None,
     ) -> None:
         try:
-            with Session(self._engine) as db:
+            with channel_session(self._engine) as db:
                 statement = update(ChannelBinding).where(
                     ChannelBinding.id == binding_id,
                     ChannelBinding.channel == "wecom",
@@ -894,15 +886,8 @@ class WeComStreamManager:
                 if result.rowcount == 1:
                     if connected:
                         # 断开告警标记在重连成功时清除(允许下次再告警)
-                        db.execute(
-                            text(
-                                "UPDATE channel_bindings "
-                                "SET config_json = json_remove(config_json, '$.disconnect_alerted_at'), "
-                                "updated_at = :updated_at "
-                                "WHERE id = :binding_id"
-                            ),
-                            {"binding_id": binding_id, "updated_at": utc_now()},
-                        )
+                        from app.channels.config_store import patch_binding_config
+                        patch_binding_config(db, binding_id, remove_keys=("disconnect_alerted_at",))
                     db.commit()
                 else:
                     db.rollback()
@@ -912,7 +897,7 @@ class WeComStreamManager:
     def _maybe_alert_disconnect_timeout(self, binding_id: str) -> None:
         """active 但持续未 connected 超阈值:给绑定创建者发一次性断开告警(config 标记防重复)。"""
         try:
-            with Session(self._engine) as db:
+            with channel_session(self._engine) as db:
                 binding = db.get(ChannelBinding, binding_id)
                 if not binding or binding.status != "active" or binding.connected:
                     return
@@ -1044,7 +1029,7 @@ class WeComStreamManager:
         try:
             if state.stop.is_set() or self._stopped.is_set():
                 return
-            with Session(self._engine) as db:
+            with channel_session(self._engine) as db:
                 binding = db.get(ChannelBinding, binding_id)
                 if not binding or binding.status != "active":
                     return
@@ -1083,7 +1068,11 @@ class WeComStreamManager:
                 logger.warning("企微事件循环关闭失败 binding=%s", binding_id, exc_info=True)
 
 
-class WeComAdapter:
+class WeComAdapter(ManagedIngressLifecycle):
+    @staticmethod
+    def handoff_target(external_user_id: str, handoff_id: str) -> dict[str, Any]:
+        return {"to_user_id": external_user_id, "handoff_id": handoff_id}
+
     """企微适配器:归一化 + 出站 send_message(run_coroutine_threadsafe)+ ingress。
 
     官方 SDK 无 typing 能力,故不实现 send_typing。
@@ -1225,15 +1214,10 @@ class WeComAdapter:
             tool_names=tool_names,
         )
 
-    def start_ingress(self, binding_id: str) -> None:
+    def ingress_manager(self):
         from app.channels import get_wecom_stream_manager
 
-        get_wecom_stream_manager().ensure_binding(binding_id)
-
-    def stop_ingress(self, binding_id: str) -> None:
-        from app.channels import get_wecom_stream_manager
-
-        get_wecom_stream_manager().stop_binding(binding_id)
+        return get_wecom_stream_manager()
 
 
 class WeComTokenError(RuntimeError):

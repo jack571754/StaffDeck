@@ -44,6 +44,14 @@ class User(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class DistributionInstallRecord(SQLModel, table=True):
+    __tablename__ = 'distribution_install_records'
+    tenant_id: str = Field(primary_key=True)
+    package_id: str
+    status: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class UserAvatar(SQLModel, table=True):
     """用户头像:小图以 data_url 直接存库(与聊天附件内联方式一致),
 

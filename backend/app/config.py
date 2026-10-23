@@ -5,6 +5,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    lark_cli_enabled: bool = True
+    lark_cli_auto_install: bool = True
+    lark_cli_binary_path: str = ""
+    package_source_root: str = ''
+    package_engine_root: str = ''
+    package_state_dir: str = ''
+    package_module_sources: dict[str, str] = {}
+    package_config_files: dict[str, str] = {}
+    package_worker_token: str = ''
+    demo_seed_enabled: bool = True
+    startup_orphan_cleanup_enabled: bool = True
     app_name: str = "Skill Agent Loop Service"
     database_url: str = "sqlite:///./skill_agent_loop.db"
     app_secret: str = "change-me-in-development"
@@ -24,14 +35,6 @@ class Settings(BaseSettings):
     codex_a2a_workspace_root: str = ""
     codex_a2a_timeout_seconds: float = 1800.0
     codex_a2a_token: str = ""
-    # 飞书官方 lark-cli 集成（app/lark_cli/）。开启即进入能力清单；应用凭据
-    # 与用户登录都在对话中完成（config init / auth login 设备码），无需预置
-    # 配置或飞书渠道绑定。
-    lark_cli_enabled: bool = True
-    # 二进制供给见 lark_cli/provision.py：懒加载（首次调用时装，非启动时），
-    # 装到用户数据目录。关掉自动安装则必须自备二进制并指定 binary_path。
-    lark_cli_auto_install: bool = True
-    lark_cli_binary_path: str = ""
     tool_base_url: str = "http://localhost:5173"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     general_skill_runtime_python: str = ""
@@ -54,6 +57,11 @@ class Settings(BaseSettings):
     )
     channel_secret: str = ""
     staffdeck_role: str = "all"
+
+    # Which SPA single_port_app serves at its web routes. Both SPAs are built with
+    # the same base path, so the choice is a serving decision, not a build one.
+    # "releases" = frontend-enterprise, "business" = staffdeck business SPA.
+    staffdeck_ui_variant: str = "releases"
     wechat_ilink_base_url: str = "https://ilinkai.weixin.qq.com"
     channel_delivery_poll_seconds: float = 1.0
     channel_delivery_max_attempts: int = 8
@@ -85,6 +93,54 @@ class Settings(BaseSettings):
     sales_dashboard_clickhouse_url: str = ""
     sales_dashboard_clickhouse_user: str = ""
     sales_dashboard_clickhouse_password: str = ""
+    # Legacy configuration fields are read for migration, not engine selection.
+    # Runtime assembly always enables the registered v3 engine.
+    harness_v3_enabled: bool = True
+    # Exposes /api/enterprise/harness (module registry, snapshot preview, ledger
+    # reconciliation, per-staff engine) even when turns still run on legacy, so
+    # operators can inspect the pluggable tree before switching engines.
+    harness_admin_api_enabled: bool = True
+    # Comma-separated module ids to disable, and extra "pkg.mod:register" specs.
+    harness_disabled_modules: str = ""
+    harness_modules: str = ""
+    # Admin-editable overrides (engine / security profile / disabled / extra modules);
+    # defaults to <harness_v3_home or cwd>/staffdeck-runtime.json.
+    harness_runtime_config_path: str = ""
+    # Where the admin page may point the enterprise permission centre. Comma-separated host[:port]
+    # patterns (fnmatch, e.g. "*.corp.example,10.0.*"); empty = loopback / private ranges only.
+    # Set to "*" to allow any host. https is required for public hosts.
+    base_url_allowlist: str = ""
+    harness_v3_root: str = ""
+    harness_v3_home: str = ""
+    harness_v3_node_bin: str = "node"
+    harness_v3_permission_mode: str = "danger-full-access"
+    harness_v3_staff_allowlist: str = ""
+    harness_v3_fallback_to_v2: bool = False  # deprecated; no execution path reads this switch
+    # Comma-separated tenant ids whose *admins* may mutate process-global runtime state
+    # (assembly config, restart, module placement/install, permission-centre test). Empty means
+    # the deployment is treated as single-operator: the tenant of the acting admin may change the
+    # runtime. Set this when multiple tenants share one process; without it, each tenant's admin
+    # would be able to change the engine/profile for everyone.
+    harness_operator_tenants: str = ""
+    harness_v3_initialize_timeout_seconds: float = 90.0
+    harness_v3_request_timeout_seconds: float = 600.0
+    # OSS_LOCAL or BUSINESS_BASE; one per deployment.
+    security_profile: str = "OSS_LOCAL"
+    harness_module_selections: dict[str, str] = {}
+    harness_enabled_modules: str = ""
+    harness_module_configs: dict[str, dict[str, object]] = {}
+    harness_presets_dir: str = ""
+    # Deployment-only; never changed by runtime presets or module enable/disable.
+    harness_control_auth_provider: str = ""
+    base_authz_url: str = ""
+    base_authz_decision_token: str = ""
+    base_authz_control_token: str = ""
+    base_authz_timeout_seconds: float = 3.0
+    base_authz_pending_timeout_seconds: float = 3.0
+    base_identity_internal_url: str = ""
+    base_identity_runtime_client_id: str = "agent-platform-runtime"
+    base_identity_runtime_client_secret: str = ""
+    base_workload_identity_audience: str = "staffdeck-gateway"
 
     model_config = SettingsConfigDict(
         env_file=_os.environ.get("ULTRARAG_DOTENV", ".env"),

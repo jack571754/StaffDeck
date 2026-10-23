@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import httpx
+import pytest
 from fastapi import HTTPException
 from sqlalchemy import inspect, text
 from sqlalchemy.pool import StaticPool
@@ -31,6 +32,13 @@ from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall, ToolResult
 
 
+@pytest.fixture(autouse=True)
+def standalone_release_tracker(monkeypatch):
+    # These upstream tests exercise the unassembled local transport. Modular
+    # identity/provider revalidation is covered by the Host contract tests.
+    monkeypatch.setattr("staffdeck_harness.modules.registry._active", None)
+
+
 class _Client:
     response_json: ClassVar[dict] = {"taskId": "provider-42", "status": "queued"}
     request_headers: ClassVar[dict[str, str]] = {}
@@ -52,6 +60,27 @@ class _Client:
             json=type(self).response_json,
             request=httpx.Request("POST", "https://provider.test/tasks"),
         )
+
+
+def test_old_async_completion_cannot_resume_a_new_wait_in_the_same_sop():
+    from app.tools.external_tasks import _prepare_sop_resume
+    with _session() as db:
+        user, tool = _seed(db)
+        frame = HarnessTaskFrameRecord(tenant_id="tenant_demo", session_id="session", source_turn_id="turn",
+            task_id="frame", kind="sop", skill_id="sop", status="waiting_external_task",
+            result_json={"structured_result":{"task_id":"current-task"}})
+        old = ExternalBusinessTask(id="old-task",tenant_id="tenant_demo",user_id=user.id,tool_id=tool.id,
+            session_id="session",task_frame_id="frame",callback_token_hash="hash",status="completed")
+        current = ExternalBusinessTask(id="current-task",tenant_id="tenant_demo",user_id=user.id,tool_id=tool.id,
+            session_id="session",task_frame_id="frame",callback_token_hash="hash",status="completed")
+        db.add_all([frame,old,current])
+        db.commit()
+        _prepare_sop_resume(db,old)
+        db.refresh(frame)
+        assert frame.status == "waiting_external_task"
+        _prepare_sop_resume(db,current)
+        db.refresh(frame)
+        assert frame.status == "ready_to_resume"
 
 
 def test_detached_submission_persists_task_and_returns_query_guidance(monkeypatch) -> None:
@@ -159,6 +188,28 @@ def test_provider_submission_rejects_accepted_response_without_task_id(monkeypat
         db.refresh(task)
         assert task.status == "failed"
         assert task.error_json["code"] == "PROVIDER_TASK_ID_MISSING"
+
+
+@pytest.mark.parametrize("provider_id", [0, 1, "0"])
+def test_http_200_task_id_without_status_schedules_polling(monkeypatch, provider_id):
+    class Client(_Client):
+        def request(self, method, url, **kwargs):
+            return httpx.Response(200, json={"taskId": provider_id},
+                request=httpx.Request(method, url))
+
+    monkeypatch.setattr("app.tools.tool_executor.httpx.Client", Client)
+    with _session() as db:
+        user, tool = _seed(db)
+        tool.config_json = {"execution": {**tool.config_json["execution"],
+            "async_strategy": "provider_task"}}
+        db.add(tool)
+        db.commit()
+        ToolExecutor(db).execute("tenant_demo", ToolCall(name=tool.name), user_id=user.id)
+        poll_due_external_tasks(db)
+        task = db.exec(select(ExternalBusinessTask)).one()
+        assert task.external_task_id == str(provider_id)
+        assert task.status == "accepted"
+        assert task.next_poll_at is not None
 
 
 def test_staffdeck_worker_executes_original_sync_tool(monkeypatch) -> None:

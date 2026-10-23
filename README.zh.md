@@ -72,7 +72,7 @@ URL。配置按用户保存，并在下次启动时生效。
 
 ```text
 阅读 https://raw.githubusercontent.com/OpenBMB/StaffDeck/main/README.zh.md。
-克隆 OpenBMB/StaffDeck 私有仓库，准备 Python 3.11 或更高版本和 Node.js 20，创建
+克隆 OpenBMB/StaffDeck 私有仓库，准备 Python 3.11 或更高版本和 Node.js 22.19+，创建
 backend/.venv，安装前后端依赖，将 backend/.env.example 复制为
 backend/.env；缺少 OpenAI 兼容模型地址或 API Key 时向我询问，并严格使用当前
 系统对应的文档命令。macOS/Linux/WSL 运行 scripts/dev_up.sh --detach，Windows
@@ -106,6 +106,26 @@ PowerShell 运行 .\scripts\dev_up.ps1 --detach；验证 /api/health 和
   - [引用](#引用)
   - [许可证](#许可证)
   - [致谢](#致谢)
+
+## 开源版安装、升级与 CLI
+
+本仓库发布可独立运行的 OSS 产品及 Harness v3 运行时。
+完整说明见 [安装与升级](INSTALL.md)、[CLI 使用](CLI.md) 和 [Release 构建](packaging/RELEASE.md)。
+需要 Python 3.11+、Node.js **22.x ≥22.19，或 ≥24**。
+
+```sh
+python3 prepare.py
+staffdeck serve
+# 另开终端：
+staffdeck login       # 全新安装：admin / admin
+staffdeck agent list
+staffdeck chat
+staffdeck chat --agent 财务
+```
+
+首次初始化携带 IT、人事、行政、财务、法务五位 `@admin` 员工及其关联资源。
+升级保留原账号、数据库、附件及加密密钥，不重置密码或覆盖员工内容。
+对话前需配置模型，发行包不携带模型凭据。
 
 ## 快速开始
 

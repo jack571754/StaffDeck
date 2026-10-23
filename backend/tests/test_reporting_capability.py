@@ -289,3 +289,101 @@ def test_report_generate_returns_a_failure_instead_of_raising(db: Session) -> No
 
     assert result["success"] is False
     assert result["error"]["code"] == "REPORT_GENERATION_ERROR"
+
+
+def test_v3_builtin_descriptors_and_report_artifact_contract(db: Session) -> None:
+    from types import SimpleNamespace
+
+    from staffdeck_harness.capabilities.staffdeck_builtins import NAMES, descriptor, invoke
+    from staffdeck_harness.contracts.invocation import InvocationContext, ModuleInvocation
+    from staffdeck_harness.contracts.sources import SourceContext
+
+    context = SourceContext(TENANT_ID, "agent_demo", None, "web", None)
+    for name in NAMES:
+        cap = descriptor(context, name)
+        assert cap.ref.id == name
+        assert cap.operation == "tool.invoke/v1"
+        assert cap.side_effecting == (name == "report_generate")
+    _add_frame(db)
+    host = SimpleNamespace(db=db, model_config=None, trace=None,
+                           fence=SimpleNamespace(check=lambda slot: None), slot=object())
+    inv = ModuleInvocation(
+        invocation_id="invoke_report_v3", module_id="tool.local", operation="tool.invoke/v1",
+        arguments={"title": "V3 report", "rows": _ROWS},
+        context=InvocationContext(TENANT_ID, "tenant_demo:overall", "user_owner", SESSION_ID,
+                                  "turn_demo", "web", task_frame_id=FRAME_ID),
+        binding_id="report_generate")
+    result = invoke(host, inv)
+    assert result.success, result.error
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0]["path"].endswith(".html")
+    assert "share_token" not in result.data
+
+    from app.core.task_request_compiler import TaskRequirement
+    from staffdeck_harness.bridge.task_agent import HarnessV3TaskAgent
+    from staffdeck_harness.capabilities.host import CapabilityHost
+    from staffdeck_harness.contracts.invocation import Receipt
+
+    # A report-only turn never calls sandbox_execute. The provider's artifact
+    # must survive host bookkeeping and the final TaskExecutionResult anyway.
+    host.results, host.citations, host.evidence = [], [], []
+    host._sandbox = None
+    host._descriptors = {(inv.operation, inv.binding_id): descriptor(context, inv.binding_id)}
+    host.project_result = lambda invocation, value: value
+    host._ledger = SimpleNamespace(cache_projection=lambda *args: None)
+    CapabilityHost._postprocess(host, inv, result,
+        Receipt("invoke_report_v3", "completed", "digest"))
+    artifacts = CapabilityHost.discover_artifacts(host, inv.context)
+    assert artifacts == list(result.artifacts)
+    requirement = TaskRequirement(task_frame_id=FRAME_ID, kind="conversation", goal="report")
+    agent = SimpleNamespace(_host=host)
+    final = HarnessV3TaskAgent._result(agent, requirement,
+        SimpleNamespace(finish={"status": "completed", "reply_fragment": "Report ready"}),
+        None, "Report ready", "completed", 1, artifacts, [])
+    assert final.artifacts == artifacts
+
+
+def test_v3_builtin_rejects_another_session_owner(db: Session) -> None:
+    from types import SimpleNamespace
+
+    from staffdeck_harness.capabilities.staffdeck_builtins import invoke
+    from staffdeck_harness.contracts.errors import PermissionDenied
+    from staffdeck_harness.contracts.invocation import InvocationContext, ModuleInvocation
+
+    inv = ModuleInvocation("wrong_owner", "tool.local", "tool.invoke/v1", {},
+        InvocationContext(TENANT_ID, "agent_demo", "another_user", SESSION_ID, "turn", "web"),
+        binding_id="data_query_search")
+    with pytest.raises(PermissionDenied):
+        invoke(SimpleNamespace(db=db), inv)
+
+
+def test_v3_workspace_preserves_scheduled_task_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from staffdeck_harness.capabilities import facade
+    from staffdeck_harness.contracts.invocation import InvocationContext
+    from staffdeck_harness.runtime.workspace import LocalWorkspaceModule
+
+    monkeypatch.setattr(facade, "SandboxFacade", lambda *args, **kwargs: kwargs)
+    ctx = InvocationContext(TENANT_ID, "agent", "user", SESSION_ID, "turn", "scheduled_task",
+                            scheduled_task_id="scheduled_demo")
+    activation = SimpleNamespace(context=ctx, policy={}, local_root=".",
+                                 require=lambda *args: None, emit=None, remaining_seconds=None)
+    result = LocalWorkspaceModule().build(activation)
+    assert result["scheduled_task_id"] == "scheduled_demo"
+
+
+@pytest.mark.parametrize("config,url", [
+    ({"source": "data_query", "template_id": "template_demo"}, "http://unused"),
+    ({}, "http://localhost/api/mock/data-query/template_demo"),
+])
+def test_v3_legacy_query_tools_use_native_executor(config: dict, url: str) -> None:
+    from types import SimpleNamespace
+
+    from staffdeck_harness.runtime.external_tasks import local_definition
+
+    row = SimpleNamespace(tenant_id=TENANT_ID, enabled=True, tool_type="http",
+                          config_json=config, url=url)
+    db = SimpleNamespace(get=lambda model, key: row)
+    inv = SimpleNamespace(binding_id="query_tool", context=SimpleNamespace(tenant_id=TENANT_ID))
+    assert local_definition(db, inv) is None

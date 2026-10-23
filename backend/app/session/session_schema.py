@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from app.tools.tool_schema import ToolCall, ToolResult
 
@@ -213,6 +213,10 @@ class SessionPublic(BaseModel):
 
 
 class ChatTurnRequest(BaseModel):
+    _control_subject: Any = PrivateAttr(default=None)
+    _trusted_execution: Any = PrivateAttr(default=None)
+    _runtime_namespace: str = PrivateAttr(default="oss-local")
+    _read_only: bool = PrivateAttr(default=False)
     tenant_id: str
     session_id: Optional[str] = None
     agent_id: Optional[str] = None
@@ -302,6 +306,9 @@ class ChatSessionRead(BaseModel):
     tenant_id: str
     user_id: Optional[str]
     agent_id: Optional[str] = None
+    agent_name: str | None = None
+    # None means availability was not checked or the authorizer could not answer.
+    agent_available: bool | None = None
     title: Optional[str]
     active_skill_id: Optional[str]
     active_step_id: Optional[str]

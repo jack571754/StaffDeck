@@ -1,3 +1,4 @@
+import { countEdgeLabels } from '../lib/sop-edge-counts';
 import {
   ApiOutlined,
   ArrowLeftOutlined,
@@ -5519,15 +5520,8 @@ function buildSkillFlowCanvasLayout(
     const sourceId = String(edge.source_node_id || '');
     if (sourceId) acc[sourceId] = (acc[sourceId] || 0) + 1;
     return acc;
-  }, {});
-  const sourceEdgeLabelCounts = rawEdges.reduce<Record<string, Record<string, number>>>((acc, edge) => {
-    const sourceId = String(edge.source_node_id || '').trim();
-    if (!sourceId) return acc;
-    const label = normalizedEdgeLabel(edge, nodeNameMap);
-    if (!acc[sourceId]) acc[sourceId] = {};
-    acc[sourceId][label] = (acc[sourceId][label] || 0) + 1;
-    return acc;
-  }, {});
+  }, Object.create(null));
+  const sourceEdgeLabelCounts = countEdgeLabels(rawEdges, (edge) => normalizedEdgeLabel(edge, nodeNameMap));
   const incomingCounts = rawEdges.reduce<Record<string, number>>((acc, edge) => {
     const targetId = String(edge.next_node_id || '');
     if (targetId) acc[targetId] = (acc[targetId] || 0) + 1;

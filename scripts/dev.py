@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import os
 import shutil
 import signal
@@ -315,6 +316,61 @@ def _ensure_sandbox_runtime() -> None:
     )
 
 
+def _ensure_oss_runtime() -> bool:
+    """Repair an unprepared bundled OSS checkout before stopping any running service."""
+    if not (ROOT_DIR / "distribution" / "manifest.json").is_file():
+        return False
+    engine = ROOT_DIR / "harness-engine"
+    configured = os.environ.get("HARNESS_V3_ROOT", "").strip()
+    if configured:
+        external = Path(configured).expanduser()
+        if not external.is_absolute():
+            # The supervisor launches the backend from backend/, matching the runtime.
+            external = ROOT_DIR / "backend" / external
+        if external.resolve() != engine.resolve():
+            return False
+
+    # The existing sandbox preparation already supplies a reviewed Node version.
+    # Select it for this launch and its children without changing the user's PATH.
+    node = ROOT_DIR / "packaging" / "sandbox_runtime" / "bin" / (
+        "node.exe" if sys.platform == "win32" else "node"
+    )
+    if node.is_file():
+        directory = str(node.parent)
+        paths = [value for value in os.environ.get("PATH", "").split(os.pathsep)
+                 if value != directory]
+        os.environ["PATH"] = os.pathsep.join([directory, *paths])
+        os.environ.setdefault("HARNESS_V3_NODE_BIN", str(node))
+
+    entry = engine / "apps" / "cli" / "lib" / "bin.js"
+
+    def ready() -> bool:
+        return (entry.is_file() and (engine / "node_modules").is_dir()
+                and importlib.util.find_spec("deepseek_harness") is not None)
+
+    if ready():
+        return False
+    print("Harness v3 runtime or SDK is incomplete; preparing the OSS checkout...", flush=True)
+    subprocess.run(
+        [sys.executable, str(ROOT_DIR / "prepare.py"), "--without-backend", "--no-cli-link"],
+        cwd=ROOT_DIR,
+        check=True,
+    )
+    # Reuse the active environment instead of recreating its running virtualenv.
+    subprocess.run(
+        [sys.executable, str(ROOT_DIR / "packaging" / "distribution" / "install_dependencies.py")],
+        cwd=ROOT_DIR,
+        check=True,
+    )
+    importlib.invalidate_caches()
+    if not ready():
+        raise RuntimeError(
+            "OSS preparation did not produce a complete Harness v3 runtime and Python SDK; "
+            "check the preparation output above."
+        )
+    return True
+
+
 def _url_ready(url: str) -> bool:
     response = None
     try:
@@ -385,10 +441,14 @@ def command_up(detach_flag: bool) -> int:
     detach = detach_flag or _env_flag("DETACH")
     os.environ.setdefault("AUTO_RESTART", "1" if detach else "0")
     _ensure_backend_dependencies()
-    supervisor = _load_supervisor()
-    _ensure_frontend_dependencies()
-    supervisor.validate_prerequisites()
     _ensure_sandbox_runtime()
+    prepared = _ensure_oss_runtime()
+    supervisor = _load_supervisor()
+    if not prepared:
+        _ensure_frontend_dependencies()
+    supervisor.validate_prerequisites()
+    if supervisor.SINGLE_PORT and not prepared:
+        _build_frontend()
     stop_services(verbose=False)
     force_ports = _env_flag("FORCE_PORTS")
     if supervisor.SINGLE_PORT and not force_ports:
@@ -400,9 +460,6 @@ def command_up(detach_flag: bool) -> int:
             supervisor = importlib.reload(supervisor)
     for host, port in _service_ports(supervisor):
         _ensure_port_available(host, port, force_ports)
-    if supervisor.SINGLE_PORT:
-        _build_frontend()
-
     if not detach:
         print("StaffDeck development services are starting. Press Ctrl-C to stop.")
         return supervisor.main()

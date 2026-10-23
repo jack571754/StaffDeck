@@ -5,7 +5,6 @@ import copy
 import logging
 import re
 import socket
-import threading
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -23,7 +22,6 @@ from app.core.harness_turn_store import HarnessTurnConflict
 from app.db import engine
 from app.db.models import (
     AgentEvent,
-    AgentProfile,
     ChatSession,
     HarnessInvocationRecord,
     HarnessRunRecord,
@@ -45,13 +43,12 @@ from app.scheduled_tasks.schema import (
     ScheduledTaskRunRead,
     ScheduledTaskUpdateRequest,
 )
-from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
-from app.security.permissions import agent_owned_by_user as _agent_owned_by_user
-from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.artifact_share import redact_share_tokens
+from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
+from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 from app.skills.nesting import SopNestingError, expand_sop_for_execution
-
+from staffdeck_harness.contracts.staff import StaffProfile
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_TASK_TIME = "09:00"
@@ -428,8 +425,9 @@ def detect_scheduled_task_draft(
     timezone: str | None = None,
 ) -> ScheduledTaskDraftRead | None:
     ensure_tenant(db, tenant_id)
-    agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
+    from staffdeck_harness.runtime.staff_directory import optional_staff_profile
+    agent = optional_staff_profile(db, tenant_id, agent_id)
+    if not agent or agent.is_overall or agent.status != "active":
         return None
     user_timezone = _safe_timezone(timezone)
     llm_draft = _detect_with_llm(db, tenant_id, agent_id, message, user_timezone)
@@ -645,6 +643,7 @@ def execute_scheduled_task(
     scheduled_for: datetime | None = None,
     manual: bool = False,
 ) -> ScheduledTaskRun:
+    _bind_scheduled_actor(db, task)
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
     try:
         skipped = _skip_misfired_run(db, task, scheduled_for, manual)
@@ -669,17 +668,18 @@ def start_scheduled_task_async(
     scheduled_for: datetime | None = None,
     manual: bool = False,
 ) -> ScheduledTaskRun:
+    _bind_scheduled_actor(db, task)
     scheduled_for = scheduled_for or task.next_run_at or utc_now()
     skipped = _skip_misfired_run(db, task, scheduled_for, manual)
     if skipped is not None:
         return skipped
     run = _prepare_scheduled_task_run(db, task, scheduled_for, manual)
     if run.status == "running" and run.session_id:
-        threading.Thread(
-            target=_execute_prepared_scheduled_task_in_background,
-            args=(task.id, run.id, manual),
-            daemon=True,
-        ).start()
+        from staffdeck_harness.runtime.jobs import enqueue_runtime_job
+        from staffdeck_harness.runtime.services import runtime_services
+        services = runtime_services(db)
+        enqueue_runtime_job(f'scheduled-{run.id}', _execute_prepared_scheduled_task_in_background,
+            task.id, run.id, manual, data_services=services, registry=getattr(services, 'registry', None))
     return run
 
 
@@ -765,6 +765,9 @@ def _prepare_scheduled_task_run(
         title=f"自动任务：{task.title}",
         status="active",
     )
+    from staffdeck_harness.runtime.session_binding import bind_session
+
+    bind_session(db, session, created=True)
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -808,9 +811,23 @@ def _skip_misfired_run(
     return run
 
 
-def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, manual: bool) -> None:
+def _bind_scheduled_actor(db, task):
+    from staffdeck_harness.runtime.actors import bind_actor
+    from staffdeck_harness.runtime.control_auth import provider
+    if provider() is not None:
+        from staffdeck_harness.runtime.identity_directory import require_internal_member
+        actor = require_internal_member(db, task.tenant_id, task.created_by_user_id, materialize=True)
+        bind_actor(db, actor)
+    else:
+        db.info['staffdeck_actor_id'] = task.created_by_user_id
+
+
+def _execute_prepared_scheduled_task_in_background(
+    task_id: str, run_id: str, manual: bool, *, data_services=None
+) -> None:
     try:
-        with Session(engine) as db:
+        with (data_services.session(None, purpose='scheduled-task')
+              if data_services else Session(engine)) as db:
             task = db.get(ScheduledTask, task_id)
             run = db.get(ScheduledTaskRun, run_id)
             if not task or not run:
@@ -819,7 +836,8 @@ def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, ma
     except Exception as exc:
         logger.exception("Background execution of scheduled task %s (run %s) failed", task_id, run_id)
         try:
-            with Session(engine) as db:
+            with (data_services.session(None, purpose='scheduled-task')
+              if data_services else Session(engine)) as db:
                 run = db.get(ScheduledTaskRun, run_id)
                 task = db.get(ScheduledTask, task_id)
                 if run and run.status == "running":
@@ -840,6 +858,7 @@ def _execute_prepared_scheduled_task_in_background(task_id: str, run_id: str, ma
             logger.warning("Failed to mark crashed scheduled task as failed: %s", cleanup_exc)
 
 
+
 def _execute_prepared_scheduled_task(
     db: Session,
     task: ScheduledTask,
@@ -848,6 +867,7 @@ def _execute_prepared_scheduled_task(
     manual: bool,
 ) -> ScheduledTaskRun:
     if getattr(task, "execution_mode", "agent") == "pipeline":
+        _bind_scheduled_actor(db, task)
         from app.scheduled_tasks.pipeline import execute_pipeline_scheduled_task
 
         return execute_pipeline_scheduled_task(db, task, run, manual=manual)
@@ -855,6 +875,7 @@ def _execute_prepared_scheduled_task(
     try:
         if not run.session_id:
             raise RuntimeError("自动任务缺少独立会话")
+        _bind_scheduled_actor(db, task)
         _ensure_scheduled_execution_agent(db, task)
         request = ChatTurnRequest(
             tenant_id=task.tenant_id,
@@ -918,14 +939,15 @@ def _execute_prepared_scheduled_task(
     return run
 
 
-def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> AgentProfile:
-    agent = db.get(AgentProfile, task.agent_id)
-    if (
-        agent is None
-        or agent.tenant_id != task.tenant_id
-        or agent.is_overall
-        or agent.status != "active"
-    ):
+def _ensure_scheduled_execution_agent(db: Session, task: ScheduledTask) -> StaffProfile:
+    from staffdeck_harness.runtime.staff_directory import staff_profile
+    try:
+        agent = staff_profile(db, task.tenant_id, task.agent_id, action='use', active_only=True)
+    except HTTPException as exc:
+        if exc.status_code not in (404, 409):
+            raise
+        raise ScheduledTaskAgentUnavailable(str(exc.detail)) from exc
+    if agent.is_overall:
         raise ScheduledTaskAgentUnavailable(
             "自动任务绑定的员工已不可用；请重新选择启用中的员工后再运行。"
         )
@@ -947,7 +969,7 @@ def _scheduled_harness_outcome(
         )
     ).first()
     if receipt is None or not receipt.user_message_id:
-        raise RuntimeError("自动任务未进入 Harness v2，已拒绝按旧链路判定成功。")
+        raise RuntimeError("自动任务未进入 Harness v3，缺少持久化执行回执，不能判定成功。")
 
     frames = db.exec(
         select(HarnessTaskFrameRecord)
@@ -1778,17 +1800,11 @@ def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _ensure_agent_access(db: Session, tenant_id: str, agent_id: str, current_user: User) -> AgentProfile:
-    agent = db.get(AgentProfile, agent_id)
-    if not agent or agent.tenant_id != tenant_id or agent.is_overall or agent.status != "active":
+def _ensure_agent_access(db: Session, tenant_id: str, agent_id: str, current_user: User) -> StaffProfile:
+    from staffdeck_harness.runtime.staff_directory import staff_profile
+    agent = staff_profile(db, tenant_id, agent_id, user=current_user, action='use', active_only=True)
+    if agent.is_overall:
         raise HTTPException(status_code=404, detail="员工不可用")
-    if _is_admin_user(current_user):
-        return agent
-    metadata = agent.metadata_json or {}
-    owns_agent = _agent_owned_by_user(agent, current_user)
-    in_gallery = metadata.get("published_to_gallery") is True
-    if not (owns_agent or in_gallery):
-        raise HTTPException(status_code=403, detail="无权为该员工设置自动任务")
     return agent
 
 

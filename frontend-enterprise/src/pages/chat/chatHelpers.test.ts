@@ -14,10 +14,12 @@ import {
   harnessWorkspaceArtifacts,
   knowledgeCitations,
   messageAttachments,
+  normalizePersistedTraceLine,
   renderInlineMarkdown,
   scheduleEditValue,
   scheduleFromEditValue,
   scheduleTypeLabel,
+  reduceReplyText,
   scheduledDraftForMessage,
   shouldDeferPersistedEventToLiveStream,
   stripTrailingCitationSummary,
@@ -35,6 +37,63 @@ function message(patch: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe('chat history consumer contract', () => {
+  it('pairs engine results by call ID and preserves failures and timing', () => {
+    const started = harnessEventTraceLine('harness_action_created', {
+      task_frame_id: 'f', iteration: 1, call_id: 'call-one', action: 'tool', tool_name: '',
+    });
+    const result = harnessEventTraceLine('harness_tool_result', {
+      task_frame_id: 'f', call_id: 'call-one', is_error: true, success: false, duration_ms: 25,
+      arguments: { kind: 'all' }, result: 'Error: unknown tool ""',
+      error: { code: 'UNKNOWN_TOOL', message: 'Error: unknown tool ""' },
+    });
+    expect(result?.id).toBe(started?.id);
+    expect(result?.state).toBe('failed');
+    expect(result?.detail).toContain('UNKNOWN_TOOL');
+    expect(result?.detail).toContain('0.03 s');
+    expect(result?.output).toContain('unknown tool');
+  });
+  it('replaces a pending capability attempt with its actual rejection reason', () => {
+    const started = harnessEventTraceLine('harness_action_created', {
+      task_frame_id: 'quota', iteration: 2, action: 'tool', tool_name: 'compute_quota',
+    });
+    const failed = harnessEventTraceLine('harness_action_failed', {
+      task_frame_id: 'quota', iteration: 2, tool_name: 'compute_quota', executed: false,
+      error: { code: 'TOOL_NOT_AVAILABLE', message: '能力尚未展开' },
+    });
+    expect(failed?.id).toBe(started?.id);
+    expect(failed?.state).toBe('failed');
+    expect(failed?.detail).toContain('能力尚未展开');
+    const recovered = harnessEventTraceLine('harness_action_failed', {
+      task_frame_id: 'quota', iteration: 2, tool_name: 'compute_quota',
+      error: { code: 'CAPABILITY_SCHEMA_LOADED', message: '请使用真实参数' },
+    });
+    expect(recovered?.text).toContain('等待参数校正');
+    expect(recovered?.state).toBe('completed');
+  });
+  it('preserves repeated deltas and applies final replacements consistently during replay', () => {
+    const events = [
+      ['stream_delta', '哈'], ['stream_delta', '哈'], ['stream_delta', '哈哈！'],
+      ['stream_replace', '你好'], ['stream_delta', '你好'],
+      ['assistant_message_created', '最终正文'], ['stream_end', ''],
+    ];
+    const states: string[] = [];
+    let text = '';
+    events.forEach(([event, piece]) => {
+      text = reduceReplyText(text, event, piece);
+      states.push(text);
+    });
+    expect(states).toEqual(['哈', '哈哈', '哈哈哈哈！', '你好', '你好你好', '最终正文', '最终正文']);
+  });
+  it('normalizes persisted completion labels without rewriting business tool traces', () => {
+    const oldControl = { id: 'old', kind: 'tool' as const,
+      text: '调用能力 mcp__staffdeck__finish_task', state: 'completed' as const };
+    expect(normalizePersistedTraceLine(oldControl)).toMatchObject({
+      id: 'old', kind: 'decision', text: '提交步骤结果', state: 'completed',
+    });
+    const business = { ...oldControl, text: '调用能力 general_skill.weather' };
+    expect(normalizePersistedTraceLine(business)).toBe(business);
+  });
+
   it('keeps inline citations but removes duplicate trailing citation summaries', () => {
     const content = [
       '请假制度按员工手册执行[1]，办公用品按行政手册执行[5]。',
@@ -403,6 +462,19 @@ describe('chat history consumer contract', () => {
       text: '任务执行完成',
       state: 'completed',
     });
+  });
+
+  it('renders runtime completion controls separately from business capabilities', () => {
+    for (const toolName of ['mcp__staffdeck__finish_task', 'mcp__staffdeck__submit_step_result']) {
+      const line = harnessEventTraceLine('harness_action_created', {
+        task_frame_id: 'frame-sop', action: 'tool', tool_name: toolName,
+      });
+      expect(line).toMatchObject({ kind: 'decision', text: '提交步骤结果' });
+      expect(line?.text).not.toContain('调用能力');
+    }
+    expect(harnessEventTraceLine('harness_action_created', {
+      action: 'finish', control: 'submit_step_result',
+    })).toMatchObject({ kind: 'decision', text: '提交步骤结果' });
   });
 
   it('keeps a switched SOP visible while it waits for user input', () => {

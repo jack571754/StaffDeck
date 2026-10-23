@@ -1,3 +1,4 @@
+import { moduleLabel, operationLabel } from '../../lib/harnessLabels';
 import { useState, type ReactNode } from 'react';
 
 import CodeBlock from '@/components/CodeBlock';
@@ -123,6 +124,12 @@ export function modelDetailText(model: { name?: string; model?: string; provider
 
 export function normalizeMessageText(value?: string): string {
   return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+export function reduceReplyText(previous: string, event: string, text: string): string {
+  if (event === 'stream_replace' || event === 'assistant_message_created') return text;
+  if (event === 'stream_delta' || event === 'token') return previous + text;
+  return previous;
 }
 
 export function hasRenderableStreamingText(value?: string): boolean {
@@ -1458,6 +1465,7 @@ export function harnessEventTraceLine(
     ? String(data.iteration)
     : '';
   const toolName = typeof data.tool_name === 'string' ? data.tool_name.trim() : '';
+  const toolCallId = typeof data.call_id === 'string' ? data.call_id : '';
 
   if (eventName === 'task_frame_started') {
     const kind = typeof data.kind === 'string' ? data.kind : 'conversation';
@@ -1531,11 +1539,35 @@ export function harnessEventTraceLine(
       icon: failed ? 'loading' : 'execute',
     };
   }
+  if (eventName === 'harness_action_failed') {
+    const error = isPlainRecord(data.error) ? data.error : {};
+    const recovered = error.code === 'CAPABILITY_SCHEMA_LOADED';
+    return {
+      id: `harness_action_${frameId}_${iteration || 'current'}`,
+      kind: 'tool',
+      text: recovered ? `已展开能力 ${toolName}，等待参数校正` : `能力调用受阻 ${toolName}`,
+      detail: [typeof error.code === 'string' ? error.code : '', typeof error.message === 'string' ? error.message : ''].filter(Boolean).join(' · '),
+      state: recovered ? 'completed' : 'failed',
+      icon: 'tool',
+    };
+  }
   if (eventName === 'harness_action_created') {
     const action = typeof data.action === 'string' ? data.action : '';
+    const isStepSubmission = data.control === 'submit_step_result'
+      || toolName === 'mcp__staffdeck__submit_step_result'
+      || toolName === 'mcp__staffdeck__finish_task';
+    if (isStepSubmission) {
+      return {
+        id: `harness_finish_${frameId}_${iteration || 'current'}`,
+        kind: 'decision',
+        text: '提交步骤结果',
+        state: 'completed',
+        icon: 'advance',
+      };
+    }
     if (action === 'tool') {
       return {
-        id: `harness_action_${frameId}_${iteration || 'current'}`,
+        id: `harness_action_${frameId}_${toolCallId || iteration || 'current'}`,
         kind: 'tool',
         text: toolName ? `调用能力 ${toolName}` : '调用能力',
         detail: iteration ? `第 ${iteration} 个动作` : undefined,
@@ -1555,6 +1587,62 @@ export function harnessEventTraceLine(
     }
     return null;
   }
+  if (eventName === 'capability_provider_selected') {
+    return {
+      id: `capability_provider_${frameId}_${(typeof data.operation === 'string' ? data.operation : 'op')}_${(typeof data.module_id === 'string' ? data.module_id : '')}`,
+      kind: 'decision',
+      text: `${typeof data.operation === 'string' ? operationLabel(data.operation) : '能力'} · 由「${typeof data.module_id === 'string' ? moduleLabel(data.module_id) : ''}」处理`,
+      detail: typeof data.operation === 'string' ? data.operation : undefined,
+      state: 'completed',
+      icon: 'advance',
+    };
+  }
+  if (eventName === 'capability_denied') {
+    const reason = typeof data.reason === 'string' ? data.reason : '权限不足';
+    const op = typeof data.operation === 'string' ? data.operation : '';
+    return {
+      id: `capability_denied_${frameId}_${op}_${reason}`,
+      kind: 'decision',
+      text: `无权限：${op ? operationLabel(op) : '该操作'}`,
+      detail: reason,
+      state: 'failed',
+      icon: 'loading',
+    };
+  }
+  if (eventName === 'composition_snapshot_compiled') {
+    const grants = typeof data.grants === 'number' ? data.grants : undefined;
+    return {
+      id: `composition_snapshot_${frameId}`,
+      kind: 'decision',
+      text: '已加载员工配置',
+      detail: grants === undefined ? 'Harness v3' : `Harness v3 · ${grants} 项能力 · ${(typeof data.sops === 'object' && Array.isArray(data.sops) ? data.sops.length : '')} 个流程`,
+      state: 'completed',
+      icon: 'advance',
+    };
+  }
+  if (eventName === 'harness_v3_process_started') {
+    const model = typeof data.model === 'string' ? data.model : '';
+    const bootMs = typeof data.boot_ms === 'number' ? `${data.boot_ms}ms` : '';
+    const thinking = typeof data.thinking === 'string' && data.thinking !== 'provider_default' ? (data.thinking === 'disabled' ? '不思考' : '思考模式') : '';
+    return {
+      id: `harness_v3_process_${frameId}`,
+      kind: 'decision',
+      text: 'Harness v3 引擎已就绪',
+      detail: [model, thinking, bootMs ? `启动 ${bootMs}` : ''].filter(Boolean).join(' · '),
+      state: 'completed',
+      icon: 'execute',
+    };
+  }
+  if (eventName === 'harness_v3_task_finished') {
+    const status = typeof data.status === 'string' ? data.status : '';
+    return {
+      id: `harness_v3_finish_${frameId}`,
+      kind: 'decision',
+      text: `引擎提交结果 · ${status === 'completed' ? '完成' : status === 'handoff' ? '需要人工处理' : status === 'failed' ? '失败' : status}`,
+      state: status === 'handoff' ? 'running' : status === 'failed' ? 'failed' : 'completed',
+      icon: 'advance',
+    };
+  }
   if (eventName === 'harness_mcp_app_view') {
     const mcpApp = isPlainRecord(data.mcp_app)
       ? data.mcp_app as TraceLine['mcpApp']
@@ -1571,8 +1659,8 @@ export function harnessEventTraceLine(
       icon: 'tool',
     };
   }
-  if (eventName === 'harness_tool_completed') {
-    const success = data.success === true;
+  if (eventName === 'harness_tool_completed' || eventName === 'harness_tool_result') {
+    const success = typeof data.success === 'boolean' ? data.success : data.is_error === false;
     const result = isPlainRecord(data.result) ? data.result : {};
     const mcpApp = isPlainRecord(result.mcp_app)
       ? result.mcp_app as TraceLine['mcpApp']
@@ -1581,16 +1669,19 @@ export function harnessEventTraceLine(
     const detail = [
       typeof error.code === 'string' ? error.code : '',
       typeof error.message === 'string' ? error.message : '',
+      typeof data.duration_ms === 'number' ? `${(data.duration_ms / 1000).toFixed(2)} s` : '',
     ].filter(Boolean).join(' · ') || undefined;
     const output = formatTracePayload(data.result);
     return {
-      id: `harness_action_${frameId}_${iteration || 'current'}`,
+      id: `harness_action_${frameId}_${toolCallId || iteration || 'current'}`,
       kind: 'tool',
       text: toolName
         ? `${success ? '能力调用完成' : '能力调用失败'} ${toolName}`
         : success ? '能力调用完成' : '能力调用失败',
       detail,
       output: output || undefined,
+      code: data.arguments ? (typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments, null, 2)) : undefined,
+      language: 'json',
       outputLanguage: output ? tracePayloadLanguage(output) : undefined,
       outputTitle: output ? '查看能力结果' : undefined,
       collapsible: Boolean(output),
@@ -1682,6 +1773,15 @@ export function traceSummary(trace: TurnTrace, lines: TraceLine[]): { text: stri
   return { text: '执行记录', state: 'completed' };
 }
 
+export function normalizePersistedTraceLine(line: TraceLine): TraceLine {
+  // Old snapshots store rendered text rather than the original control event.
+  // Normalize only the exact legacy labels, keeping the underlying audit intact.
+  if (/^调用能力 mcp__staffdeck__(?:finish_task|submit_step_result)$/.test(line.text)) {
+    return { ...line, kind: 'decision', text: '提交步骤结果', icon: 'advance' };
+  }
+  return line;
+}
+
 export function traceDetails(lines: TraceLine[]): TraceLine[] {
   const details = lines.filter((line) => {
     if (line.placeholder) return false;
@@ -1768,7 +1868,9 @@ export function knowledgeCitations(item: ChatMessage, content: string): Knowledg
       ? `chunk:${citation.chunk_id}`
       : citation.concept_id
         ? `concept:${citation.concept_id}`
-        : (citation.title || citation.section_path || citation.summary || citation.excerpt || citation.source_path || citation.id);
+        : (citation.excerpt || citation.content || citation.summary)
+          ? [citation.source_path, citation.section_path, citation.excerpt || citation.content || citation.summary].filter(Boolean).join('|')
+          : (citation.title || citation.section_path || citation.source_path || citation.id);
     const key = normalizeMessageText(identity).toLowerCase();
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -1807,11 +1909,11 @@ export function citationKindLabel(citation: KnowledgeCitation): string {
 
 export function citationDisplayTitle(citation: KnowledgeCitation): string {
   const raw = citation.title || citation.section_path || citation.source_path || citation.concept_id || '知识引用';
-  return raw.trim() || '知识引用';
+  return !citation.title && !citation.section_path && /^\d+$/.test(raw.trim()) ? '知识引用' : raw.trim() || '知识引用';
 }
 
 export function citationSourceLabel(citation: KnowledgeCitation): string {
-  const raw = citation.source_path || '';
+  const raw = citation.title || citation.source_path || '';
   if (!raw) return '';
   return raw.trim();
 }

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.db.models import ChatSession, Skill
 from app.session.session_schema import PlannedTaskFrame
+from staffdeck_harness.sop.fields import slot_field_names
 
 CapabilityKind = Literal[
     "general_skill",
@@ -57,11 +58,11 @@ class TaskRequirement(BaseModel):
     task_frame_id: str
     kind: Literal["sop", "conversation"]
     goal: str
-    # 当前时间（用户时区，含偏移与星期），供模型换算"明天/下周一"等相对
-    # 日期。模型无法自知"今天几号"，若不注入则依赖它主动去查；真实案例中
-    # 它改为让 shell 代算（`date -d tomorrow; date`），GNU 参数在 macOS 上
-    # 报错但被 `;` 吞掉退出码，后一条命令补上今天的日期，静默给出错答案。
+    execution_loop_id: str = ""
+    current_user_message: str = ""
     current_time: str = ""
+    expected_slots: list[str] = Field(default_factory=list)
+    default_result_status: Literal["completed", "awaiting_user", "handoff"] = "completed"
     source_user_message: str = ""
     out_of_scope_task_intents: list[str] = Field(default_factory=list)
     requirements: list[str] = Field(default_factory=list)
@@ -102,6 +103,9 @@ class TaskExecutionResult(BaseModel):
     error: dict[str, Any] | None = None
     structured_result: Any | None = None
     loop_checkpoint: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    # Assistant text the engine already streamed to the client while this frame ran. The turn
+    # skeleton compares it with the final reply to avoid emitting the same text twice.
+    streamed_reply: str = Field(default="", exclude=True)
 
 
 class TaskRequestCompiler:
@@ -122,7 +126,7 @@ class TaskRequestCompiler:
         client_timezone: str | None = None,
     ) -> TaskRequirement:
         current_node = _current_node(skill, frame.target_step_id or session.active_step_id)
-        expected_fields = _text_list((current_node or {}).get("expected_user_info"))
+        expected_fields = slot_field_names((current_node or {}).get("expected_user_info"))
         known_slots = (
             {
                 str(key): value
@@ -178,6 +182,8 @@ class TaskRequestCompiler:
             kind=frame.kind,
             goal=goal,
             current_time=_current_time_text(client_timezone),
+            expected_slots=expected_fields,
+            default_result_status="handoff" if frame.decision == "handoff_human" else "awaiting_user" if frame.decision == "clarify" else "completed",
             source_user_message=str(source_user_message or "").strip()[:4_000],
             out_of_scope_task_intents=_unique(
                 [str(item or "") for item in out_of_scope_task_intents or []]
@@ -196,25 +202,6 @@ class TaskRequestCompiler:
             published_deliverables=list(published_deliverables or []),
             capability_manifest=manifest,
         )
-
-
-def _current_time_text(client_timezone: str | None = None) -> str:
-    """当前时间文本；优先用户所在时区，缺省或非法时回退服务端本地时区。
-
-    注入错误时区的时间比不注入更危险（看起来权威，模型不会质疑），
-    因此时区来源必须显式，且结果始终带 UTC 偏移。
-    """
-
-    zone: ZoneInfo | None = None
-    name = str(client_timezone or "").strip()
-    if name:
-        try:
-            zone = ZoneInfo(name)
-        except (ZoneInfoNotFoundError, ValueError):
-            zone = None
-    now = datetime.now(zone) if zone is not None else datetime.now().astimezone()
-    weekday = "一二三四五六日"[now.weekday()]
-    return f"{now.isoformat(timespec='minutes')}（周{weekday}）"
 
 
 def current_step_capability_refs(skill: Skill | None, step_id: str | None) -> dict[str, list[str]]:
@@ -307,13 +294,7 @@ def _required_step_capabilities(
             descriptor.capability_id in required_skill_refs
             or descriptor.name in required_skill_refs
         )
-        # 内置能力（如 lark_cli）也允许被 SOP 节点标记为强制执行，
-        # 使 finish 闸（REQUIRED_CAPABILITY_NOT_INVOKED）同样生效。
-        matches_internal = descriptor.kind == "internal" and (
-            descriptor.capability_id in required_tool_refs
-            or descriptor.name in required_tool_refs
-        )
-        if matches_tool or matches_skill or matches_internal:
+        if matches_tool or matches_skill:
             required.append(descriptor.name)
     if required_knowledge_base_ids:
         required.append("knowledge_search")
@@ -402,4 +383,15 @@ def _unique(values: list[str]) -> list[str]:
 
 
 def _slot_satisfied(value: object) -> bool:
-    return value not in (None, "", [], {})
+    from app.session.slot_policy import slot_is_filled
+
+    return slot_is_filled(value)
+
+
+def _current_time_text(client_timezone: str | None = None) -> str:
+    try:
+        zone = ZoneInfo(client_timezone.strip()) if client_timezone and client_timezone.strip() else None
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = None
+    now = datetime.now(zone) if zone else datetime.now().astimezone()
+    return f"{now.isoformat(timespec='minutes')}（周{'一二三四五六日'[now.weekday()]}）"

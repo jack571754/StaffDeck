@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-import logging
 from datetime import timedelta
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import or_, update
@@ -35,7 +35,6 @@ PROVIDER_TASK_STRATEGY = "provider_task"
 CALLBACK_URL_HEADER = "X-StaffDeck-Callback-URL"
 CALLBACK_TOKEN_HEADER = "X-StaffDeck-Callback-Token"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
-logger = logging.getLogger(__name__)
 
 
 def new_callback_token() -> str:
@@ -62,6 +61,8 @@ def normalize_status(value: object) -> str:
         return "expired"
     if status == "outcome_unknown":
         return "outcome_unknown"
+    if status == 'tracking_blocked':
+        return 'tracking_blocked'
     if status in {"accepted", "submitted", "queued", "pending"}:
         return "accepted"
     return "working"
@@ -84,6 +85,68 @@ def apply_task_event(
     ).first()
     if existing is not None:
         return False
+    from staffdeck_harness.modules.registry import peek_registry
+    modular = bool((task.status_config_json or {}).get('_runtime') or db.info.get('staffdeck_registry') or peek_registry())
+    next_status = normalize_status(status)
+    result_denied = False
+    review_failed = False
+    if task.status in PERSISTED_TERMINAL_STATUSES and task.status != 'outcome_unknown':
+        # A duplicate or late callback must not expose unreviewed raw payloads.
+        data = {'ignored': True, 'reason': 'task_already_terminal'}
+    elif modular and (
+            next_status in PERSISTED_TERMINAL_STATUSES or data.get('result') is not None or data.get('error') is not None):
+        from staffdeck_harness.runtime.external_tasks import project_external_result
+        from staffdeck_harness.contracts.invocation import ModuleResult
+        from staffdeck_harness.contracts.errors import ModuleSdkError
+        raw = ModuleResult(success=next_status not in {'failed', 'cancelled', 'expired', 'outcome_unknown'},
+            data=data.get('result'), error=data.get('error'))
+        try:
+            projected = project_external_result(db, task, raw)
+            data = {'result':projected.data, 'error':dict(projected.error or {}),
+                    'provider_status':next_status, 'result_reviewed':True}
+            if raw.success and not projected.success:
+                result_denied = True
+                next_status = 'tracking_blocked'
+                data['error'] = {**dict(projected.error or {}), 'retryable':False,
+                    'next_action':'review_result_policy', 'business_replay_allowed':False}
+        except Exception as exc:
+            # Never persist the callback/provider payload when identity or policy
+            # reconstruction failed. A later explicit callback may be revalidated.
+            next_status = 'tracking_blocked'
+            review_failed = True
+            data = {'error': {'code':exc.code if isinstance(exc, ModuleSdkError) else 'RESULT_POLICY_UNAVAILABLE',
+                'message':'异步结果未通过当前身份或结果监管，已停止跟踪；不会重放业务调用。',
+                'retryable':False, 'business_replay_allowed':False}, 'result_reviewed':False}
+    elif modular:
+        # Transport progress without a result is not a final capability output.
+        # Keep only protocol state; arbitrary Provider fields are not public data.
+        data = {'provider_status':next_status}
+    # Policy/identity reconstruction may commit its own bookkeeping. Lock and
+    # refresh AFTER it, so concurrent callbacks/polls cannot regress a terminal
+    # task using a stale Session. A no-op UPDATE is a portable row write lock
+    # (SQLite writer serialization, PostgreSQL row lock); no network follows it.
+    db.flush()
+    db.exec(update(ExternalBusinessTask).where(ExternalBusinessTask.id == task.id,
+        ExternalBusinessTask.tenant_id == task.tenant_id).values(id=ExternalBusinessTask.id)
+        .execution_options(synchronize_session=False))
+    db.refresh(task)
+    existing = db.exec(select(ExternalBusinessTaskEvent).where(
+        ExternalBusinessTaskEvent.task_id == task.id, ExternalBusinessTaskEvent.event_id == event_id)).first()
+    if existing is not None:
+        db.commit()
+        return False
+    if task.status in PERSISTED_TERMINAL_STATUSES and task.status != 'outcome_unknown':
+        data = {'ignored':True, 'reason':'task_already_terminal'}
+        task.next_poll_at = None
+    elif task.status == 'tracking_blocked' and next_status != 'tracking_blocked' and not (
+            next_status in PERSISTED_TERMINAL_STATUSES and data.get('result_reviewed') is True):
+        # Mere progress never lifts a security/output-policy block.
+        next_status = 'tracking_blocked'
+        data = {'ignored':True, 'reason':'tracking_requires_reauthorization'}
+    elif result_denied or review_failed:
+        task.result_json = {}
+        task.status_config_json = {**dict(task.status_config_json or {}),
+            '_tracking_blocked_from':task.status, '_result_blocked':result_denied}
     event = ExternalBusinessTaskEvent(
         tenant_id=task.tenant_id,
         task_id=task.id,
@@ -99,7 +162,6 @@ def apply_task_event(
         return False
 
     now = utc_now()
-    next_status = normalize_status(status)
     if (
         task.status in PERSISTED_TERMINAL_STATUSES
         and task.status != "outcome_unknown"
@@ -124,6 +186,8 @@ def apply_task_event(
         task.next_poll_at = None
     else:
         task.finished_at = None
+        if task.status == 'tracking_blocked':
+            task.next_poll_at = None
     task.updated_at = now
     db.add(task)
     db.commit()
@@ -151,6 +215,12 @@ def _prepare_sop_resume(db: Session, task: ExternalBusinessTask) -> None:
         # completion into its in-memory result before releasing that lease.
         return
     if frame.status not in {"waiting_external_task", "ready_to_resume"}:
+        return
+    receipt = (frame.result_json or {}).get("structured_result")
+    current_task_id = receipt.get("task_id") if isinstance(receipt, dict) else None
+    if current_task_id and current_task_id != task.id:
+        # One SOP frame can submit several tasks in successive nodes. An older
+        # completion must not resume the node currently waiting on another task.
         return
     result = dict(task.result_json or {})
     frame.result_json = {
@@ -200,6 +270,9 @@ def update_external_task_checkpoint(
         "error": dict(task.error_json or {}) or None,
     }
     checkpoint = dict(loop.checkpoint_json or {})
+    # Native warm context no longer matches the completed receipt. Cold restore
+    # must use this updated public transcript, not the pre-completion session.
+    checkpoint["context_revision"] = new_id("extcheckpoint")
     transcript = [dict(item) for item in checkpoint.get("transcript") or []]
     updated = False
     for item in reversed(transcript):
@@ -240,7 +313,7 @@ def update_external_task_checkpoint(
     db.add(loop)
 
 
-def poll_due_external_tasks(db: Session) -> int:
+def poll_due_external_tasks(db: Session, *, dispatch=None) -> int:
     now = utc_now()
     stale_tasks = db.exec(
         select(ExternalBusinessTask).where(
@@ -298,6 +371,21 @@ def poll_due_external_tasks(db: Session) -> int:
                 }
             },
         )
+    queued = db.exec(
+        select(ExternalBusinessTask)
+        .where(
+            ExternalBusinessTask.status == "queued",
+            ExternalBusinessTask.lease_owner.is_(None),
+        )
+        .limit(20)
+    ).all()
+    local_count = 0
+    for task in queued:
+        if dispatch is None:
+            _execute_local_task(db, task)
+            local_count += 1
+        elif dispatch(db, task.id, 'submit'):
+            local_count += 1
     candidates = db.exec(
         select(ExternalBusinessTask).where(
             ExternalBusinessTask.status.in_(["accepted", "working"]),
@@ -313,6 +401,9 @@ def poll_due_external_tasks(db: Session) -> int:
     ).all()
     claimed = 0
     for task in candidates:
+        if dispatch is not None:
+            claimed += bool(dispatch(db, task.id, 'poll'))
+            continue
         owner = new_id("exttasklease")
         result = db.exec(
             update(ExternalBusinessTask)
@@ -326,7 +417,7 @@ def poll_due_external_tasks(db: Session) -> int:
             )
             .values(
                 lease_owner=owner,
-                lease_expires_at=now + timedelta(seconds=60),
+                lease_expires_at=now + timedelta(seconds=3660),
                 updated_at=now,
             )
             .execution_options(synchronize_session=False)
@@ -338,33 +429,42 @@ def poll_due_external_tasks(db: Session) -> int:
         task = db.get(ExternalBusinessTask, task.id)
         if task is None:
             continue
-        try:
-            _poll_task(db, task, owner=owner)
-        except Exception:
-            db.rollback()
-            logger.exception("External task polling failed outside provider transport")
+        _poll_task(db, task, owner=owner)
         claimed += 1
-    # Poll previously accepted jobs first; a backlog of slow submissions must not
-    # delay every existing Provider status query until after the entire batch.
-    queued = db.exec(select(ExternalBusinessTask.id).where(
-        ExternalBusinessTask.status == "queued",
-        ExternalBusinessTask.lease_owner.is_(None),
-    ).order_by(ExternalBusinessTask.created_at, ExternalBusinessTask.id).limit(20)).all()
-    local_count = 0
-    for task_id in queued:
-        try:
-            task = db.get(ExternalBusinessTask, task_id)
-            if task is not None:
-                _execute_local_task(db, task)
-                local_count += 1
-        except Exception:
-            db.rollback()
-            logger.exception("External task execution failed task=%s", task_id)
     return claimed + local_count + len(expired) + recovered
 
 
+def execute_external_task(db: Session, task_id: str, phase: str) -> None:
+    """Worker entry: independent transaction, live status and conditional DB claim."""
+    task = db.get(ExternalBusinessTask, task_id)
+    if task is None:
+        return
+    now = utc_now()
+    if task.expires_at is not None and task.expires_at.replace(tzinfo=None) <= now.replace(tzinfo=None):
+        return  # scanner owns timeout transitions
+    if phase == 'submit':
+        if task.status == 'queued' and task.lease_owner is None:
+            _execute_local_task(db, task)
+        return
+    if phase != 'poll' or task.status not in {'accepted', 'working'}:
+        return
+    owner = new_id('exttasklease')
+    claimed = db.exec(update(ExternalBusinessTask).where(
+        ExternalBusinessTask.id == task.id, ExternalBusinessTask.tenant_id == task.tenant_id,
+        ExternalBusinessTask.status.in_(['accepted','working']),
+        ExternalBusinessTask.next_poll_at <= now,
+        or_(ExternalBusinessTask.lease_owner.is_(None), ExternalBusinessTask.lease_expires_at <= now)
+    ).values(lease_owner=owner, lease_expires_at=now+timedelta(seconds=3660), updated_at=now)
+        .execution_options(synchronize_session=False))
+    if claimed.rowcount != 1:
+        db.rollback()
+        return
+    db.commit()
+    db.refresh(task)
+    _poll_task(db, task, owner=owner)
+
+
 def _execute_local_task(db: Session, task: ExternalBusinessTask) -> None:
-    task_id = task.id
     owner = new_id("exttasklease")
     now = utc_now()
     strategy = _task_strategy(task)
@@ -378,7 +478,7 @@ def _execute_local_task(db: Session, task: ExternalBusinessTask) -> None:
         .values(
             status=("submitting" if strategy == PROVIDER_TASK_STRATEGY else "working"),
             lease_owner=owner,
-            lease_expires_at=now + timedelta(hours=1),
+            lease_expires_at=now + timedelta(seconds=3660),
             updated_at=now,
         )
         .execution_options(synchronize_session=False)
@@ -388,50 +488,39 @@ def _execute_local_task(db: Session, task: ExternalBusinessTask) -> None:
         return
     db.commit()
     task = db.get(ExternalBusinessTask, task.id)
-    tool = db.get(Tool, task.tool_id) if task else None
+    request_started = False
     try:
-        if task is None or tool is None:
-            raise ValueError("Detached tool no longer exists")
+        if task is None:
+            raise ValueError("Detached task no longer exists")
         from app.tools.tool_executor import ToolExecutor
 
-        if strategy == PROVIDER_TASK_STRATEGY:
-            _submit_provider_task(db, task, tool)
-        else:
-            result = ToolExecutor(db).execute_sync_http(tool, task.request_json)
-            if result.success:
-                apply_task_event(
-                    db,
-                    task,
-                    event_id=f"local-{task.id}",
-                    event_type="completed",
-                    status="completed",
-                    data={"result": result.data},
-                )
+        from staffdeck_harness.runtime.external_tasks import resolve_task_tool
+        with resolve_task_tool(db, task) as tool:
+            request_started = True
+            if strategy == PROVIDER_TASK_STRATEGY:
+                _submit_provider_task(db, task, tool)
             else:
-                error = result.error.model_dump(mode="json") if result.error else {}
-                apply_task_event(
-                    db,
-                    task,
-                    event_id=f"local-{task.id}",
-                    event_type="failed",
-                    status="failed",
-                    data={"error": error},
-                )
+                result = ToolExecutor(db).execute_sync_http(tool, task.request_json)
+                if result.success:
+                    apply_task_event(
+                        db,
+                        task,
+                        event_id=f"local-{task.id}",
+                        event_type="completed",
+                        status="completed",
+                        data={"result": result.data},
+                    )
+                else:
+                    error = result.error.model_dump(mode="json") if result.error else {}
+                    apply_task_event(
+                        db,
+                        task,
+                        event_id=f"local-{task.id}",
+                        event_type="failed",
+                        status="failed",
+                        data={"error": error},
+                    )
     except Exception as exc:
-        db.rollback()
-        task = db.get(ExternalBusinessTask, task_id)
-        if task is None:
-            logger.exception("Detached task disappeared during execution task=%s", task_id)
-            return
-        if strategy == PROVIDER_TASK_STRATEGY and task.external_task_id and task.status_url:
-            # A durable provider receipt means submission must not be repeated.
-            if task.status not in PERSISTED_TERMINAL_STATUSES:
-                task.status = "working"
-                task.next_poll_at = utc_now()
-                db.add(task)
-                db.commit()
-            logger.exception("Provider task tracking interrupted task=%s", task_id)
-            return
         apply_task_event(
             db,
             task,
@@ -443,18 +532,16 @@ def _execute_local_task(db: Session, task: ExternalBusinessTask) -> None:
             event_type="submission_failed",
             status=(
                 "outcome_unknown"
-                if strategy == PROVIDER_TASK_STRATEGY
+                if strategy == PROVIDER_TASK_STRATEGY and request_started
                 else "failed"
             ),
-            data={"error": {"code": "DETACHED_EXECUTION_ERROR", "message": str(exc)}},
+            data={"error": {"code": getattr(exc, "code", "DETACHED_EXECUTION_ERROR"), "message": str(exc)}},
         )
     finally:
-        if not db.is_active:
-            db.rollback()
         db.exec(
             update(ExternalBusinessTask)
             .where(
-                ExternalBusinessTask.id == task_id,
+                ExternalBusinessTask.id == task.id,
                 ExternalBusinessTask.lease_owner == owner,
             )
             .values(lease_owner=None, lease_expires_at=None)
@@ -509,11 +596,6 @@ def _submit_provider_task(db: Session, task: ExternalBusinessTask, tool: Tool) -
     provider_task_id = _json_path(payload, str(config.get("task_id_field") or "taskId"))
     raw_status = _json_path(payload, str(config.get("status_field") or "status"))
     status_mapping = dict(config.get("status_mapping") or {})
-    if provider_task_id is not None:
-        if isinstance(provider_task_id, bool) or not isinstance(provider_task_id, (str, int)):
-            raise ValueError("Provider task ID must be a string or integer")
-        elif not str(provider_task_id).strip():
-            raise ValueError("Provider task ID cannot be empty")
     if raw_status is None:
         raw_status = "accepted" if response.status_code == 202 or provider_task_id is not None else "completed"
     mapped_status = status_mapping.get(str(raw_status), raw_status)
@@ -561,31 +643,32 @@ def _task_strategy(task: ExternalBusinessTask) -> str:
 
 
 def _poll_task(db: Session, task: ExternalBusinessTask, *, owner: str) -> None:
-    tool = db.get(Tool, task.tool_id)
-    if tool is None or not task.external_task_id or not task.status_url:
-        return
     config = dict(task.status_config_json or {})
     status_field = str(config.get("status_field") or "status")
     result_field = str(config.get("result_field") or "result")
     status_mapping = dict(config.get("status_mapping") or {})
-    url = task.status_url.replace("{taskId}", task.external_task_id)
+    url = (task.status_url or "").replace("{taskId}", quote(task.external_task_id or "", safe=""))
     task.poll_attempts += 1
     task.next_poll_at = utc_now() + timedelta(seconds=task.poll_interval_seconds)
     try:
         from app.tools.tool_executor import ToolExecutor
 
-        executor = ToolExecutor(db)
-        if url.startswith("/"):
-            url = f"{executor.settings.normalized_tool_base_url}{url}"
-        headers = executor._request_headers(
-            url,
-            executor._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
-        )
-        response = httpx.get(
-            url,
-            headers=headers,
-            timeout=executor._execution_policy(tool).timeout_seconds,
-        )
+        from staffdeck_harness.runtime.external_tasks import resolve_task_tool
+        with resolve_task_tool(db, task) as tool:
+            if not task.external_task_id or not task.status_url:
+                raise ValueError("Provider tracking identity is missing")
+            executor = ToolExecutor(db)
+            if url.startswith("/"):
+                url = f"{executor.settings.normalized_tool_base_url}{url}"
+            headers = executor._request_headers(
+                url,
+                executor._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
+            )
+            response = httpx.get(
+                url,
+                headers=headers,
+                timeout=executor._execution_policy(tool).timeout_seconds,
+            )
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
@@ -605,8 +688,27 @@ def _poll_task(db: Session, task: ExternalBusinessTask, *, owner: str) -> None:
             data=event_data,
         )
     except Exception as exc:
-        db.rollback()
-        task.error_json = {"code": "POLL_ERROR", "message": str(exc)}
+        from staffdeck_harness.contracts.errors import ModuleSdkError
+        db.flush()
+        db.exec(update(ExternalBusinessTask).where(ExternalBusinessTask.id == task.id,
+            ExternalBusinessTask.tenant_id == task.tenant_id).values(id=ExternalBusinessTask.id)
+            .execution_options(synchronize_session=False))
+        db.refresh(task)
+        if task.status in PERSISTED_TERMINAL_STATUSES:
+            # A callback may have completed while this GET was failing.
+            return
+        module_error = isinstance(exc, ModuleSdkError)
+        permanent = module_error and exc.code not in {'AUTHORIZATION_UNAVAILABLE', 'ENGINE_UNAVAILABLE',
+            'BUSINESS_CATALOG_UNAVAILABLE', 'BUSINESS_DIRECTORY_UNAVAILABLE'}
+        if permanent:
+            task.status_config_json = {**dict(task.status_config_json or {}),
+                '_tracking_blocked_from': task.status}
+            task.status = 'tracking_blocked'
+            task.next_poll_at = None
+        task.error_json = {'code':exc.code if module_error else 'POLL_ERROR',
+            'message':exc.message if module_error else '外部任务状态查询暂不可用，稍后重试。',
+            'retryable':not permanent, 'business_replay_allowed':False,
+            'next_action':'restore_module_or_permission' if permanent else 'retry_status_query'}
         task.updated_at = utc_now()
         db.add(task)
         db.commit()

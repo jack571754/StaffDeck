@@ -10,14 +10,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.agents.branching import visible_tool_rows
 from app.config import get_settings
 from app.db.models import ChatSession, ExternalBusinessTask, MCPServer, Tool, utc_now
 from app.security.internal_service import INTERNAL_SERVICE_HEADER, internal_service_token
-from app.skills.tool_authorization import SopToolAuthorization
 from app.tools.a2a_client import A2AClient, A2AClientError
 from app.tools.external_tasks import callback_token_hash, new_callback_token
 from app.tools.http_request import prepare_get_request
@@ -64,8 +62,6 @@ class ToolExecutor:
         resume_step_id: str | None = None,
         timeout_seconds_override: float | None = None,
         user_id: str | None = None,
-        *,
-        sop_authorization: SopToolAuthorization | None = None,
     ) -> ToolResult:
         with self.db.no_autoflush:
             tool = self.db.exec(
@@ -73,32 +69,9 @@ class ToolExecutor:
             ).first()
         if not tool:
             return self._error(tool_call.name, "NOT_FOUND", "工具不存在或未配置。")
-        if not tool.enabled:
-            return self._error(tool.name, "DISABLED", "工具当前未启用。")
-        if agent_id and tool.id not in {
-            row.id
-            for row in visible_tool_rows(self.db, tenant_id, agent_id, include_inactive=False)
-        }:
-            return self._error(tool.name, "NOT_ALLOWED", "当前员工未启用该工具。")
-        if sop_authorization is not None:
-            if (
-                sop_authorization.tenant_id != tenant_id
-                or sop_authorization.parent_skill_id != active_skill_id
-            ):
-                return self._error(tool.name, "NOT_ALLOWED", "SOP 授权上下文不匹配。")
-            if not sop_authorization.permits_skill(tool):
-                return self._error(tool.name, "NOT_ALLOWED", "当前技能不允许调用该工具。")
-            if (
-                str(tool.capability_scope).replace("-", "_") == "sop_specific"
-                and not sop_authorization.explicitly_allows(tool)
-            ):
-                return self._error(tool.name, "NOT_ALLOWED", "当前 SOP 节点未授权该工具。")
-        elif (
-            active_skill_id
-            and tool.allowed_skills_json
-            and active_skill_id not in tool.allowed_skills_json
-        ):
-            return self._error(tool.name, "NOT_ALLOWED", "当前技能不允许调用该工具。")
+        denied = self.scope_error(tool, agent_id=agent_id, active_skill_id=active_skill_id)
+        if denied is not None:
+            return denied
 
         if (tool.tool_type or "http") == "mcp":
             return self._execute_mcp_tool(
@@ -141,7 +114,7 @@ class ToolExecutor:
                 session = self.db.get(ChatSession, session_id)
                 if session and session.tenant_id == tenant_id:
                     user_id = session.user_id
-            return self._execute_detached_http(
+            return self.enqueue_http(
                 tool,
                 tool_call.arguments,
                 user_id=user_id,
@@ -153,46 +126,20 @@ class ToolExecutor:
                 timeout_seconds_override=timeout_seconds_override,
             )
 
-        headers = self._request_headers(
-            tool.url,
-            self._resolve_headers(tool.headers_json or {}, tool.auth_json or {}),
-        )
-        policy = self._execution_policy(
-            tool,
-            timeout_seconds_override=timeout_seconds_override,
-        )
-        try:
-            with httpx.Client(timeout=policy.timeout_seconds) as client:
-                if tool.method.upper() == "GET":
-                    request_url, request_kwargs = prepare_get_request(tool.url, tool_call.arguments)
-                    response = client.request(
-                        tool.method.upper(), request_url, headers=headers, **request_kwargs
-                    )
-                else:
-                    response = client.request(
-                        tool.method.upper(), tool.url, headers=headers, json=tool_call.arguments
-                    )
-                response.raise_for_status()
-                return ToolResult(
-                    tool_name=tool.name,
-                    success=True,
-                    data=self._response_data(response),
-                    error=None,
-                )
-        except httpx.TimeoutException:
-            return self._error(
-                tool.name,
-                "TIMEOUT",
-                f"工具调用超过 {policy.timeout_seconds:g} 秒未返回。",
-            )
-        except httpx.HTTPStatusError as exc:
-            return self._error(
-                tool.name,
-                "HTTP_ERROR",
-                f"工具返回异常状态码：{exc.response.status_code}",
-            )
-        except Exception as exc:
-            return self._error(tool.name, "EXECUTION_ERROR", str(exc))
+        return self.execute_sync_http(tool, tool_call.arguments,
+            timeout_seconds_override=timeout_seconds_override)
+
+    def scope_error(self, tool: Tool, *, agent_id=None, active_skill_id=None) -> ToolResult | None:
+        """Same local resource restrictions before synchronous and deferred transport."""
+        if not tool.enabled:
+            return self._error(tool.name, "DISABLED", "工具当前未启用。")
+        if agent_id and tool.id not in {
+            row.id for row in visible_tool_rows(self.db, tool.tenant_id, agent_id, include_inactive=False)
+        }:
+            return self._error(tool.name, "NOT_ALLOWED", "当前员工未启用该工具。")
+        if active_skill_id and tool.allowed_skills_json and active_skill_id not in tool.allowed_skills_json:
+            return self._error(tool.name, "NOT_ALLOWED", "当前技能不允许调用该工具。")
+        return None
 
     def _execute_data_query_tool(
         self,
@@ -307,7 +254,7 @@ class ToolExecutor:
                 result=self._error(tool.name, "EXECUTION_ERROR", str(exc))
             )
 
-    def _execute_detached_http(
+    def enqueue_http(
         self,
         tool: Tool,
         arguments: dict[str, Any],
@@ -319,6 +266,7 @@ class ToolExecutor:
         task_frame_id: str | None,
         resume_step_id: str | None,
         timeout_seconds_override: float | None,
+        runtime_context: dict[str, Any] | None = None,
     ) -> ToolResult:
         if not user_id:
             return self._error(
@@ -342,22 +290,8 @@ class ToolExecutor:
                 )
             ).first()
             if existing is not None:
-                return self._detached_acceptance_result(tool, existing)
-        if session_id and task_frame_id:
-            existing = self.db.exec(select(ExternalBusinessTask).where(
-                ExternalBusinessTask.tenant_id == tool.tenant_id,
-                ExternalBusinessTask.user_id == user_id,
-                ExternalBusinessTask.session_id == session_id,
-                ExternalBusinessTask.task_frame_id == task_frame_id,
-                ExternalBusinessTask.tool_id == tool.id,
-                ExternalBusinessTask.status.in_([
-                    "queued", "submitting", "accepted", "working", "outcome_unknown",
-                ]),
-            ).order_by(ExternalBusinessTask.created_at.desc())).first()
-            if existing is not None:
-                if dict(existing.request_json or {}) != arguments:
-                    return self._error(tool.name, "EXTERNAL_TASK_ALREADY_PENDING",
-                                       f"当前 TaskFrame 已有任务 {existing.id}；请先用 external_task_status 查询，不能重复提交。")
+                if existing.user_id != user_id or existing.request_json != arguments:
+                    return self._error(tool.name, "IDEMPOTENCY_CONFLICT", "该调用标识已经用于其他请求，本次未执行。")
                 return self._detached_acceptance_result(tool, existing)
         callback_token = new_callback_token()
         status_url = str(execution.get("status_url") or "").strip() or None
@@ -382,6 +316,7 @@ class ToolExecutor:
             status="queued",
             status_url=status_url,
             status_config_json={
+                **({"_runtime": runtime_context} if runtime_context is not None else {}),
                 "async_strategy": async_strategy,
                 "task_id_field": str(execution.get("task_id_field") or "taskId"),
                 "status_field": str(execution.get("status_field") or "status"),
@@ -393,17 +328,7 @@ class ToolExecutor:
             expires_at=utc_now() + timedelta(seconds=max_tracking_seconds),
         )
         self.db.add(task)
-        try:
-            self.db.flush()
-        except IntegrityError:
-            self.db.rollback()
-            if idempotency_key:
-                existing = self.db.exec(select(ExternalBusinessTask).where(
-                    ExternalBusinessTask.idempotency_key == idempotency_key,
-                )).first()
-                if existing is not None:
-                    return self._detached_acceptance_result(tool, existing)
-            raise
+        self.db.flush()
         if not task.idempotency_key:
             task.idempotency_key = f"staffdeck:{tool.tenant_id}:{tool.id}:{task.id}"
         task.accepted_at = utc_now()
@@ -418,17 +343,6 @@ class ToolExecutor:
         tool: Tool,
         task: ExternalBusinessTask,
     ) -> ToolResult:
-        state_text = {
-            "queued": "已进入后台队列，尚未提交到外部接口",
-            "submitting": "正在提交到外部接口",
-            "accepted": "外部接口已受理",
-            "working": "正在处理",
-            "completed": "已完成",
-            "failed": "执行失败",
-            "cancelled": "已取消",
-            "expired": "已超时",
-            "outcome_unknown": "提交结果不确定，请核对外部系统，勿重复提交",
-        }.get(task.status, task.status)
         return ToolResult(
             tool_name=tool.name,
             success=True,
@@ -447,12 +361,12 @@ class ToolExecutor:
                     ),
                     "tenant_id": tool.tenant_id,
                     "guidance": (
-                        "Use external_task_status with this StaffDeck task_id to query the "
-                        "existing task. Do not invoke the submission tool again to check status."
+                        "Use external_task_status with this StaffDeck task_id. "
+                        "Do not resubmit the original tool while this task is pending."
                     ),
                 },
                 "user_reply": (
-                    f"任务 #{task.id}：{state_text}。"
+                    f"已经帮您提交任务，任务号 #{task.id}，正在后台处理。"
                     f"您随时可以对我说 “查询 #{task.id} 状态” 查看结果。"
                 ),
             },

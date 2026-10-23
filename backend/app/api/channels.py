@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import Response as FastAPIResponse
-from sqlalchemy import case, or_, text, update
+from sqlalchemy import case, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -31,6 +31,7 @@ from app.channels.adapters.dingtalk import (
 )
 from app.channels.adapters.feishu import (
     FeishuAdapter,
+    FeishuCredentialError,
     FeishuPermanentError,
     validate_feishu_credentials,
 )
@@ -45,7 +46,6 @@ from app.channels.schema import (
     ChannelBindingManagerCreate,
     ChannelBindingManagerRead,
     ChannelBindingRead,
-    ChannelIdentityBindCodeCreate,
     ChannelConversationAttachmentRead,
     ChannelConversationMessageRead,
     ChannelConversationPage,
@@ -53,6 +53,7 @@ from app.channels.schema import (
     ChannelDeliveryDay,
     ChannelDeliveryDayPage,
     ChannelDeliveryPage,
+    ChannelIdentityBindCodeCreate,
     ChannelMetaRead,
     ChannelQRCodeRead,
     ChannelQRCodeStatusRead,
@@ -87,7 +88,6 @@ from app.channels.service_session import (
 from app.config import get_settings
 from app.db import get_session
 from app.db.models import (
-    AgentProfile,
     ChannelBindCode,
     ChannelBinding,
     ChannelBindingAgent,
@@ -107,11 +107,14 @@ from app.db.models import (
 )
 from app.security.auth import get_current_user
 from app.security.permissions import (
-    ensure_agent_scope_manager,
     ensure_current_user_tenant,
     is_admin_user,
-    require_agent_scope_viewer,
 )
+from staffdeck_harness.runtime.identity_directory import require_internal_member, user_names
+from staffdeck_harness.runtime.staff_directory import (
+    ensure_staff_manager as ensure_agent_scope_manager,
+)
+from staffdeck_harness.runtime.staff_directory import staff_names, staff_profile
 
 logger = logging.getLogger(__name__)
 
@@ -143,22 +146,8 @@ def _patch_binding_config_key(
     value: object,
 ) -> None:
     """Patch one API-owned config key against the latest JSON value."""
-    result = db.exec(
-        text(
-            "UPDATE channel_bindings "
-            "SET config_json = json_set(COALESCE(config_json, '{}'), :path, json(:value)), "
-            "updated_at = :updated_at "
-            "WHERE id = :binding_id AND tenant_id = :tenant_id"
-        ),
-        params={
-            "path": f"$.{key}",
-            "value": json.dumps(value, ensure_ascii=False),
-            "updated_at": utc_now(),
-            "binding_id": binding_id,
-            "tenant_id": tenant_id,
-        },
-    )
-    if result.rowcount != 1:
+    from app.channels.config_store import patch_binding_config
+    if not patch_binding_config(db, binding_id, tenant_id=tenant_id, set_values={key: value}):
         raise HTTPException(status_code=404, detail="渠道绑定不存在")
 
 SUPPORTED_CHANNELS = {"wechat", "wechat_kf", "wecom", "feishu", "dingtalk"}
@@ -378,7 +367,8 @@ def list_channel_bindings(
     db: Session = Depends(get_session),
 ) -> list[ChannelBindingRead]:
     if agent_id:
-        require_agent_scope_viewer(tenant_id, agent_id, current_user, db)
+        ensure_current_user_tenant(tenant_id, current_user)
+        staff_profile(db, tenant_id, agent_id, user=current_user, action="view")
     else:
         ensure_current_user_tenant(tenant_id, current_user)
     statement = select(ChannelBinding).where(ChannelBinding.tenant_id == tenant_id)
@@ -543,9 +533,7 @@ def create_identity_bind_code(
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
     _ensure_binding_manager(db, tenant_id, binding, current_user, action=_MANAGER_ACTION_AGENTS)
-    target = db.get(User, request.user_id)
-    if not target or target.tenant_id != tenant_id or target.source != "web":
-        raise HTTPException(status_code=400, detail="身份绑定对象必须是当前租户的内部成员")
+    target = require_internal_member(db, tenant_id, request.user_id, materialize=True)
     if binding.channel == "feishu" and not binding.credentials_enc:
         raise HTTPException(status_code=409, detail="请先完成飞书应用接入，再邀请成员绑定身份")
     if not _check_bind_code_rate(current_user.id):
@@ -686,12 +674,7 @@ def update_channel_binding_agents(
     handoff_assignee = request.default_handoff_assignee_user_id
     handoff_channel = request.default_handoff_assignee_channel
     if handoff_assignee != "unchanged" and handoff_assignee:
-        user = db.get(User, handoff_assignee)
-        if not user or user.tenant_id != tenant_id or user.source != "web":
-            raise HTTPException(
-                status_code=400,
-                detail="默认人工处理人必须是当前租户的内部成员",
-            )
+        require_internal_member(db, tenant_id, handoff_assignee, materialize=True)
         handoff_channel = str(handoff_channel or "").strip()
         if handoff_channel and handoff_channel not in ("unchanged", "web"):
             from app.channels.service_outbox import (
@@ -910,10 +893,7 @@ def delete_channel_binding(
 
 def _user_display_name(db: Session, user_id: str, tenant_id: str) -> str | None:
     """租户内用户展示名;用户不存在或不属于该租户时返回 None。"""
-    user = db.get(User, user_id)
-    if not user or user.tenant_id != tenant_id:
-        return None
-    return user.display_name or user.username
+    return user_names(db, tenant_id, [user_id]).get(user_id)
 
 
 @router.get("/{binding_id}/managers", response_model=list[ChannelBindingManagerRead])
@@ -963,9 +943,7 @@ def add_channel_binding_manager(
     ensure_current_user_tenant(tenant_id, current_user)
     binding = _get_binding(db, tenant_id, binding_id)
     _ensure_binding_manager(db, tenant_id, binding, current_user)
-    target = db.get(User, request.user_id)
-    if not target or target.tenant_id != tenant_id or target.source != "web":
-        raise HTTPException(status_code=400, detail="协作者必须是当前租户的内部成员")
+    target = require_internal_member(db, tenant_id, request.user_id, materialize=True)
     if target.id == binding.created_by_user_id:
         raise HTTPException(status_code=400, detail="创建者已是该渠道拥有者,无需添加")
     if is_admin_user(target):
@@ -1866,6 +1844,11 @@ def save_feishu_credentials(
         raise HTTPException(status_code=400, detail="应用变更不允许直接修改，请删除后重新创建绑定")
     try:
         bot_info = validate_feishu_credentials(app_id, app_secret)
+    except FeishuCredentialError as exc:
+        logger.warning("feishu credential validation rejected binding=%s stage=%s code=%s provider_code=%s",
+                       binding_id, exc.stage, exc.code, exc.provider_code)
+        raise HTTPException(status_code=400, detail={"code":exc.code,"message":str(exc),
+            "stage":exc.stage,"provider_code":exc.provider_code}) from exc
     except FeishuPermanentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -2092,8 +2075,8 @@ def list_channel_delivery_days(
     _ensure_binding_manager(db, tenant_id, binding, current_user)
     from sqlalchemy import func
 
-    # 按服务器本地时区的自然日分桶(SQLite date(created_at, 'localtime'))
-    day_bucket = func.date(ChannelDelivery.created_at, "localtime")
+    from app.channels.delivery_days import delivery_day_bucket
+    day_bucket = delivery_day_bucket(db)
     day_rows = db.exec(
         select(day_bucket, func.count())
         .where(ChannelDelivery.binding_id == binding.id)
@@ -2175,11 +2158,10 @@ def list_channel_conversations(
         identity_names = {
             row.staffdeck_user_id: row.display_name for row in identities if row.display_name
         }
-        users = db.exec(select(User).where(User.id.in_(user_ids))).all()
-        user_names = {row.id: row.display_name for row in users if row.display_name}
+        from staffdeck_harness.runtime.identity_directory import user_names as resolve_user_names
+        user_names = resolve_user_names(db, tenant_id, user_ids)
     if agent_ids:
-        agents = db.exec(select(AgentProfile).where(AgentProfile.id.in_(agent_ids))).all()
-        agent_name_map = {row.id: row.name for row in agents}
+        agent_name_map = staff_names(db, tenant_id, agent_ids)
     if session_ids:
         from sqlalchemy import func
 

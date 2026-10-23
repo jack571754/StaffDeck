@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -32,6 +33,12 @@ MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
 # --------------------------------------------------------------------------- #
 # Transport 归一化
 # --------------------------------------------------------------------------- #
+
+def _safe_url(url: str) -> str:
+    """错误提示里只留 scheme+host+path，query 里可能带密钥。"""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}{parts.path}"
+
 
 def normalize_transport(config: dict[str, Any]) -> str:
     """从连接配置推断 transport 类型。
@@ -606,7 +613,9 @@ class _HttpSession(_MCPSession):
             response = client.post(self._endpoint(), headers=self._headers(), json=payload)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise MCPClientError(f"HTTP MCP 返回异常状态码：{exc.response.status_code}") from exc
+            raise MCPClientError(
+                f"HTTP MCP 返回异常状态码：{exc.response.status_code}（{_safe_url(self._endpoint())}）"
+            ) from exc
         except Exception as exc:
             raise MCPClientError(str(exc)) from exc
         session_id = response.headers.get("mcp-session-id")
@@ -710,7 +719,9 @@ class _SseSession(_MCPSession):
             posted = client.post(str(self._message_url), headers=self._post_headers(), json=payload)
             posted.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise MCPClientError(f"SSE MCP 返回异常状态码：{exc.response.status_code}") from exc
+            raise MCPClientError(
+                f"SSE MCP 返回异常状态码：{exc.response.status_code}（{_safe_url(str(self._message_url))}）"
+            ) from exc
         except Exception as exc:
             raise MCPClientError(str(exc)) from exc
         body = self._await_response(request_id)

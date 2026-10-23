@@ -8,7 +8,6 @@ from sqlmodel import Session, select
 
 from app.channels.service_identity import channel_label
 from app.db.models import (
-    AgentProfile,
     ChannelBinding,
     ChannelBindingAgent,
     ChannelConvState,
@@ -79,7 +78,8 @@ def mounted_agents(db: Session, binding: ChannelBinding) -> list[ChannelBindingA
     """
     rows = db.exec(
         select(ChannelBindingAgent)
-        .where(ChannelBindingAgent.binding_id == binding.id)
+        .where(ChannelBindingAgent.binding_id == binding.id,
+               ChannelBindingAgent.tenant_id == binding.tenant_id)
         .order_by(ChannelBindingAgent.sort_order, ChannelBindingAgent.created_at)
     ).all()
     if rows:
@@ -108,15 +108,8 @@ def default_agent_id(mounts: list[ChannelBindingAgent]) -> str:
 
 
 def agent_names(db: Session, tenant_id: str, agent_ids: list[str]) -> dict[str, str]:
-    if not agent_ids:
-        return {}
-    rows = db.exec(
-        select(AgentProfile).where(
-            AgentProfile.tenant_id == tenant_id,
-            AgentProfile.id.in_(agent_ids),
-        )
-    ).all()
-    return {row.id: row.name for row in rows}
+    from staffdeck_harness.runtime.staff_directory import staff_names
+    return staff_names(db, tenant_id, agent_ids)
 
 
 def _get_conv_state(db: Session, binding: ChannelBinding, external_conv_id: str) -> ChannelConvState | None:

@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { api, TENANT_ID } from '../api/client';
 import { getEnterpriseAuthSession } from '../auth';
 
-type Receipt = { success?: boolean; data?: { detached?: boolean; task_id?: string }; error?: unknown };
+type Receipt = { success?: boolean; data?: { detached?: boolean; accepted?: boolean; task_id?: string }; error?: unknown };
 type Task = { id: string; status: string; poll_attempts?: number; result?: unknown; error?: unknown };
-const terminal = new Set(['completed', 'failed', 'cancelled', 'expired', 'outcome_unknown']);
+const terminal = new Set(['completed', 'failed', 'cancelled', 'expired', 'outcome_unknown', 'tracking_blocked']);
 function requestId() {
   // randomUUID is unavailable on non-HTTPS deployments such as port 10086.
   return globalThis.crypto?.randomUUID?.()
@@ -17,7 +17,10 @@ function persist(key: string, value: unknown) {
   } catch { /* Private mode/quota must not wedge the call button. */ }
 }
 
-export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5) {
+export function useToolTest(toolId: string, agentQuery?: string, pollSeconds = 2) {
+  const legacy = agentQuery !== undefined;
+  const [rawResult, setRawResult] = useState<unknown>(null);
+  const [queryError, setQueryError] = useState('');
   const key = `staffdeck-tool-test:${TENANT_ID}:${getEnterpriseAuthSession()?.user.id || ''}:${toolId}`;
   const [result, setResult] = useState('');
   const [status, setStatus] = useState('等待调用');
@@ -44,29 +47,32 @@ export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5)
     controller.current = requestController;
     const timeout = setTimeout(() => requestController.abort(), 30000);
     try {
-      const task = await api.getWithSignal<Task>(
+      const task = await api.get<Task>(
         `/api/enterprise/external-business-tasks/${encodeURIComponent(id)}?tenant_id=${TENANT_ID}&tool_id=${encodeURIComponent(toolId)}`,
-        requestController.signal,
+        { signal: requestController.signal },
       );
       if (version !== generation.current) return;
+      if (task.id !== id) throw new Error('任务状态与查询回执不一致');
+      setRawResult(task); setQueryError('');
       setResult(JSON.stringify(task, null, 2));
       setError('');
-      setStatus(labels[task.status] || task.status);
+      setStatus(legacy ? labels[task.status] || task.status : task.status);
       if (terminal.has(task.status)) {
         // Unknown outcome must not enable a one-click re-submission.
-        if (task.status !== 'outcome_unknown') {
+        if (!['outcome_unknown', 'tracking_blocked'].includes(task.status)) {
           setTaskId(null);
           save(null);
         }
-        setBusy(false);
+        setBusy(task.status === 'tracking_blocked');
       } else {
         timer.current = setTimeout(() => void poll(id, version), Math.max(1, pollSeconds) * 1000);
       }
     } catch (e) {
       if (version !== generation.current) return;
       setError(`状态查询失败，任务不会重新提交：${e instanceof Error ? e.message : String(e)}`);
-      setStatus('状态查询中断');
-      setBusy(false);
+      setQueryError(e instanceof Error ? e.message : String(e));
+      if (legacy) { setStatus('状态查询中断'); setBusy(false); }
+      else timer.current = setTimeout(() => void poll(id, version), Math.max(1, pollSeconds) * 1000);
     } finally {
       clearTimeout(timeout);
     }
@@ -76,6 +82,7 @@ export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5)
     const version = ++generation.current;
     inFlight.current = false;
     submission.current = undefined;
+    setRawResult(null); setQueryError('');
     setResult(''); setStatus('等待调用'); setError(''); setBusy(false); setTaskId(null);
     try {
       const saved = JSON.parse(sessionStorage.getItem(key) || 'null');
@@ -96,10 +103,12 @@ export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5)
     };
   }, [key]);
 
-  async function submit(args: Record<string, unknown>) {
+  async function submit(pathOrArgs: string | Record<string, unknown>, explicitArgs?: Record<string, unknown>) {
     if (inFlight.current || taskId) return;
     inFlight.current = true;
     const version = generation.current;
+    const args = typeof pathOrArgs === 'string' ? explicitArgs || {} : pathOrArgs;
+    const path = typeof pathOrArgs === 'string' ? pathOrArgs : `/api/enterprise/tools/${toolId}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`;
     submission.current ||= { id: requestId(), arguments: args };
     persist(key, { submission: submission.current });
     setBusy(true); setError(''); setStatus('正在提交');
@@ -107,21 +116,22 @@ export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5)
     controller.current = requestController;
     const timeout = setTimeout(() => requestController.abort(), 30000);
     try {
-      const receipt = await api.postWithSignal<Receipt>(
-        `/api/enterprise/tools/${toolId}/test${agentQuery ? `?${agentQuery.slice(1)}` : ''}`,
+      const receipt = await api.post<Receipt>(
+        path,
         { tenant_id: TENANT_ID, arguments: submission.current.arguments, client_request_id: submission.current.id },
-        requestController.signal,
+        { signal: requestController.signal },
       );
       if (version !== generation.current) return;
+      setRawResult(receipt);
       setResult(JSON.stringify(receipt, null, 2));
       submission.current = undefined;
-      const id = receipt.data?.detached ? receipt.data.task_id : undefined;
+      const id = (receipt.data?.detached || receipt.data?.accepted) ? receipt.data.task_id : undefined;
       if (id) {
-        save(id); setTaskId(id); setStatus('本地排队中');
+        save(id); setTaskId(id); setStatus(legacy ? '本地排队中' : 'queued');
         clearTimeout(timeout);
         void poll(id, version);
       } else {
-        save(null); setStatus(receipt.success === false ? '调用失败' : '已返回'); setBusy(false);
+        save(null); setStatus(legacy ? (receipt.success === false ? '调用失败' : '已返回') : (receipt.success === false ? 'failed' : 'completed')); setBusy(false);
       }
     } catch (e) {
       if (version !== generation.current) return;
@@ -138,6 +148,6 @@ export function useToolTest(toolId: string, agentQuery: string, pollSeconds = 5)
     setBusy(true); setError('');
     void poll(taskId, generation.current);
   }
-  return { result, status, taskId, busy, error, submit, retryStatus,
+  return { result: legacy ? result : rawResult, status, taskId, busy, error, queryError, submit, retryStatus,
     parametersLocked: busy || Boolean(taskId) || Boolean(submission.current) };
 }

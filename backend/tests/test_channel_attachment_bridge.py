@@ -29,6 +29,13 @@ from app.db.models import ChannelBinding
 from app.session.session_schema import ChatAttachmentRead
 
 
+@pytest.fixture(autouse=True)
+def _standalone_adapter_registry(monkeypatch):
+    # These bridge unit tests explicitly register fake adapters. Keep them independent
+    # of application/module registries installed by other API test modules.
+    monkeypatch.setattr("staffdeck_harness.modules.registry.peek_registry", lambda: None)
+
+
 class _FakeAdapter:
     """模拟适配器:download_media 返回预设字节,用于隔离 attachment_bridge 测试。"""
 

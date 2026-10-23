@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useToolTest } from './useToolTest';
 
 const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn() }));
-vi.mock('../api/client', () => ({ TENANT_ID: 'tenant_demo', api: { postWithSignal: mocks.post, getWithSignal: mocks.get } }));
+vi.mock('../api/client', () => ({ TENANT_ID: 'tenant_demo', api: { post: mocks.post, get: mocks.get } }));
 vi.mock('../auth', () => ({ getEnterpriseAuthSession: () => ({ user: { id: 'admin' } }) }));
 
 beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); sessionStorage.clear(); });
@@ -55,7 +55,7 @@ describe('async tool test tracking', () => {
     await act(async () => {});
     expect(hook.result.current.taskId).toBe('task1');
     expect(mocks.post).not.toHaveBeenCalled();
-    const signal = mocks.get.mock.calls[0][1] as AbortSignal;
+    const signal = (mocks.get.mock.calls[0][1] as { signal: AbortSignal }).signal;
     hook.unmount();
     expect(signal.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(10000);
