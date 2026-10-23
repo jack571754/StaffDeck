@@ -9,27 +9,27 @@
 ## Task 1: Protect local customizations
 - [x] Clone upstream and pin ccf25abe.
 - [x] Back up Git history, binary patches, untracked sources, private environment and consistent SQLite database.
-- [ ] Commit the source-only working copy snapshot on codex/upgrade-v3-preserve-custom in the clone.
+- [x] Commit the source-only working copy snapshot on codex/upgrade-v3-preserve-custom in the clone.
 
 ## Task 2: Merge and resolve conflicts
-- [ ] Merge main with --no-commit, keeping both parents.
-- [ ] Runtime: preserve upstream v3 orchestration, port data query fast path, capability discovery and artifact/Feishu behavior from local commits. Files: backend/app/api/chat.py and backend/app/core/{capability_manifest,harness_capability_invoker,harness_v2_engine}.py.
-- [ ] Scheduling/channels: preserve multiple daily times, intervals, deterministic pipeline, recipient isolation, recall binding and worker timeout fixes. Files: backend/app/api/channels.py, backend/app/channels/adapters/feishu.py, backend/app/scheduled_tasks/{service,worker}.py.
-- [ ] Frontend: retain local data query/share management routes and menus alongside upstream navigation and streaming protocol. Files: frontend-enterprise/src/{components/AppSidebar.tsx,enums/routes.ts,i18n/en.json,pages/chat/chatHelpers.test.ts}.
-- [ ] Configuration: combine .gitignore and backend/app/config.py, preserving local reporting and deployment settings. Verify auto-merged model/schema, dependency and startup files against both sides.
+- [x] Merge main with --no-commit, keeping both parents.
+- [x] Runtime: preserve upstream v3 orchestration, port data query fast path, capability discovery and artifact/Feishu behavior from local commits. Files: backend/app/api/chat.py and backend/app/core/{capability_manifest,harness_capability_invoker,harness_v2_engine}.py.
+- [x] Scheduling/channels: preserve multiple daily times, intervals, deterministic pipeline, recipient isolation, recall binding and worker timeout fixes. Files: backend/app/api/channels.py, backend/app/channels/adapters/feishu.py, backend/app/scheduled_tasks/{service,worker}.py.
+- [x] Frontend: retain local data query/share management routes and menus alongside upstream navigation and streaming protocol. Files: frontend-enterprise/src/{components/AppSidebar.tsx,enums/routes.ts,i18n/en.json,pages/chat/chatHelpers.test.ts}.
+- [x] Configuration: combine .gitignore and backend/app/config.py, preserving local reporting and deployment settings. Verify auto-merged model/schema, dependency and startup files against both sides.
 
 ## Task 3: Validate preservation and v3 runtime
-- [ ] Check no conflict markers remain; git diff --check.
-- [ ] Use a separate virtualenv and isolated database; install backend[dev], then python prepare.py --no-cli-link. Do not reuse production secrets or schedulers in smoke tests.
-- [ ] Run frontend npm ci, npm test -- --run, npm run build, npm run i18n:check and npm run config:check.
-- [ ] Run backend tests and tests_harness, comparing Windows POSIX/symlink baseline. Specifically exercise data_query, scheduled_task_pipeline, sales_snapshot, artifact_share_link and channel routing tests.
-- [ ] Validate sales same-snapshot ranking, exact influencer names, and cumulative-total row visibility remain intact.
-- [ ] Smoke test v3 health, console routes, native data-query tool capability and readonly persistence migration using the backed-up state only.
+- [x] Check no conflict markers remain; git diff --check.
+- [x] Use a separate virtualenv and isolated database; install backend[dev], then python prepare.py --no-cli-link. Do not reuse production secrets or schedulers in smoke tests.
+- [x] Run frontend npm ci, npm test -- --run, npm run build, npm run i18n:check and npm run config:check.
+- [x] Run backend tests and tests_harness, comparing Windows POSIX/symlink baseline. Specifically exercise data_query, scheduled_task_pipeline, sales_snapshot, artifact_share_link and channel routing tests.
+- [x] Validate sales same-snapshot ranking, exact influencer names, and cumulative-total row visibility remain intact.
+- [x] Smoke test v3 health, console routes, native data-query tool capability and readonly persistence migration using the backed-up state only.
 
 ## Task 4: Integrate
-- [ ] Record test outcomes and finish the merge commit.
-- [ ] Preserve the original branch; transfer the validated upgrade branch and switch the live checkout only after compatible runtime artifacts are prepared.
-- [ ] Restart service, confirm health and inspect existing scheduled task configuration without manual notifications.
+- [x] Record test outcomes and finish the merge commit.
+- [x] Preserve the original branch; transfer the validated upgrade branch and switch the live checkout only after compatible runtime artifacts are prepared.
+- [x] Restart service, confirm health and inspect existing scheduled task configuration without manual notifications.
 
 ## Review focus
 - v3 capability transport must retain tenant/employee authorization for native data queries.
@@ -59,3 +59,15 @@
 - User explicitly selected complete v3 migration, superseding the original v2-only runtime guideline.
 - Keep legacy chart behavior and record its pre-existing test mismatch rather than change unrelated sales presentation.
 - Do not rewrite the ten upstream failing contracts; preserve and document their baseline.
+
+## Live cutover completed
+
+- Original workspace is now on codex/upgrade-v3-preserve-custom; upstream ccf25abe is an ancestor. The original feature branch remains intact, and codex/pre-v3-20261023 (d3d3f188) preserves the complete original uncommitted source snapshot.
+- Original backend environment saved as ../StaffDeck-backup-20261023-090622/backend-venv-v2; new Python dependencies and local Harness SDK installed in backend/.venv.
+- Bundled Node was 22.14.0 (below v3 requirements); backed it up and installed the existing vendor Node 24.11.1 binary. Native CLI version command passed under the selected runtime.
+- Service restarted from staffdeck_harness.distribution.asgi; port 5173 and health check passed, applied assembly reports engine=harness_v3.
+- Read-only post-cutover checks confirmed original task definitions, templates, share-link expiry, employee state, encrypted model credentials and channel settings are unchanged; backend/.env bytes match the backup.
+- Existing administrator browser session remained valid. Verified live pages: connected Feishu channel, 3 data sources, 5 query templates, one active task-bound HTML share link, sales employee scheduled task and historical successful runs.
+- Real Node engine + real MCP round trip + local scripted model: 2 sealed successful-turn variants passed in 35.32s, with no external model credentials.
+- Additional sealed unknown-tool retry-count failure also reproduced on pristine upstream; not an upgrade-specific regression. Docker image and external live-model/notification tests remain unrun.
+- Temporary W: drive alias removed after artifact transfer. Source working tree is clean after committing this validation record.
