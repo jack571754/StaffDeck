@@ -3355,6 +3355,11 @@ def bind_artifact_share_link_to_scheduled_task(
     _ensure_request_tenant(tid, current_user)
     if link.tenant_id != tid:
         raise HTTPException(status_code=403, detail="跨租户访问被拒绝")
+    _ensure_share_link_access(link, current_user)
+    if link.is_revoked:
+        raise HTTPException(status_code=400, detail="分享链接已撤回，无法绑定")
+    if link.expires_at and link.expires_at <= utc_now():
+        raise HTTPException(status_code=400, detail="分享链接已过期，无法绑定")
 
     if (link.title or "").startswith(DEMO_SHARE_TITLE_PREFIX):
         raise HTTPException(
@@ -3758,7 +3763,7 @@ def semantic_generate_share_link(
             model_config = db.exec(
                 select(ModelConfig).where(
                     ModelConfig.tenant_id == tid,
-                    ModelConfig.is_default == True,
+                    ModelConfig.is_default == True,  # noqa: E712
                 )
             ).first()
             if not model_config:

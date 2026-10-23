@@ -8,7 +8,7 @@ import threading
 from sqlmodel import Session, update
 
 from app.db import engine, init_db
-from app.db.models import ScheduledTask
+from app.db.models import ScheduledTask, utc_now
 from app.db.seed import seed_demo_data
 from app.scheduled_tasks.service import (
     WORKER_SLEEP_SECONDS,
@@ -34,10 +34,15 @@ def run_worker(*, once: bool = False, poll_seconds: float = WORKER_SLEEP_SECONDS
         reaped = reap_stale_scheduled_task_runs(db)
         if reaped:
             logger.info("Worker startup self-healing reaped %d stale scheduled task runs", len(reaped))
-        # Clear any dangling leases left behind from an ungraceful shutdown
+        # Clear only expired dangling leases left behind from an ungraceful shutdown
+        # (do NOT clear active leases held by other living worker instances)
+        now = utc_now()
         db.exec(
             update(ScheduledTask)
-            .where(ScheduledTask.lease_until.is_not(None))
+            .where(
+                ScheduledTask.lease_until.is_not(None),
+                ScheduledTask.lease_until < now,
+            )
             .values(lease_owner=None, lease_until=None)
         )
         db.commit()

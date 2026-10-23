@@ -18,6 +18,15 @@ from sqlmodel import Session
 from app.data_query.connectors import QueryResult, get_connector
 from app.data_query.models import DataSource, QueryExecuteResult, QueryTemplate
 
+try:
+    import sqlparse
+    import sqlparse.engine.grouping as sqlparse_grouping
+    if hasattr(sqlparse_grouping, "MAX_GROUPING_TOKENS"):
+        sqlparse_grouping.MAX_GROUPING_TOKENS = max(sqlparse_grouping.MAX_GROUPING_TOKENS, 500000)
+except ImportError:
+    sqlparse = None  # type: ignore[assignment]
+import re
+
 
 def _clean_value(val: Any) -> Any:
     if isinstance(val, Decimal):
@@ -235,6 +244,113 @@ def _make_cache_key(template: QueryTemplate, params: dict[str, Any]) -> str:
     return f"{template.id}::{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
 
 
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+
+def _strip_comments(sql: str) -> str:
+    """Remove block and line comments from SQL."""
+    sql = _BLOCK_COMMENT_RE.sub("", sql)
+    sql = _LINE_COMMENT_RE.sub("", sql)
+    return sql
+
+
+def _extract_cte_names(sql: str) -> set[str]:
+    """Extract Common Table Expression (CTE) aliases defined in SQL."""
+    cleaned = _strip_comments(sql)
+    pattern = re.compile(
+        r"(?:(?:WITH\s+(?:RECURSIVE\s+)?)|,)\s*([`'\"a-zA-Z0-9_\u4e00-\u9fff\-]+)(?:\s*\([^)]*\))?\s+AS\s*\(",
+        re.IGNORECASE,
+    )
+    return {m.group(1).strip("`'\"").lower() for m in pattern.finditer(cleaned)}
+
+
+def _contains_subquery(token: Any) -> bool:
+    """Check if token or its children represent a subquery (parenthesis)."""
+    if isinstance(token, getattr(sqlparse.sql, "Parenthesis", ())) or getattr(token, "value", "").strip().startswith("("):
+        return True
+    if hasattr(token, "tokens"):
+        return any(_contains_subquery(sub) for sub in token.tokens)
+    return False
+
+
+def _extract_query_tables(sql: str) -> set[str]:
+    """Extract referenced physical table names from a SQL query using sqlparse."""
+    if not sql or not sql.strip():
+        return set()
+
+    cte_names = _extract_cte_names(sql)
+    raw_tables: set[str] = set()
+
+    if sqlparse is not None:
+        try:
+            statements = sqlparse.parse(sql)
+
+            def _walk(tokens):
+                from_seen = False
+                for token in tokens:
+                    if token.is_whitespace:
+                        continue
+                    if hasattr(token, "tokens"):
+                        _walk(token.tokens)
+                    val = token.value.upper()
+                    if token.ttype is sqlparse.tokens.Keyword and (
+                        val in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "CROSS JOIN", "FULL JOIN")
+                        or "JOIN" in val
+                    ):
+                        from_seen = True
+                        continue
+                    if from_seen:
+                        if isinstance(token, sqlparse.sql.Parenthesis) or token.value.strip().startswith("("):
+                            from_seen = False
+                            continue
+                        elif isinstance(token, sqlparse.sql.IdentifierList):
+                            for iden in token.get_identifiers():
+                                if not _contains_subquery(iden):
+                                    name = iden.get_real_name() or iden.value
+                                    raw_tables.add(name.strip("`'\""))
+                            from_seen = False
+                        elif isinstance(token, sqlparse.sql.Identifier):
+                            if not _contains_subquery(token):
+                                name = token.get_real_name() or token.value
+                                raw_tables.add(name.strip("`'\""))
+                            from_seen = False
+                        elif token.ttype is sqlparse.tokens.Keyword:
+                            from_seen = False
+                        else:
+                            val_str = token.value.strip("`'\"")
+                            if not val_str.startswith("(") and "\n" not in val_str and " " not in val_str:
+                                raw_tables.add(val_str)
+                            from_seen = False
+
+            for stmt in statements:
+                _walk(stmt.tokens)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    if not raw_tables:
+        raw_tables = {
+            m.strip("`'\"")
+            for m in re.findall(
+                r"(?:FROM|JOIN)\s+([`'\"a-zA-Z0-9_\u4e00-\u9fff\.\-]+)",
+                sql,
+                re.IGNORECASE,
+            )
+        }
+
+    clean_tables: set[str] = set()
+    for t in raw_tables:
+        base_name = t.split(".")[-1].strip("`'\"").lower()
+        if (
+            base_name
+            and base_name not in cte_names
+            and not base_name.startswith("(")
+            and base_name not in ("dual", "select", "where", "on", "values")
+        ):
+            clean_tables.add(base_name)
+
+    return clean_tables
+
 # ---------------------------------------------------------------------------
 # Query executor
 # ---------------------------------------------------------------------------
@@ -285,7 +401,29 @@ class QueryExecutor:
         # 1. Parameter validation
         validated = _validate_params(params, template.params_json or [])
 
-        # 2. Cache lookup
+        # 2. Load and validate data source & permissions BEFORE cache lookup
+        if self._db is None:
+            raise RuntimeError("QueryExecutor requires a db_session to load data sources")
+        data_source = self._db.get(DataSource, template.data_source_id)
+        if data_source is None:
+            raise ValueError(f"Data source not found: {template.data_source_id!r}")
+
+        ds_status = getattr(data_source, "status", "active")
+        if isinstance(ds_status, str) and ds_status.lower() not in ("active", "enabled"):
+            raise ValueError(f"Data source is inactive: {template.data_source_id!r}")
+
+        raw_allowed = getattr(data_source, "allowed_tables_json", None)
+        if isinstance(raw_allowed, list) and len(raw_allowed) > 0:
+            allowed_set = {t.lower().strip() for t in raw_allowed if isinstance(t, str) and t.strip()}
+            if allowed_set:
+                query_tables = _extract_query_tables(template.query_content)
+                for tbl in query_tables:
+                    if tbl.lower() not in allowed_set:
+                        raise PermissionError(
+                            f"Access to table '{tbl}' is forbidden by data source whitelist"
+                        )
+
+        # 3. Cache lookup (only after data source status and table permissions are verified)
         cache_ttl = template.cache_ttl or 0
         if cache_ttl > 0:
             cache_key = _make_cache_key(template, validated)
@@ -299,13 +437,6 @@ class QueryExecutor:
                     execution_time_ms=0.0,
                     cached=True,
                 )
-
-        # 3. Load data source
-        if self._db is None:
-            raise RuntimeError("QueryExecutor requires a db_session to load data sources")
-        data_source = self._db.get(DataSource, template.data_source_id)
-        if data_source is None:
-            raise ValueError(f"Data source not found: {template.data_source_id!r}")
 
         # 4-5. Get connector and execute (timed)
         connector = get_connector(data_source)

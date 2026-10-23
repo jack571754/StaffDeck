@@ -12,6 +12,19 @@ from typing import Any
 from app.data_query.connectors.base import BaseConnector, QueryResult
 from app.data_query.security import decrypt_config
 
+try:
+    import sqlparse
+    import sqlparse.engine.grouping as sqlparse_grouping
+    from sqlparse.tokens import DDL, DML, Comment, Literal, String, Whitespace
+    if hasattr(sqlparse_grouping, "MAX_GROUPING_TOKENS"):
+        sqlparse_grouping.MAX_GROUPING_TOKENS = max(sqlparse_grouping.MAX_GROUPING_TOKENS, 500000)
+except ImportError:
+    sqlparse = None  # type: ignore[assignment]
+    DDL = None  # type: ignore[assignment]
+    DML = None  # type: ignore[assignment]
+    Literal = None  # type: ignore[assignment]
+    String = None  # type: ignore[assignment]
+
 # -- SQL whitelist -----------------------------------------------------------
 # Allow SELECT statements and WITH-CTE statements.  Comments (/* ... */ and
 # -- style) are stripped before matching to prevent comment-based bypasses.
@@ -55,9 +68,104 @@ def _strip_comments(sql: str) -> str:
 
 
 def _is_sql_allowed(sql: str) -> bool:
-    """Return True if *sql* passes the read-only whitelist check."""
-    cleaned = _strip_comments(sql)
-    return bool(_SQL_ALLOW_PATTERN.match(cleaned))
+    """Return True if *sql* passes the read-only whitelist check.
+    
+    Uses AST tokenization via sqlparse to reject multi-statement queries,
+    DDL statements, non-SELECT DML (e.g. UPDATE/DELETE in CTEs), and
+    dangerous file output statements (OUTFILE/DUMPFILE).
+    Supports large complex BI queries through increased grouping limits
+    and streaming token fallback.
+    """
+    if not sql or not sql.strip():
+        return False
+
+    # Check for multi-statements (disallowing multiple statements separated by semicolon)
+    if sqlparse is not None:
+        try:
+            stmts = sqlparse.split(sql)
+            stmts = [s for s in stmts if _strip_comments(s).strip()]
+            if len(stmts) != 1:
+                return False
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    # 1. Try full AST analysis
+    if sqlparse is not None:
+        try:
+            statements = sqlparse.parse(sql)
+            meaningful = []
+            for stmt in statements:
+                real_tokens = [
+                    t for t in stmt.flatten()
+                    if not t.is_whitespace and t.ttype not in sqlparse.tokens.Comment
+                ]
+                if real_tokens:
+                    meaningful.append((stmt, real_tokens))
+
+            if len(meaningful) == 1:
+                stmt, tokens = meaningful[0]
+                stmt_type = (stmt.get_type() or "").upper()
+                if stmt_type != "SELECT":
+                    return False
+
+                for t in tokens:
+                    val = t.value.upper().strip("`'\"")
+                    if val in ("OUTFILE", "DUMPFILE") and t.ttype not in (
+                        String, Literal.String, Literal.String.Single, Literal.String.Double
+                    ):
+                        return False
+                    if t.ttype in (DDL,):
+                        return False
+                    if t.ttype in (DML,) and val not in ("SELECT", "WITH"):
+                        return False
+
+                return True
+        except Exception:  # noqa: BLE001, S110
+            # Fall back to token-stream check if grouping exceeds limits
+            pass
+
+    # 2. Token-stream or regex validation fallback
+    cleaned = _strip_comments(sql).strip()
+    if not _SQL_ALLOW_PATTERN.match(cleaned):
+        return False
+
+    if sqlparse is not None:
+        try:
+            tokens = list(sqlparse.lexer.tokenize(sql))
+            meaningful_tokens = [
+                t for t in tokens
+                if t[0] not in (Whitespace, Comment, Comment.Single, Comment.Multiline)
+            ]
+            if not meaningful_tokens:
+                return False
+
+            first_val = meaningful_tokens[0][1].upper()
+            if first_val not in ("SELECT", "WITH"):
+                return False
+
+            for ttype, val in meaningful_tokens:
+                uval = val.upper().strip("`'\"")
+                if uval in ("OUTFILE", "DUMPFILE") and ttype not in (
+                    String, Literal.String, Literal.String.Single, Literal.String.Double
+                ):
+                    return False
+                if ttype in (DDL,):
+                    return False
+                if ttype in (DML,) and uval not in ("SELECT", "WITH"):
+                    return False
+
+            return True
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    # Final regex defense: ensure no write keywords outside strings
+    if ";" in cleaned.rstrip(";"):
+        return False
+    upper = cleaned.upper()
+    for word in ("UPDATE", "DELETE", "INSERT", "REPLACE", "DROP", "ALTER", "TRUNCATE", "OUTFILE", "DUMPFILE"):
+        if re.search(r"\b" + word + r"\b", upper):
+            return False
+    return True
 
 
 def _convert_params(query: str) -> tuple[str, list[str]]:
@@ -147,6 +255,12 @@ class MySQLConnector(BaseConnector):
             read_timeout=timeout * 2,
             write_timeout=timeout,
         )
+        if self.read_only:
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY")
+            except Exception:  # noqa: BLE001, S110
+                pass
         self._connected = True
 
     # -- public API ----------------------------------------------------------

@@ -40,10 +40,10 @@ def fetch_clickhouse_dy_order_metrics() -> dict[str, Any]:
     SELECT
         trim(doudian_shop_name) AS shop_name,
         count(DISTINCT order_id) AS order_cnt,
-        round(sum(pay_amount+only_platform_cost_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
+        round(sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
         round(sum(pay_amount)/10000, 2) AS pay_wan,
         round(sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0))/10000, 2) AS refund_wan,
-        round((sum(pay_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
+        round((sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
     FROM smartbimpp.dy_order
     WHERE toDate(pay_time) = today()
       AND `端口` = '自营'
@@ -58,8 +58,8 @@ def fetch_clickhouse_dy_order_metrics() -> dict[str, Any]:
     SELECT
         IF(theme_type_desc = '直播间', '自播', '商城') AS ch_type,
         count(DISTINCT order_id) AS order_cnt,
-        round(sum(pay_amount+only_platform_cost_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
-        round((sum(pay_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
+        round(sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
+        round((sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
     FROM smartbimpp.dy_order
     WHERE toDate(pay_time) = today()
       AND `端口` = '自营'
@@ -74,10 +74,10 @@ def fetch_clickhouse_dy_order_metrics() -> dict[str, Any]:
     SELECT
         trim(doudian_shop_name) AS shop_name,
         count(DISTINCT order_id) AS order_cnt,
-        round(sum(pay_amount+only_platform_cost_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
+        round(sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000, 2) AS gmv_wan,
         round(sum(pay_amount)/10000, 2) AS pay_wan,
         round(sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0))/10000, 2) AS refund_wan,
-        round((sum(pay_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
+        round((sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) AS net_wan
     FROM smartbimpp.dy_order
     WHERE toDate(pay_time) = today()
       AND `端口` = '自营'
@@ -124,8 +124,8 @@ def fetch_all_channel_daren_top5(url: str) -> list[dict[str, Any]]:
         """
         SELECT trim(author_name) AS author, '抖音' AS platform,
             if(trim(doudian_shop_name) like '%可丽金%', '可丽金', '可复美') AS brand,
-            sum(pay_amount+only_platform_cost_amount+promotion_pay_amount+post_amount)/10000 AS gmv_wan,
-            (sum(pay_amount) - sum(IF(order_status_desc LIKE '%已关闭%',
+            sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000 AS gmv_wan,
+            (sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%',
                 pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000 AS net_wan
         FROM smartbimpp.dy_order
         WHERE toDate(pay_time) = today() AND `端口` = '达播'
@@ -1261,6 +1261,20 @@ def sync_task_artifact_report(
     # 1. 抓取 ClickHouse 与解析 MySQL 全盘数据
     ck_data = fetch_clickhouse_dy_order_metrics()
     metrics = parse_pipeline_query_metrics(query_rows)
+    # The card and linked dashboard must retain the same influencer snapshot.
+    from app.reporting.sales_metrics import get_top_influencers, is_dabo_row
+
+    if any(row.get("category") == "达播矩阵" for row in query_rows):
+        influencer_rows = [row for row in query_rows if is_dabo_row(row)]
+        ck_data["daren_top5"] = [
+            {"author": row["name"], "net_wan": row["net_wan"],
+             "gmv_wan": row["gmv_wan"],
+             "platform": " / ".join(sorted({str(r.get("平台") or "")
+                 for r in influencer_rows if r.get("达人") == row["name"]})),
+             "brand": " / ".join(sorted({str(r.get("品牌") or "")
+                 for r in influencer_rows if r.get("达人") == row["name"]}))}
+            for row in get_top_influencers(influencer_rows)
+        ]
 
     from app.reporting.dashboard_hourly import align_current_hour, fetch_task_hourly_series
 
@@ -1297,10 +1311,21 @@ def sync_task_artifact_report(
 
     target_file = Path(workspace_root) / link.path
     target_file.parent.mkdir(parents=True, exist_ok=True)
-    target_file.write_bytes(content_bytes)
-    logger.info("Successfully updated artifact file at: %s", target_file)
+    temp_target = target_file.parent / f".tmp_{new_sha256[:8]}_{target_file.name}"
+    try:
+        with open(temp_target, "wb") as f:
+            f.write(content_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_target, target_file)
+    except OSError as e:
+        logger.warning("Failed to atomically write artifact %s: %s", target_file, e)
+        if temp_target.exists():
+            temp_target.unlink(missing_ok=True)
+        return None
+    logger.info("Successfully atomically updated artifact file at: %s", target_file)
 
-    # 4. 更新 messages 表中的 harness_artifacts sha256 和 size 规避 409
+    # 4. 在单事务中原子更新 messages 表中的 harness_artifacts sha256 和 size 规避 409
     msgs = db.exec(
         select(Message).where(
             Message.tenant_id == link.tenant_id,
@@ -1308,6 +1333,7 @@ def sync_task_artifact_report(
             Message.role == "assistant",
         )
     ).all()
+    modified_any = False
     for m in msgs:
         meta = json.loads(json.dumps(m.metadata_json or {}))
         artifacts = meta.get("harness_artifacts")
@@ -1322,20 +1348,9 @@ def sync_task_artifact_report(
                 m.metadata_json = meta
                 flag_modified(m, "metadata_json")
                 db.add(m)
-                db.commit()
-                logger.info("Updated message %s artifact sha256 to %s", m.id, new_sha256)
-
-    # 5. 同步写入常用模板及下载目录备份
-    sync_targets = [
-        Path("backend/app/reporting/templates/realtime_sales_dashboard.html"),
-        Path(os.path.expanduser("~")) / "Downloads" / "realtime_sales_dashboard.html",
-        Path(r"C:\Users\lj153\.gemini\antigravity\brain\d828731f-5307-4db9-a2b0-b21815a2c7d4\realtime_sales_dashboard.html"),
-    ]
-    for st in sync_targets:
-        try:
-            st.parent.mkdir(parents=True, exist_ok=True)
-            st.write_bytes(content_bytes)
-        except OSError:
-            pass
+                modified_any = True
+    if modified_any:
+        db.commit()
+        logger.info("Updated artifact sha256 to %s across messages", new_sha256)
 
     return new_sha256

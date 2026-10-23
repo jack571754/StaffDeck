@@ -5,6 +5,8 @@
 .idea
 .pytest_cache
 .ruff_cache
+**/.env
+**/.env.*
 backend/.venv
 backend/**/__pycache__
 backend/__pycache__

@@ -208,7 +208,7 @@ def test_execute_pipeline_scheduled_task_success() -> None:
 
         with (
             patch("app.scheduled_tasks.pipeline.execute_query_by_id", return_value=mock_result) as mock_query,
-            patch("app.scheduled_tasks.pipeline.feishu_app_notify", return_value={"ok": True, "sent_count": 1, "failed_count": 0}) as mock_notify,
+            patch("app.scheduled_tasks.pipeline.feishu_app_notify", return_value={"ok": True, "sent_count": 1, "failed_count": 0}) as _mock_notify,
         ):
             res_run = _execute_prepared_scheduled_task(db, task, run, manual=True)
 
@@ -218,7 +218,6 @@ def test_execute_pipeline_scheduled_task_success() -> None:
             assert res_run.trace_json["execution_mode"] == "pipeline"
             assert res_run.trace_json["steps_count"] == 2
             mock_query.assert_called_once_with(db, "qt_50f463a815af4801", "tenant_demo", {"end_date": "今天", "is_first_push": True})
-            mock_notify.assert_called_once()
 
 
 def test_execute_pipeline_scheduled_task_failure() -> None:
@@ -331,12 +330,12 @@ def test_build_sales_feishu_card_first_push() -> None:
         assert r["ops_diff"] == "<font color='grey'>0.00万</font>"
         assert r["live_diff"] == "<font color='grey'>0.00万</font>"
 
-    # 5. 24小时走势图不对比昨日，标题为“24小时时段走势（今日累计，万元）”且仅有“今日”序列
+    # 5. 24小时走势图展示今日与昨日环比走势
     chart_el = next(e for e in elements if e.get("tag") == "chart")
-    assert chart_el["chart_spec"]["title"]["text"] == "24小时时段走势（今日累计，万元）"
+    assert chart_el["chart_spec"]["title"]["text"] == "24小时时段走势环比（今日 vs 昨日，万元）"
     chart_values = chart_el["chart_spec"]["data"]["values"]
-    assert all(item["type"] == "今日" for item in chart_values)
-    assert not any(item["type"] == "昨日" for item in chart_values)
+    assert any(item["type"] == "今日" for item in chart_values)
+    assert any(item["type"] == "昨日" for item in chart_values)
 
 
 def test_is_task_first_push_today_detection() -> None:
@@ -1113,8 +1112,87 @@ def test_sales_card_brand_table_bolding_and_yiwo() -> None:
     assert brand_map["天猫可复美"]["net_sales"] == "300.00万"
 
 
+def test_pipeline_partial_notification_delivery() -> None:
+    with _test_session() as db:
+        _seed(db)
+        user = db.get(User, "user_demo")
 
+        req = ScheduledTaskCreateRequest(
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            title="部分投递定时任务",
+            prompt="测试提示词",
+            execution_mode="pipeline",
+            schedule_type="interval",
+            schedule_json={"interval_seconds": 3600},
+            pipeline_steps=[
+                {"type": "query", "template_id": "qt_50f463a815af4801"},
+                {
+                    "type": "feishu_notify",
+                },
+            ],
+            metadata_json={
+                "feishu_notify": {
+                    "enabled": True,
+                    "webhooks": ["https://open.feishu.cn/open-apis/bot/v2/hook/wh1", "https://open.feishu.cn/open-apis/bot/v2/hook/wh2"],
+                }
+            },
+        )
+        task = create_scheduled_task(db, req, user)
+        now = utc_now()
+        run = ScheduledTaskRun(
+            id=new_id("run"),
+            tenant_id=task.tenant_id,
+            scheduled_task_id=task.id,
+            agent_id=task.agent_id,
+            user_id=user.id,
+            scheduled_for=now,
+            status="running",
+            started_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
 
+        mock_result = QueryExecuteResult(
+            template_id="qt_50f463a815af4801",
+            columns=["category", "item", "净销_万"],
+            rows=_sample_sales_rows(),
+            row_count=len(_sample_sales_rows()),
+            execution_time_ms=5.0,
+            cached=False,
+        )
 
+        # wh1 succeeds, wh2 fails
+        partial_res = {
+            "ok": False,
+            "partial": True,
+            "sent_count": 1,
+            "failed_count": 1,
+            "sent": [{"target_type": "webhook", "target": "https://open.feishu.cn/open-apis/bot/v2/hook/wh1"}],
+            "failed": [{"target_type": "webhook", "target": "https://open.feishu.cn/open-apis/bot/v2/hook/wh2", "error": "timeout"}],
+            "error": "部分发送失败：1 个通道未送达",
+        }
 
+        with (
+            patch("app.scheduled_tasks.pipeline.execute_query_by_id", return_value=mock_result),
+            patch("app.scheduled_tasks.pipeline.feishu_app_notify", return_value=partial_res) as mock_notify,
+        ):
+            res_run = _execute_prepared_scheduled_task(db, task, run, manual=True)
+            mock_notify.assert_called_once()
+
+        # Must be marked partial, not succeeded
+        assert res_run.status == "partial"
+        assert "部分发送失败" in str(res_run.error)
+
+        db.refresh(task)
+        meta = task.metadata_json or {}
+        # Global last_push_snapshot should NOT advance when delivery was only partial
+        assert "last_push_snapshot" not in meta
+        # Target snapshots should advance for wh1 only
+        assert "target_snapshots" in meta
+        assert "webhook:https://open.feishu.cn/open-apis/bot/v2/hook/wh1" in meta["target_snapshots"]
+        assert "webhook:https://open.feishu.cn/open-apis/bot/v2/hook/wh2" not in meta["target_snapshots"]
 

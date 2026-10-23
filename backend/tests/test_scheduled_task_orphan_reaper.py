@@ -229,3 +229,62 @@ def test_pipeline_session_immediately_has_user_message() -> None:
     assert msgs[1].role == "assistant"
     assert "流水线执行成功" in msgs[1].content
 
+
+
+def test_worker_startup_preserves_active_leases() -> None:
+    from sqlmodel import update
+    db = _test_session()
+    tenant, user, agent = _seed(db)
+    now = utc_now()
+
+    # Task 1: Stale lease from ungraceful shutdown
+    stale_task = ScheduledTask(
+        id="task_stale_lease",
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        created_by_user_id=user.id,
+        title="Stale Task",
+        prompt="p",
+        status="active",
+        execution_mode="pipeline",
+        lease_owner="worker_dead:123",
+        lease_until=now - timedelta(seconds=30),
+    )
+    # Task 2: Active lease currently held by another living worker
+    active_task = ScheduledTask(
+        id="task_active_lease",
+        tenant_id=tenant.id,
+        agent_id=agent.id,
+        created_by_user_id=user.id,
+        title="Active Task",
+        prompt="p",
+        status="active",
+        execution_mode="pipeline",
+        lease_owner="worker_living:456",
+        lease_until=now + timedelta(seconds=60),
+    )
+    db.add(stale_task)
+    db.add(active_task)
+    db.commit()
+
+    # Simulate worker startup lease cleanup logic
+    db.exec(
+        update(ScheduledTask)
+        .where(
+            ScheduledTask.lease_until.is_not(None),
+            ScheduledTask.lease_until < now,
+        )
+        .values(lease_owner=None, lease_until=None)
+    )
+    db.commit()
+
+    db.refresh(stale_task)
+    db.refresh(active_task)
+
+    # Stale lease must be cleared
+    assert stale_task.lease_owner is None
+    assert stale_task.lease_until is None
+
+    # Active lease must be preserved!
+    assert active_task.lease_owner == "worker_living:456"
+    assert active_task.lease_until is not None

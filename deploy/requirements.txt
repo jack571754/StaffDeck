@@ -23,3 +23,4 @@ wecom-aibot-python-sdk>=1.0.2
 dingtalk-stream>=0.24.3,<0.25.0
 defusedxml>=0.7.1
 pymysql>=1.1.0
+sqlparse>=0.5.0

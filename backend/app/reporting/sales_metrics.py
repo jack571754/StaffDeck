@@ -153,87 +153,115 @@ def format_influencer_top_lines(
     return lines
 
 
-def fetch_dabo_matrix_raw() -> list[dict[str, Any]]:
+def fetch_influencer_sales_rows() -> list[dict[str, Any]]:
+    """Fetch untruncated channel/brand rows using the matrix's live-sales scope."""
+    url = clickhouse_query_url()
+    if url is None:
+        return []
+    queries = [
+        """
+        SELECT trim(author_name) AS author, '抖音' AS platform,
+            if(trim(doudian_shop_name) like '%可丽金%', '可丽金', '可复美') AS brand,
+            sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000 AS gmv_wan,
+            (sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%',
+                pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000 AS net_wan
+        FROM smartbimpp.dy_order
+        WHERE toDate(pay_time) = today() AND `端口` = '达播'
+        GROUP BY author, brand
+        FORMAT JSON
+        """,
+        """
+        SELECT trim(`达人`) AS author, '天猫' AS platform,
+            if(`平台店铺` like '%可丽金%', '可丽金', '可复美') AS brand,
+            sum(`支付金额`)/10000 AS gmv_wan,
+            (sum(`支付金额`) - sum(`成功退款金额`))/10000 AS net_wan
+        FROM smartbimpp.tm_product_realtime_jieguobiao
+        WHERE toDate(`日期`) = today() AND `归属` = '达播'
+        GROUP BY author, brand
+        FORMAT JSON
+        """,
+        """
+        SELECT trim(coalesce(nullIf(trim(`达人`), ''), `昵称`, '')) AS author,
+            trim(`平台`) AS platform,
+            if(`平台店铺` like '%可丽金%', '可丽金',
+                if(`平台店铺` like '%可复美%', '可复美', '')) AS brand,
+            sum(`成交金额`)/10000 AS gmv_wan, sum(`净销`)/10000 AS net_wan
+        FROM smartbimpp.`达人销售表汇总_商品维度_勿删`
+        WHERE `日期` = today() AND trim(`平台`) NOT IN ('天猫', '抖音', '')
+        GROUP BY author, platform, brand
+        FORMAT JSON
+        """,
+    ]
+    result: list[dict[str, Any]] = []
+    for sql in queries:
+        request = urllib.request.Request(url, data=sql.encode("utf-8"))
+        # Do not publish a partial ranking if any channel is unavailable.
+        with urllib.request.urlopen(request, timeout=8) as response:
+            result.extend(json.loads(response.read().decode("utf-8")).get("data", []))
+    return result
+
+
+def fetch_dabo_matrix_raw(
+    influencer_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """从 ClickHouse 高速缓存库获取达播实时矩阵核心数据（天猫、抖音、小红书、快手）。
 
     100% 真实数据驱动，严禁造假，无虚构数据。
     """
-    url = clickhouse_query_url()
-    if url is None:
-        return []
+    # Reuse the exact Tmall rows used by the ranking (including unattributed totals).
+    if influencer_rows is None:
+        influencer_rows = fetch_influencer_sales_rows()
+    tm_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in influencer_rows:
+        if row.get("platform") != "天猫":
+            continue
+        brand = str(row.get("brand") or "")
+        group = "李佳琦" if str(row.get("author") or "").strip() == "李佳琦" else "二梯队 (除李佳琦)"
+        entry = tm_groups.setdefault((brand, group), {
+            "brand": brand, "daren_group": group,
+            "gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0,
+        })
+        gmv, net = float(row.get("gmv_wan") or 0), float(row.get("net_wan") or 0)
+        entry["gmv_wan"] += gmv
+        entry["net_wan"] += net
+        entry["refund_wan"] += gmv - net
+    tm_data = list(tm_groups.values())
 
-    def _query(sql: str) -> list[dict[str, Any]]:
-        req = urllib.request.Request(url, data=sql.encode("utf-8"))
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                return json.loads(resp.read().decode("utf-8")).get("data", [])
-        except Exception as e:  # noqa: BLE001
-            logger.warning("ClickHouse query in fetch_dabo_matrix_raw failed: %s", e)
-            return []
-
-    # 1. 天猫达播（李佳琦 vs 二梯队）
-    sql_tm = """
-    SELECT
-        if(`平台店铺` like '%可丽金%', '可丽金', '可复美') as brand,
-        if(`达人` like '%李佳琦%', '李佳琦', '二梯队 (除李佳琦)') as daren_group,
-        round(sum(`支付金额`)/10000, 2) as gmv_wan,
-        round((sum(`支付金额`) - sum(`成功退款金额`))/10000, 2) as net_wan,
-        round(sum(`成功退款金额`)/10000, 2) as refund_wan
-    FROM smartbimpp.tm_product_realtime_jieguobiao
-    WHERE toDate(`日期`) = today()
-      AND `归属` = '达播'
-    GROUP BY brand, daren_group
-    FORMAT JSON
-    """
-    tm_data = _query(sql_tm)
-
-    # 2. 抖音达播品牌汇总
-    sql_dy_brand = """
-    SELECT
-        if(trim(`doudian_shop_name`) like '%可丽金%', '可丽金', '可复美') as brand,
-        round(sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000, 2) as gmv_wan,
-        round((sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) as net_wan,
-        round(sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0))/10000, 2) as refund_wan
-    FROM smartbimpp.dy_order
-    WHERE toDate(pay_time) = today()
-      AND `端口` = '达播'
-    GROUP BY brand
-    FORMAT JSON
-    """
-    dy_brand_data = _query(sql_dy_brand)
-
-    # 3. 抖音达播达人明细（提取 TOP 3）
-    sql_dy_authors = """
-    SELECT
-        if(trim(`doudian_shop_name`) like '%可丽金%', '可丽金', '可复美') as brand,
-        trim(`author_name`) as author,
-        round(sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount)/10000, 2) as gmv_wan,
-        round((sum(pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount) - sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0)))/10000, 2) as net_wan,
-        round(sum(IF(order_status_desc LIKE '%已关闭%', pay_amount+promotion_platform_amount+promotion_pay_amount+post_amount, 0))/10000, 2) as refund_wan
-    FROM smartbimpp.dy_order
-    WHERE toDate(pay_time) = today()
-      AND `端口` = '达播'
-      AND `author_name` != '' AND `author_name` != '-'
-    GROUP BY brand, author
-    ORDER BY brand, net_wan DESC
-    FORMAT JSON
-    """
-    dy_author_data = _query(sql_dy_authors)
-
-    # 4. 小红书与快手
-    sql_other = """
-    SELECT
-        `平台`,
-        round(sum(`成交金额`)/10000, 2) as gmv_wan,
-        round(sum(`净销`)/10000, 2) as net_wan,
-        round(sum(`退款金额`)/10000, 2) as refund_wan
-    FROM smartbimpp.`达人销售表汇总_商品维度_勿删`
-    WHERE toDate(`日期`) = today()
-      AND `平台` IN ('小红书', '快手')
-    GROUP BY `平台`
-    FORMAT JSON
-    """
-    other_data = _query(sql_other)
+    # Derive all remaining matrix levels from the same untruncated snapshot.
+    dy_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    other_groups: dict[str, dict[str, Any]] = {}
+    for row in influencer_rows:
+        platform = str(row.get("platform") or "")
+        brand = str(row.get("brand") or "")
+        author = str(row.get("author") or "").strip()
+        if platform == "抖音":
+            entry = dy_groups.setdefault((brand, author), {
+                "brand": brand, "author": author,
+                "gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0,
+            })
+        elif platform in ("小红书", "快手"):
+            entry = other_groups.setdefault(platform, {
+                "平台": platform, "gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0,
+            })
+        else:
+            continue
+        gmv, net = float(row.get("gmv_wan") or 0), float(row.get("net_wan") or 0)
+        entry["gmv_wan"] += gmv
+        entry["net_wan"] += net
+        entry["refund_wan"] += gmv - net
+    dy_author_data = sorted(
+        (r for r in dy_groups.values() if r["author"] not in ("", "-")),
+        key=lambda r: (-r["net_wan"], r["author"]),
+    )
+    dy_brands: dict[str, dict[str, Any]] = {}
+    for row in dy_groups.values():
+        entry = dy_brands.setdefault(row["brand"], {
+            "brand": row["brand"], "gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0,
+        })
+        for metric in ("gmv_wan", "net_wan", "refund_wan"):
+            entry[metric] += row[metric]
+    dy_brand_data = list(dy_brands.values())
+    other_data = list(other_groups.values())
 
     if not tm_data and not dy_brand_data and not other_data:
         return []
@@ -352,11 +380,23 @@ def inject_dabo_matrix_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if any(str(r.get("category") or "") == "达播矩阵" for r in rows):
         return rows
 
-    raw_items = fetch_dabo_matrix_raw()
+    influencer_rows = fetch_influencer_sales_rows()
+    raw_items = fetch_dabo_matrix_raw(influencer_rows)
     if not raw_items:
         return rows
 
-    res = list(rows)
+    # Discard the legacy, pre-truncated template ranking before adding live rows.
+    res = [r for r in rows if not is_dabo_row(r)]
+    for row in influencer_rows:
+        name = str(row.get("author") or "").strip()
+        if name in ("", "-", "通用", "未知", "其他", "二梯队", "二梯队 (除李佳琦)"):
+            continue
+        res.append({
+            "category": "达人", "item": name, "达人": name,
+            "平台": row.get("platform"), "品牌": row.get("brand"),
+            "成交金额_万": float(row.get("gmv_wan") or 0),
+            "净销_万": float(row.get("net_wan") or 0),
+        })
     for it in raw_items:
         res.append({
             "category": "达播矩阵",
@@ -440,8 +480,8 @@ def build_dabo_matrix_table_elements(
         refund = float(r.get("退款金额_万") or 0.0)
         diff = 0.0 if is_first_push else float(r.get("环比增量_万") or r.get("diff_amount") or 0.0)
 
-        # Keep refund-only and negative-sales rows; hide rows with no displayed activity.
-        if all(abs(value) < 0.0001 for value in (gmv, net, refund, diff)):
+        # Visibility depends only on daily cumulative sales/refunds, never the increment.
+        if all(abs(value) < 0.0001 for value in (gmv, net, refund)):
             continue
 
         table_rows.append({

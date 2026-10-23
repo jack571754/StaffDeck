@@ -1035,8 +1035,13 @@ def feishu_app_notify(
     elif failed_results:
         err_detail = f"部分发送失败：{len(failed_results)} 个通道未送达"
 
+    all_succeeded = len(sent_results) > 0 and len(failed_results) == 0
+    is_partial = len(sent_results) > 0 and len(failed_results) > 0
+    is_empty = len(sent_results) == 0 and len(failed_results) == 0
+
     res: dict[str, Any] = {
-        "ok": len(sent_results) > 0,
+        "ok": all_succeeded or is_empty,
+        "partial": is_partial,
         "sent_count": len(sent_results),
         "failed_count": len(failed_results),
         "sent": sent_results,

@@ -645,6 +645,72 @@ def test_bind_rejects_task_owned_by_another_member(
 
 
 
+
+
+def test_bind_rejects_link_owned_by_another_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api.chat import (
+        BindScheduledTaskRequest,
+        bind_artifact_share_link_to_scheduled_task,
+    )
+    from app.db.models import ScheduledTask, new_id
+
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        user_a = _seed_artifact(db)
+        user_b = User(
+            id="user_b",
+            tenant_id="tenant_demo",
+            username="user_b",
+            display_name="成员B",
+            role="member",
+            password_hash="test-hash",
+        )
+        db.add(user_b)
+        db.commit()
+
+        # user_b 拥有自己的任务
+        task = ScheduledTask(
+            id=new_id("task_sched"),
+            tenant_id="tenant_demo",
+            agent_id="agent_demo",
+            created_by_user_id=user_b.id,
+            title="成员B的定时任务",
+            prompt="测试",
+            status="active",
+            execution_mode="pipeline",
+            pipeline_steps_json=[{"type": "query", "template_id": "qt_demo"}],
+            schedule_type="interval",
+            schedule_json={"interval_seconds": 600},
+        )
+        db.add(task)
+        db.commit()
+
+        # user_a 创建了分享链接
+        link = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id="task_demo",
+                path="reports/sales.html",
+            ),
+            current_user=user_a,
+            db=db,
+        )
+
+        # user_b 尝试把 user_a 的链接绑定到 user_b 自己的任务上
+        with pytest.raises(HTTPException) as exc_info:
+            bind_artifact_share_link_to_scheduled_task(
+                link_id=link.link_id,
+                req=BindScheduledTaskRequest(mode="existing", existing_task_id=task.id),
+                current_user=user_b,
+                db=db,
+            )
+        assert exc_info.value.status_code == 403
+        assert "无权管理该分享链接" in exc_info.value.detail
+
 def test_update_share_link_title_syncs_bound_task_metadata():
     engine = _test_engine()
     with Session(engine) as db:

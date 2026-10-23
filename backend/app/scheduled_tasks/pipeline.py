@@ -387,21 +387,30 @@ def execute_pipeline_scheduled_task(
                     })
                     continue
 
-                # 核心：计算较上一轮实际推送的增量差值
-                from app.reporting.sales_metrics import inject_dabo_matrix_rows
-
-                query_rows = inject_dabo_matrix_rows(query_rows)
-
-                processed_rows, current_snapshot, prev_push_time = apply_push_incremental_diff(
-                    query_rows, task, is_first_push, db
-                )
-
                 renderer_name = (
                     step.get("renderer")
                     or (step.get("params") or {}).get("renderer")
                     or metadata.get("renderer")
                     or "sales_card"
                 )
+                is_sales_task = (
+                    renderer_name == "sales_card"
+                    or metadata.get("task_type") == "sales_summary"
+                    or bool(step.get("inject_sales_matrix"))
+                )
+
+                # 仅对销售业务任务注入达播矩阵数据
+                if is_sales_task:
+                    try:
+                        from app.reporting.sales_metrics import inject_dabo_matrix_rows
+                        query_rows = inject_dabo_matrix_rows(query_rows)
+                    except Exception as matrix_err:
+                        logger.warning("Pipeline step %d: failed to inject dabo matrix: %s", idx, matrix_err)
+
+                processed_rows, current_snapshot, prev_push_time = apply_push_incremental_diff(
+                    query_rows, task, is_first_push, db
+                )
+
                 renderer_func = get_card_renderer(renderer_name)
                 card_params = dict(step.get("card_params") or {})
                 if prev_push_time and "prev_push_time" not in card_params:
@@ -416,12 +425,13 @@ def execute_pipeline_scheduled_task(
 
                 from app.scheduled_tasks.service import resolve_task_share_link_url
 
-                try:
-                    from app.reporting.realtime_dashboard_syncer import sync_task_artifact_report
-
-                    sync_task_artifact_report(db, task, query_rows)
-                except Exception as sync_err:  # noqa: BLE001
-                    logger.warning("Pipeline step %d: failed to sync artifact report: %s", idx, sync_err)
+                # 仅在销售业务任务中同步关联的大屏交付物
+                if is_sales_task:
+                    try:
+                        from app.reporting.realtime_dashboard_syncer import sync_task_artifact_report
+                        sync_task_artifact_report(db, task, query_rows)
+                    except Exception as sync_err:  # noqa: BLE001
+                        logger.warning("Pipeline step %d: failed to sync artifact report: %s", idx, sync_err)
 
                 artifact_url = resolve_task_share_link_url(db, task) or ""
                 if not artifact_url and not str(metadata.get("artifact_share_link_id") or "").strip():
@@ -487,32 +497,63 @@ def execute_pipeline_scheduled_task(
                     "type": step_type,
                     "notify_res": notify_res,
                 })
-                if not notify_res.get("ok"):
+                is_ok = bool(notify_res.get("ok"))
+                is_partial = bool(notify_res.get("partial"))
+                sent_count = int(notify_res.get("sent_count") or 0)
+                failed_count = int(notify_res.get("failed_count") or 0)
+
+                if not is_ok and not is_partial:
                     err = notify_res.get("error") or "飞书推送失败"
                     raise RuntimeError(f"飞书推送失败: {err}")
 
-                # 推送成功，原子持久化本次快照作为下次执行的增量对比基准
+                # 推送成功或部分成功，按目标推进快照基准
                 if current_snapshot:
                     cst = timezone(timedelta(hours=8))
                     now_cst = datetime.now(cst)
                     updated_meta = dict(task.metadata_json or {})
-                    updated_meta["last_push_snapshot"] = {
-                        "date": now_cst.strftime("%Y-%m-%d"),
-                        "pushed_at": now_cst.strftime("%H:%M"),
-                        "metrics": current_snapshot,
-                    }
+                    target_snapshots = dict(updated_meta.get("target_snapshots") or {})
+                    for s in notify_res.get("sent", []):
+                        target_key = f"{s.get('target_type')}:{s.get('target')}"
+                        target_snapshots[target_key] = {
+                            "date": now_cst.strftime("%Y-%m-%d"),
+                            "pushed_at": now_cst.strftime("%H:%M"),
+                            "metrics": current_snapshot,
+                        }
+                    updated_meta["target_snapshots"] = target_snapshots
+
+                    # 全局快照仅在全部通道成功送达时推进，部分失败时不污染全局基线
+                    if is_ok:
+                        updated_meta["last_push_snapshot"] = {
+                            "date": now_cst.strftime("%Y-%m-%d"),
+                            "pushed_at": now_cst.strftime("%H:%M"),
+                            "metrics": current_snapshot,
+                        }
                     task.metadata_json = updated_meta
                     db.add(task)
                     db.commit()
 
-                logger.info("Pipeline step %d (notify): push succeeded: %s", idx, notify_res)
+                if is_partial:
+                    logger.warning(
+                        "Pipeline step %d (notify): partial delivery (%d sent, %d failed): %s",
+                        idx, sent_count, failed_count, notify_res.get("error")
+                    )
+                else:
+                    logger.info("Pipeline step %d (notify): push succeeded: %s", idx, notify_res)
 
             else:
                 raise ValueError(f"未知的流水线步骤类型: {step_type}")
 
-        # Mark succeeded
-        run.status = "succeeded"
-        run.error = None
+        # Mark status (succeeded or partial)
+        has_partial = any(s.get("notify_res", {}).get("partial") for s in step_results)
+        if has_partial:
+            run.status = "partial"
+            run.error = next(
+                (s.get("notify_res", {}).get("error") for s in step_results if s.get("notify_res", {}).get("partial")),
+                "部分飞书通道推送失败",
+            )
+        else:
+            run.status = "succeeded"
+            run.error = None
         has_push = any(s.get("type") in ("skill_notify", "feishu_notify", "notify") and s.get("status") != "skipped" for s in step_results)
         push_summary = "已成功装配并推送至飞书" if has_push else "飞书消息通知未启用（已跳过推送）"
         push_first_note = "（当日首次推送，增量置为0）" if is_first_push else ""

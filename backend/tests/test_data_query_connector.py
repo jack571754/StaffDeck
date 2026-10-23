@@ -92,10 +92,28 @@ class TestSQLWhitelist:
             "CREATE TABLE users (id INT)",
             "TRUNCATE TABLE users",
             "REPLACE INTO users (id, name) VALUES (1, 'bob')",
+            "WITH c AS (SELECT 1) UPDATE audit_table SET value = 1",
+            "WITH c AS (SELECT 1) DELETE FROM audit_table WHERE id = 1",
+            "WITH c AS (SELECT 1) INSERT INTO audit_table SELECT * FROM c",
+            "SELECT 1; UPDATE audit_table SET value = 1",
+            "SELECT * FROM users INTO OUTFILE '/tmp/dump'",
         ],
     )
     def test_rejected_sql(self, sql):
         assert _is_sql_allowed(sql) is False
+
+
+    def test_large_complex_cte_sql_allowed(self):
+        """Large reporting SQL with hundreds of unioned CTE rows (>10,000 tokens) must not be rejected."""
+        unions = " UNION ALL ".join([f"SELECT {i} AS id, 'item_{i}' AS name, {i*10.5} AS amount" for i in range(500)])
+        large_sql = f"WITH cte AS ({unions}) SELECT * FROM cte WHERE amount > 100"
+        assert _is_sql_allowed(large_sql) is True
+
+    def test_large_complex_cte_sql_write_rejected(self):
+        """Large CTE queries terminating in a write operation must still be strictly rejected."""
+        unions = " UNION ALL ".join([f"SELECT {i} AS id, 'item_{i}' AS name" for i in range(500)])
+        attack_sql = f"WITH cte AS ({unions}) UPDATE audit_log SET note = 'hack'"
+        assert _is_sql_allowed(attack_sql) is False
 
     def test_block_comment_bypass_rejected(self):
         sql = "/* SELECT */ DROP TABLE users"

@@ -323,15 +323,15 @@ def _build_brand_dataset(
 
 
 def _build_hourly_dataset(hourly_rows: list[dict[str, Any]], *, is_first_push: bool):
-    series = ["今日"] if is_first_push else ["今日", "昨日"]
+    # Yesterday's hourly series is historical context, consistent with sales_card renderer
+    series = ["今日", "昨日"]
     chart_rows: list[dict[str, Any]] = []
     for row in hourly_rows:
         entry: dict[str, Any] = {
             "hour": str(row.get("item", "")),
             "今日": to_float(row.get("运营净销_万")),
+            "昨日": to_float(row.get("运营增量_万")),
         }
-        if not is_first_push:
-            entry["昨日"] = to_float(row.get("运营增量_万"))
         chart_rows.append(entry)
     dataset = rows_to_dataset(
         chart_rows,
@@ -339,11 +339,7 @@ def _build_hourly_dataset(hourly_rows: list[dict[str, Any]], *, is_first_push: b
         columns=["hour", *series],
         max_rows=24,
     )
-    chart_title = (
-        "24小时时段走势（今日累计，万元）"
-        if is_first_push
-        else "24小时时段走势环比（今日 vs 昨日，万元）"
-    )
+    chart_title = "24小时时段走势环比（今日 vs 昨日，万元）" 
     return dataset, series, chart_title
 
 

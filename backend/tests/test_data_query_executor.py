@@ -96,7 +96,7 @@ class TestValidateParams:
 
     def test_type_conversion_date_dynamic_macros(self) -> None:
         """Dynamic date macros (今天/today/执行日期/昨天) translate using CST timezone."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
         cst = timezone(timedelta(hours=8))
         today_str = datetime.now(cst).strftime("%Y-%m-%d")
         yesterday_str = (datetime.now(cst) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -436,6 +436,51 @@ class TestQueryExecutor:
             assert invalidate_template_cache("qt-inv") >= 1
             assert invalidate_template_cache("qt-inv") == 0
 
+
+    def test_inactive_data_source_rejected_before_cache(self) -> None:
+        """Inactive data source cannot execute and cannot return cached data."""
+        template = self._make_template(tpl_id="qt-inact", cache_ttl=300)
+        ds = self._make_data_source()
+        ds.status = "active"
+
+        mock_session = MagicMock(spec=Session)
+        mock_session.get.return_value = ds
+
+        mock_connector = MagicMock()
+        mock_connector.execute.return_value = QueryResult(
+            columns=["v"], rows=[{"v": 1}], row_count=1
+        )
+
+        with patch("app.data_query.executor.get_connector", return_value=mock_connector):
+            executor = QueryExecutor(db_session=mock_session)
+            # 1. First execution succeeds and caches
+            r1 = executor.execute(template, {})
+            assert r1.cached is False
+
+            # 2. Data source is deactivated
+            ds.status = "inactive"
+
+            # 3. Next execution must be rejected even though cache exists
+            with pytest.raises(ValueError, match="Data source is inactive"):
+                executor.execute(template, {})
+
+    def test_table_whitelist_enforced(self) -> None:
+        """Queries accessing forbidden tables are rejected."""
+        template = self._make_template(
+            tpl_id="qt-wl",
+            query_content="SELECT * FROM forbidden_table WHERE id = 1",
+        )
+        ds = self._make_data_source()
+        ds.status = "active"
+        ds.allowed_tables_json = ["allowed_table", "users"]
+
+        mock_session = MagicMock(spec=Session)
+        mock_session.get.return_value = ds
+
+        executor = QueryExecutor(db_session=mock_session)
+        with pytest.raises(PermissionError, match="forbidden by data source whitelist"):
+            executor.execute(template, {})
+
     def test_different_params_not_cached(self) -> None:
         """Different parameter values trigger separate executions."""
         template = self._make_template(
@@ -610,3 +655,50 @@ class TestQueryExecutor:
         params_arg = call_args.args[1]
         assert params_arg == {"id": 42}
         assert isinstance(params_arg["id"], int)
+    def test_cte_and_subqueries_ignored_by_table_whitelist(self) -> None:
+        """CTEs and derived subqueries are not checked against physical table whitelist."""
+        template = self._make_template(
+            tpl_id="qt-cte-wl",
+            query_content=(
+                "WITH cte1 AS (SELECT * FROM allowed_table WHERE id = 1), "
+                "cte2 AS (SELECT * FROM cte1) "
+                "SELECT * FROM cte2 JOIN (SELECT * FROM cte1) subq ON cte2.id = subq.id"
+            ),
+        )
+        ds = self._make_data_source()
+        ds.status = "active"
+        ds.allowed_tables_json = ["allowed_table"]
+
+        mock_session = MagicMock(spec=Session)
+        mock_session.get.return_value = ds
+
+        mock_connector = MagicMock()
+        mock_connector.execute.return_value = QueryResult(columns=["id"], rows=[{"id": 1}])
+
+        with patch("app.data_query.executor.get_connector", return_value=mock_connector):
+            executor = QueryExecutor(db_session=mock_session)
+            result = executor.execute(template, {})
+
+        assert result.rows == [{"id": 1}]
+
+    def test_extract_query_tables_complex_cte(self) -> None:
+        """_extract_query_tables extracts only real physical tables, ignoring CTEs."""
+        from app.data_query.executor import _extract_query_tables
+
+        sql = """
+        WITH
+        -- First CTE
+        biao1 AS (
+            SELECT * FROM physical_orders WHERE status = 'paid'
+        ),
+        biao2 AS (
+            SELECT id, user_id FROM biao1
+        )
+        SELECT b2.id, p.name
+        FROM biao2 AS b2
+        JOIN (SELECT * FROM products_dim) AS p ON b2.id = p.id
+        LEFT JOIN extra_info ei ON b2.user_id = ei.user_id
+        """
+        tables = _extract_query_tables(sql)
+        assert tables == {"physical_orders", "products_dim", "extra_info"}
+
