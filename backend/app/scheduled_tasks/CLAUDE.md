@@ -72,6 +72,8 @@
 
 **分发字段**：notify 步骤按 `step["renderer"]` → `step["params"]["renderer"]` → `metadata["renderer"]` → 默认 `"sales_card"` 解析后调 `get_card_renderer()`（`pipeline.py:193-199`）。**该字段只存在于步骤 JSON 中，schema 无枚举校验。**
 
+**全店独立页**：销售任务设置 `metadata_json.shop_sales_report_enabled=true` 后，同轮复用全店快照更新原大屏与独立页，最后追加「查看全部店铺实时销售」按钮。独立页绑定键为 `shop_sales_share_link_id`，取数失败保留旧结果，撤销链接后不重建；页面刷新不触发查询或通知。详见 `../reporting/shop_sales_syncer.py`，首次生成脚本为 `scripts/refresh_shop_sales_report.py`（默认只检查，`--apply` 才写入）。
+
 **仍存在的债 / 待办（本次逐行核实）**：
 
 1. **默认渲染器仍业务化**：`get_card_renderer(None)` 与 `renderer_name` 缺省都落到 `sales_card`，非销售任务不显式配置 renderer 时仍出销售卡（`renderers/__init__.py:18-23`）。注意：未知名反而回退 `generic_table`，与缺省方向相反，容易踩。
@@ -147,6 +149,7 @@
 
 ## 变更记录 (Changelog)
 
+- 2026-10-23T10:35 — 销售卡「达人销售TOP 5」口径修正：助播账号（如「李佳琦-助播」）的净销并入主达人后排序，不再单独占名次；规则落在 `app/reporting/sales_metrics.py` 的 `canonical_influencer_name`，`renderers/sales_card.py` 的 `_build_dabo_top5_lines` 无需改动。详见 `../reporting/CLAUDE.md` 同日条目。
 - 2026-09-30T16:10 — 增量更新（在途改动核实）：**新增**「自愈、租约与 next_run 推进」一节（`reap_stale_scheduled_task_runs`、`TASK_RUN_STALE_SECONDS=900`、`due_scheduled_tasks`/worker 启动清租约、`_finish_task_schedule` 新推进语义、worker Event + 三级异常保护）与 5 条风险、2 个新测试文件；修正 pipeline 行号漂移（`is_first_push` 142→160、分发 175-181→193-199、task.title 242→263/331、`query_rows` 123/144→162、文件 342→367 行）；新增"未知步骤类型静默成功"债；风险表把 2 条 P0/P1 标为已修、新增 5 条在途风险；修掉 `fixed_process_workflow.md` 行的多余空格。
 - 2026-09-24T16:45 — 增量更新（聚焦 pipeline 通道）：**新增**「Pipeline 通道与飞书卡片渲染器」一节，登记新 `renderers/` 包（`CARD_RENDERERS` 注册表 / `sales_card.py` / `generic_table.py` / `base.py`）；据提交 `042333ee` 修正事实——销售卡片已抽包、`pipeline.py` 由约 660 行降至 342 行、`run.py` 已改为共用同一 `build_sales_feishu_card`（双份实现漂移消除）、聊天总结改用 `task.title`；据实保留残留债（默认渲染器业务化、`is_first_push` 无条件注入、无 process 步骤、多 query 只渲染最后一个、`pipeline_steps` 零校验、前端无入口）；补「已知缺陷与风险」5 行；标注 `architecture_analysis.md` 为本地未跟踪且 3.1/3.2 节已过时。
 - 2026-09-24T09:46 — 增量更新：补「任务 → 文件对照」与「已知缺陷与风险」表（锚点来自 `architecture_analysis.md`）；补 pipeline 通道、Run Now 计数缺陷与 max_runs 语义。

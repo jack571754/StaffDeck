@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 from starlette.requests import Request as StarletteRequest
 
 from app.api.chat import (
@@ -180,7 +180,7 @@ def test_list_share_links_and_filtering(
             current_user=user,
             db=db,
         )
-        # Mint another link with 1 day
+        # Mint another link with 1 day (force_new=True to mint distinct link)
         resp2 = mint_artifact_share(
             ShareLinkRequest(
                 tenant_id="tenant_demo",
@@ -189,6 +189,7 @@ def test_list_share_links_and_filtering(
                 path="reports/sales.html",
                 title="报告B",
                 days=1,
+                force_new=True,
             ),
             current_user=user,
             db=db,
@@ -346,16 +347,21 @@ def test_delete_link_and_recent_reports(
         assert len(reports) == 1
         assert reports[0]["path"] == "reports/sales.html"
 
-        # Delete = 软删除：保留审计行并立即吊销 token，而不是留下仍可访问的孤儿签名
+        # Delete = 标记删除：列表中不再返回，并立即阻止 token 访问 (404)
         del_res = delete_artifact_share_link(resp.link_id, current_user=user, db=db)
         assert del_res["success"] is True
         db.expire_all()
         deleted = db.get(ArtifactShareLink, resp.link_id)
         assert deleted is not None
+        assert deleted.is_deleted is True
         assert deleted.is_revoked is True
         with pytest.raises(HTTPException) as exc_info:
             view_published_artifact(resp.token, current_user=None, db=db)
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 404
+
+        # 确保列表中已彻底不返回已删除项
+        listed = list_artifact_share_links(tenant_id="tenant_demo", status="all", current_user=user, db=db)
+        assert all(item.id != resp.link_id for item in listed.items)
 
 
 def test_report_generate_automatically_creates_share_link(
@@ -1025,3 +1031,88 @@ def test_update_share_link_noop():
         assert res.title == "幂等测试"
         current_count = len(db.exec(select(ArtifactShareLink)).all())
         assert current_count == initial_count
+
+
+def test_mint_share_link_reuses_active_link_and_avoids_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        user = _seed_artifact(db)
+
+        # 1. 首次为产物生成外链
+        resp1 = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id="task_demo",
+                path="reports/sales.html",
+                title="Q3 销售报告",
+                days=7,
+            ),
+            current_user=user,
+            db=db,
+        )
+        assert resp1.link_id is not None
+        initial_links = db.exec(select(ArtifactShareLink)).all()
+        assert len(initial_links) == 1
+
+        # 2. 再次为同一产物请求外链（如用户多次点击「预览」或「分享」）
+        # 必须复用未作废且未过期的现有外链，严禁无故产生重复数据行
+        resp2 = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id="task_demo",
+                path="reports/sales.html",
+            ),
+            current_user=user,
+            db=db,
+        )
+        assert resp2.link_id == resp1.link_id
+        assert resp2.token == resp1.token
+        assert resp2.url == resp1.url
+        after_second_mint = db.exec(select(ArtifactShareLink)).all()
+        assert len(after_second_mint) == 1
+
+        # 3. 若显式指定 force_new=True，才铸造独立的新外链
+        resp3 = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id="task_demo",
+                path="reports/sales.html",
+                title="新版本独立外链",
+                days=3,
+                force_new=True,
+            ),
+            current_user=user,
+            db=db,
+        )
+        assert resp3.link_id != resp1.link_id
+        after_force_new = db.exec(select(ArtifactShareLink)).all()
+        assert len(after_force_new) == 2
+
+
+def test_sync_endpoints_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        user = _seed_artifact(db)
+        resp = mint_artifact_share(
+            ShareLinkRequest(
+                tenant_id="tenant_demo",
+                session_id="session_demo",
+                task_frame_id="task_demo",
+                path="reports/sales.html",
+            ),
+            current_user=user,
+            db=db,
+        )
+        from app.api.chat import get_artifact_share_sync_status
+        status = get_artifact_share_sync_status(resp.token, db=db)
+        assert "is_syncing" in status
+        assert status["is_syncing"] is False

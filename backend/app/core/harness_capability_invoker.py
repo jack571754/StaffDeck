@@ -678,44 +678,67 @@ class HarnessCapabilityInvoker:
         try:
             from datetime import UTC, datetime
 
+            from sqlmodel import select
+
             from app.config import get_settings
             from app.db.models import ArtifactShareLink
             from app.security import artifact_share as artifact_share_mod
 
-            ttl = artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
-            share_token = artifact_share_mod.mint_artifact_share_token(
-                tenant_id=self.tenant_id,
-                session_id=self.session.id,
-                owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
-                owner_id=self.task_frame_id,
-                path=published.path,
-                ttl_seconds=ttl,
-            )
-            payload = artifact_share_mod.decode_artifact_share_token(share_token)
-            share_url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{share_token}"
-            token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
-            exp_dt = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
-            share_expires_at = payload["exp"]
+            now_dt = datetime.now(UTC).replace(tzinfo=None)
+            existing_link = self.db.exec(
+                select(ArtifactShareLink)
+                .where(
+                    ArtifactShareLink.tenant_id == self.tenant_id,
+                    ArtifactShareLink.session_id == self.session.id,
+                    ArtifactShareLink.owner_kind == ARTIFACT_OWNER_DEFAULT_KIND,
+                    ArtifactShareLink.owner_id == self.task_frame_id,
+                    ArtifactShareLink.path == published.path,
+                    ArtifactShareLink.is_revoked == False,
+                    ArtifactShareLink.expires_at > now_dt,
+                )
+                .order_by(ArtifactShareLink.created_at.desc())
+            ).first()
 
-            share_record = ArtifactShareLink(
-                tenant_id=self.tenant_id,
-                session_id=self.session.id,
-                owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
-                owner_id=self.task_frame_id,
-                path=published.path,
-                title=published.display_name or Path(published.path).name,
-                token=share_token,
-                token_hash=token_hash,
-                url=share_url,
-                created_by_user_id=getattr(self.session, "user_id", None) or "system",
-                created_by_username="AI Assistant",
-                ttl_seconds=ttl,
-                expires_at=exp_dt,
-                is_revoked=False,
-            )
-            self.db.add(share_record)
-            self.db.commit()
-            share_link_id = share_record.id
+            if existing_link and existing_link.token:
+                share_token = existing_link.token
+                share_url = existing_link.url
+                share_expires_at = int(existing_link.expires_at.replace(tzinfo=UTC).timestamp())
+                share_link_id = existing_link.id
+            else:
+                ttl = artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
+                share_token = artifact_share_mod.mint_artifact_share_token(
+                    tenant_id=self.tenant_id,
+                    session_id=self.session.id,
+                    owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+                    owner_id=self.task_frame_id,
+                    path=published.path,
+                    ttl_seconds=ttl,
+                )
+                payload = artifact_share_mod.decode_artifact_share_token(share_token)
+                share_url = f"{get_settings().normalized_tool_base_url}/api/chat/artifacts/view/{share_token}"
+                token_hash = hashlib.sha256(share_token.encode("utf-8")).hexdigest()
+                exp_dt = datetime.fromtimestamp(payload["exp"], tz=UTC).replace(tzinfo=None)
+                share_expires_at = payload["exp"]
+
+                share_record = ArtifactShareLink(
+                    tenant_id=self.tenant_id,
+                    session_id=self.session.id,
+                    owner_kind=ARTIFACT_OWNER_DEFAULT_KIND,
+                    owner_id=self.task_frame_id,
+                    path=published.path,
+                    title=published.display_name or Path(published.path).name,
+                    token=share_token,
+                    token_hash=token_hash,
+                    url=share_url,
+                    created_by_user_id=getattr(self.session, "user_id", None) or "system",
+                    created_by_username="AI Assistant",
+                    ttl_seconds=ttl,
+                    expires_at=exp_dt,
+                    is_revoked=False,
+                )
+                self.db.add(share_record)
+                self.db.commit()
+                share_link_id = share_record.id
         except (OSError, ValueError, RuntimeError, KeyError):
             pass
 

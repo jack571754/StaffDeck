@@ -86,6 +86,7 @@ def mint_artifact_share_token(
     owner_id: str | None = None,
     task_frame_id: str | None = None,
     ttl_seconds: int = ARTIFACT_SHARE_TTL_SECONDS,
+    share_link_id: str | None = None,
 ) -> str:
     """Sign an artifact-share capability token for a normalized path.
 
@@ -118,6 +119,8 @@ def mint_artifact_share_token(
     }
     if kind == ARTIFACT_OWNER_DEFAULT_KIND:
         payload["task_frame_id"] = identity
+    if share_link_id is not None:
+        payload["share_link_id"] = str(share_link_id)
     body = _auth._b64(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     )

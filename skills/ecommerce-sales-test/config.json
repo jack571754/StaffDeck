@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "profile_id": "ecommerce-sales-test-v2",
+  "title": "电商实时销售数据 · 技能测试报告",
+  "summary_template_id": "qt_50f463a815af4801",
+  "dabo_template_id": "qt_dabo_realtime_summary",
+  "summary_row_limit": 100,
+  "dabo_row_limit": 500,
+  "top_n": 5,
+  "brand_order": ["可复美", "可丽金", "巨子生物", "欣苷", "参苷"],
+  "hourly_fields": {"today": "净销_万", "yesterday": "运营增量_万"},
+  "influencer_aliases": {
+    "李佳琦-助播": "李佳琦",
+    "李佳琦（助播）": "李佳琦",
+    "李佳琦(助播)": "李佳琦"
+  },
+  "delivery": {"mode": "preview", "notify_enabled": false}
+}

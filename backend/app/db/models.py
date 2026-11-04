@@ -1748,6 +1748,9 @@ class ArtifactShareLink(SQLModel, table=True):
     is_revoked: bool = Field(default=False, index=True)
     revoked_at: datetime | None = None
     revoked_by_user_id: str | None = None
+    is_deleted: bool = Field(default=False, index=True)
+    deleted_at: datetime | None = None
+    deleted_by_user_id: str | None = None
     view_count: int = Field(default=0)
     last_viewed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now, index=True)

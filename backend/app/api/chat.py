@@ -2413,6 +2413,7 @@ class ShareLinkRequest(BaseModel):
     ttl_seconds: int | None = None
     days: int | None = None
     title: str | None = None
+    force_new: bool = False
 
 
 class ShareLinkResponse(BaseModel):
@@ -2448,6 +2449,7 @@ class ArtifactShareLinkRead(BaseModel):
     remaining_seconds: int
     bound_task_id: str | None = None
     bound_task_title: str | None = None
+    session_title: str | None = None
 
 
 class ArtifactShareLinksListResponse(BaseModel):
@@ -2635,6 +2637,7 @@ def _to_share_link_read(
     now: datetime,
     bound_task_id: str | None = None,
     bound_task_title: str | None = None,
+    session_title: str | None = None,
     *,
     include_token: bool = True,
 ) -> ArtifactShareLinkRead:
@@ -2672,6 +2675,7 @@ def _to_share_link_read(
         remaining_seconds=remaining,
         bound_task_id=bound_task_id,
         bound_task_title=bound_task_title,
+        session_title=session_title,
     )
 
 
@@ -2688,7 +2692,7 @@ _HTML_INLINE_CSP = (
     "img-src https: data: blob:; "
     "media-src https: data: blob:; "
     "font-src https: data:; "
-    "connect-src https:; "
+    "connect-src 'self' http: https: data:; "
     "frame-src https: data: blob:; "
     "object-src 'none'; "
     "base-uri 'none'; "
@@ -2714,6 +2718,34 @@ def _shared_artifact_headers(digest: str, size: int) -> dict[str, str]:
         "Cross-Origin-Resource-Policy": "same-origin",
         "Content-Length": str(size),
     }
+
+
+def _share_link_access_notice(link_record: ArtifactShareLink, wants_html: bool) -> Response | None:
+    if getattr(link_record, "is_deleted", False):
+        if wants_html:
+            return _render_share_link_notice_page(
+                title="链接已被删除",
+                message="抱歉，该报告分享链接已被删除，无法继续访问。",
+                status_code=404,
+            )
+        raise HTTPException(status_code=404, detail="该分享链接已被删除")
+    if link_record.is_revoked:
+        if wants_html:
+            return _render_share_link_notice_page(
+                title="链接已作废",
+                message="抱歉，该报告分享链接已被管理员手动撤销或作废，无法继续访问。",
+                status_code=403,
+            )
+        raise HTTPException(status_code=403, detail="该分享链接已被撤销作废")
+    if link_record.expires_at < utc_now():
+        if wants_html:
+            return _render_share_link_notice_page(
+                title="链接已过期",
+                message="抱歉，该报告分享链接已超出有效期（默认7天），如需查看请联系分享人重新生成链接。",
+                status_code=410,
+            )
+        raise HTTPException(status_code=410, detail="该分享链接已过期失效")
+    return None
 
 
 @router.get("/artifacts/view/{token}", response_model=None)
@@ -2746,22 +2778,9 @@ def view_published_artifact(
         wants_html = True
 
     if link_record is not None:
-        if link_record.is_revoked:
-            if wants_html:
-                return _render_share_link_notice_page(
-                    title="链接已作废",
-                    message="抱歉，该报告分享链接已被管理员手动撤销或作废，无法继续访问。",
-                    status_code=403,
-                )
-            raise HTTPException(status_code=403, detail="该分享链接已被撤销作废")
-        if link_record.expires_at < utc_now():
-            if wants_html:
-                return _render_share_link_notice_page(
-                    title="链接已过期",
-                    message="抱歉，该报告分享链接已超出有效期（默认7天），如需查看请联系分享人重新生成链接。",
-                    status_code=410,
-                )
-            raise HTTPException(status_code=410, detail="该分享链接已过期失效")
+        notice = _share_link_access_notice(link_record, wants_html)
+        if notice is not None:
+            return notice
 
     try:
         payload = artifact_share_mod.decode_artifact_share_token(token)
@@ -2773,6 +2792,21 @@ def view_published_artifact(
                 status_code=404,
             )
         raise
+
+    if payload.get("share_link_id") is not None:
+        stable_id = payload["share_link_id"]
+        if not isinstance(stable_id, str):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        stable_link = db.get(ArtifactShareLink, stable_id)
+        if stable_link is None or any(
+            getattr(stable_link, key) != payload[key]
+            for key in ("tenant_id", "session_id", "owner_kind", "owner_id", "path")
+        ):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        link_record = stable_link
+        notice = _share_link_access_notice(link_record, wants_html)
+        if notice is not None:
+            return notice
 
     tenant_id = payload["tenant_id"]
     session_id = payload["session_id"]
@@ -2820,6 +2854,16 @@ def view_published_artifact(
         link_record.last_viewed_at = utc_now()
         db.add(link_record)
         db.commit()
+
+        if _is_html_previewable(cn_path):
+            try:
+                from app.reporting.report_sync_manager import find_bound_task_for_share_link, sync_manager
+
+                bound_task = find_bound_task_for_share_link(db, link_record)
+                if bound_task is not None and sync_manager.should_sync(link_record.id):
+                    sync_manager.trigger_sync(bound_task.id, link_record.id)
+            except Exception as sync_trigger_err:  # noqa: BLE001
+                logger.warning("Auto sync trigger failed: %s", sync_trigger_err)
 
     filename = _safe_artifact_download_name(
         str(artifact.get("display_name") or opened.filename)
@@ -2875,6 +2919,41 @@ def mint_artifact_share(
     )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
+
+    now = utc_now()
+    if not request.force_new:
+        existing_stmt = (
+            select(ArtifactShareLink)
+            .where(
+                ArtifactShareLink.tenant_id == request.tenant_id,
+                ArtifactShareLink.session_id == request.session_id,
+                ArtifactShareLink.owner_kind == resolved.owner_kind,
+                ArtifactShareLink.owner_id == resolved.owner_id,
+                ArtifactShareLink.path == request.path,
+                ArtifactShareLink.is_revoked == False,
+                ArtifactShareLink.expires_at > now,
+            )
+            .order_by(ArtifactShareLink.created_at.desc())
+        )
+        existing = db.exec(existing_stmt).first()
+        if existing and existing.token:
+            updated = False
+            if request.title and request.title != existing.title:
+                existing.title = request.title
+                existing.updated_at = now
+                updated = True
+            if updated:
+                db.add(existing)
+                db.commit()
+                db.refresh(existing)
+            exp_ts = int(existing.expires_at.replace(tzinfo=UTC).timestamp())
+            return ShareLinkResponse(
+                token=existing.token,
+                url=existing.url,
+                expires_at=exp_ts,
+                link_id=existing.id,
+                title=existing.title,
+            )
 
     ttl = (
         (request.days * 86400)
@@ -2947,7 +3026,10 @@ def list_artifact_share_links(
     tid = tenant_id or current_user.tenant_id
     _ensure_request_tenant(tid, current_user)
 
-    stmt = select(ArtifactShareLink).where(ArtifactShareLink.tenant_id == tid)
+    stmt = select(ArtifactShareLink).where(
+        ArtifactShareLink.tenant_id == tid,
+        ArtifactShareLink.is_deleted == False,
+    )
     if not is_admin_user(current_user):
         # 普通成员只能看到自己创建的链接，避免枚举他人的报告路径与 token
         stmt = stmt.where(ArtifactShareLink.created_by_user_id == current_user.id)
@@ -2955,6 +3037,7 @@ def list_artifact_share_links(
 
     # Map tasks bound to artifact share links
     task_map: dict[str, tuple[str, str]] = {}
+    session_map: dict[str, str] = {}
     try:
         tasks = db.exec(select(ScheduledTask).where(ScheduledTask.tenant_id == tid)).all()
         for t in tasks:
@@ -2962,6 +3045,10 @@ def list_artifact_share_links(
             lid = meta.get("artifact_share_link_id")
             if lid and str(lid).strip():
                 task_map[str(lid).strip()] = (t.id, t.title)
+        sids = {link.session_id for link in all_links if link.session_id}
+        if sids:
+            sessions = db.exec(select(ChatSession).where(ChatSession.id.in_(sids))).all()
+            session_map = {s.id: s.title for s in sessions if s.title}
     except Exception:
         pass
 
@@ -2980,6 +3067,7 @@ def list_artifact_share_links(
             now,
             bound_task_id=bound_id,
             bound_task_title=bound_title,
+            session_title=session_map.get(link.session_id),
             include_token=False,
         )
         total_views += link.view_count
@@ -3007,7 +3095,9 @@ def list_artifact_share_links(
             title_match = bool(link.title and q in link.title.lower())
             path_match = q in link.path.lower()
             user_match = bool(link.created_by_username and q in link.created_by_username.lower())
-            if not (title_match or path_match or user_match):
+            stitle = session_map.get(link.session_id)
+            session_match = bool(stitle and q in stitle.lower())
+            if not (title_match or path_match or user_match or session_match):
                 continue
 
         read_items.append(read)
@@ -3034,7 +3124,7 @@ def revoke_artifact_share_link(
 ) -> ArtifactShareLinkRead:
     """Manually revoke a share link so it can no longer be accessed."""
     link = db.get(ArtifactShareLink, link_id)
-    if not link:
+    if not link or link.is_deleted:
         raise HTTPException(status_code=404, detail="分享链接不存在")
     _ensure_request_tenant(link.tenant_id, current_user)
     _ensure_share_link_access(link, current_user)
@@ -3145,7 +3235,7 @@ def update_artifact_share_link(
 ) -> ArtifactShareLinkRead:
     """Update title and/or expiration time of a share link."""
     link = db.get(ArtifactShareLink, link_id)
-    if not link:
+    if not link or link.is_deleted:
         raise HTTPException(status_code=404, detail="分享链接不存在")
     _ensure_request_tenant(link.tenant_id, current_user)
     _ensure_share_link_access(link, current_user)
@@ -3207,7 +3297,7 @@ def extend_artifact_share_link(
 ) -> ArtifactShareLinkRead:
     """Extend the expiration time of a share link and re-sign the capability token."""
     link = db.get(ArtifactShareLink, link_id)
-    if not link:
+    if not link or link.is_deleted:
         raise HTTPException(status_code=404, detail="分享链接不存在")
     _ensure_request_tenant(link.tenant_id, current_user)
     _ensure_share_link_access(link, current_user)
@@ -3238,28 +3328,100 @@ def delete_artifact_share_link(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """Delete a share link: revoke the signed token and keep the row for audit.
-
-    Hard-deleting the row would orphan the stateless signed token: the viewer
-    only checks revocation/expiry when it can find the row, so a deleted record
-    used to keep serving the artifact until the token's own ``exp``. We therefore
-    soft-delete (``is_revoked=True``) so ``/artifacts/view/{token}`` rejects it
-    immediately while the audit trail survives.
-    """
+    """Delete a share link: mark is_deleted=True so it vanishes from lists and rejects viewers."""
     link = db.get(ArtifactShareLink, link_id)
-    if not link:
+    if not link or link.is_deleted:
         raise HTTPException(status_code=404, detail="分享链接不存在")
     _ensure_request_tenant(link.tenant_id, current_user)
     _ensure_share_link_access(link, current_user)
 
-    if not link.is_revoked:
-        link.is_revoked = True
-        link.revoked_at = utc_now()
+    now = utc_now()
+    link.is_deleted = True
+    link.deleted_at = now
+    link.deleted_by_user_id = current_user.id
+    link.is_revoked = True
+    if not link.revoked_at:
+        link.revoked_at = now
         link.revoked_by_user_id = current_user.id
-        link.updated_at = utc_now()
-        db.add(link)
-        db.commit()
+    link.updated_at = now
+    db.add(link)
+
+    tasks = db.exec(select(ScheduledTask).where(ScheduledTask.tenant_id == link.tenant_id)).all()
+    for t in tasks:
+        meta = dict(t.metadata_json or {})
+        changed = False
+        if meta.get("artifact_share_link_id") == link.id:
+            meta.pop("artifact_share_link_id", None)
+            changed = True
+        if meta.get("shop_sales_share_link_id") == link.id:
+            meta.pop("shop_sales_share_link_id", None)
+            changed = True
+        if changed:
+            t.metadata_json = meta
+            flag_modified(t, "metadata_json")
+            db.add(t)
+
+    db.commit()
     return {"success": True, "deleted_id": link_id, "revoked": True}
+
+
+@router.get("/artifacts/sync-status/{token}")
+def get_artifact_share_sync_status(
+    token: str,
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Check background data pulling and sync status for an artifact share link."""
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    link = db.exec(
+        select(ArtifactShareLink).where(
+            or_(
+                ArtifactShareLink.token_hash == token_hash,
+                ArtifactShareLink.token == token,
+            )
+        )
+    ).first()
+    if not link or link.is_deleted:
+        raise HTTPException(status_code=404, detail="分享链接不存在或已被删除")
+    from app.reporting.report_sync_manager import find_bound_task_for_share_link, sync_manager
+
+    bound_task = find_bound_task_for_share_link(db, link)
+    if not bound_task:
+        return {"has_task": False, "is_syncing": False}
+    status = sync_manager.get_status(link.id)
+    status["has_task"] = True
+    status["task_id"] = bound_task.id
+    return status
+
+
+@router.post("/artifacts/sync/{token}")
+def trigger_artifact_share_sync(
+    token: str,
+    db: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Trigger background data pulling for an artifact share link."""
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    link = db.exec(
+        select(ArtifactShareLink).where(
+            or_(
+                ArtifactShareLink.token_hash == token_hash,
+                ArtifactShareLink.token == token,
+            )
+        )
+    ).first()
+    if not link or link.is_deleted:
+        raise HTTPException(status_code=404, detail="分享链接不存在或已被删除")
+    if link.is_revoked:
+        raise HTTPException(status_code=403, detail="分享链接已被撤销作废")
+    from app.reporting.report_sync_manager import find_bound_task_for_share_link, sync_manager
+
+    bound_task = find_bound_task_for_share_link(db, link)
+    if not bound_task:
+        raise HTTPException(status_code=400, detail="该分享报告未关联定时数据任务")
+    triggered = sync_manager.trigger_sync(bound_task.id, link.id)
+    status = sync_manager.get_status(link.id)
+    status["triggered"] = triggered
+    return status
+
 
 
 @router.post("/artifacts/share-links/{link_id}/bind-scheduled-task", response_model=BindScheduledTaskResponse)
@@ -3271,7 +3433,7 @@ def bind_artifact_share_link_to_scheduled_task(
 ) -> BindScheduledTaskResponse:
     """Bind an HTML artifact share link to a scheduled task for periodic push notifications."""
     link = db.get(ArtifactShareLink, link_id)
-    if not link:
+    if not link or link.is_deleted:
         raise HTTPException(status_code=404, detail="分享链接不存在")
     tid = req.tenant_id or current_user.tenant_id
     _ensure_request_tenant(tid, current_user)

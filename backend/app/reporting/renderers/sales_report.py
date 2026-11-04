@@ -270,7 +270,12 @@ def _build_rank_blocks(
     if not pos_rows and not neg_rows:
         return []
 
-    pos_lines = [_shop_line(i, row) for i, row in enumerate(pos_rows[:5], 1)]
+    sorted_pos = sorted(
+        [row for row in pos_rows if to_float(row.get("环比增量_万") or row.get("diff_amount")) > 0],
+        key=lambda row: to_float(row.get("环比增量_万") or row.get("diff_amount")),
+        reverse=True,
+    )
+    pos_lines = [_shop_line(i, row) for i, row in enumerate(sorted_pos[:5], 1)]
     dabo_lines = _dabo_lines(neg_rows)
     if not dabo_lines:
         dabo_lines = ["*（暂无达人实时销售数据）*"]

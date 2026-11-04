@@ -762,6 +762,32 @@ def test_build_sales_feishu_card_with_dabo_top5() -> None:
             "退款金额": "75594.30",
             "净销": "143291.38",
         },
+        {
+            "统计维度": "3_达人TOP18",
+            "日期": "2026-10-20~2026-10-20",
+            "平台": "天猫",
+            "平台店铺": "天猫-可复美旗舰店",
+            "达人": "李佳琦",
+            "商品名称": "-",
+            "数据源": "实时数据源",
+            "品牌": "可复美",
+            "成交金额": "2000000.00",
+            "退款金额": "800000.00",
+            "净销": "1200000.00",
+        },
+        {
+            "统计维度": "3_达人TOP18",
+            "日期": "2026-10-20~2026-10-20",
+            "平台": "天猫",
+            "平台店铺": "天猫-可复美旗舰店",
+            "达人": "李佳琦-助播",
+            "商品名称": "-",
+            "数据源": "实时数据源",
+            "品牌": "可复美",
+            "成交金额": "600000.00",
+            "退款金额": "300000.00",
+            "净销": "300000.00",
+        },
     ]
     card = build_sales_feishu_card(rows, title="线上实时销售播报（每30分钟）")
     card_str = str(card)
@@ -772,6 +798,10 @@ def test_build_sales_feishu_card_with_dabo_top5() -> None:
     assert "66.84万" in card_str
     assert "诸十亿（可复美焦点面霜专场）" in card_str
     assert "16.75万" in card_str
+
+    # 助播销售必须并入李佳琦：合并后净销 150.00万，且不再出现独立名次。
+    assert "李佳琦-助播" not in card_str
+    assert "150.00万" in card_str
 
     # Ensure 1_平台汇总 and 3_达人TOP18 rows did not leak into the 7-column brand table
     elements = card["card"]["body"]["elements"]
@@ -993,6 +1023,62 @@ def test_pipeline_artifact_url_schema_v2_button_appended() -> None:
         assert btn["behaviors"][0]["default_url"] == "http://127.0.0.1:5173/api/chat/artifacts/view/test-token"
 
 
+def test_pipeline_only_pushes_bound_report_link_and_shares_shop_query() -> None:
+    """独立页继续更新，但推送仅保留链接管理所关联的报告入口。"""
+    with _test_session() as db:
+        _seed(db)
+        task, run = _make_pipeline_task(db, db.get(User, "user_demo"), [
+            {"type": "query", "template_id": "qt_demo"}, {"type": "skill_notify"},
+        ], metadata={
+            "feishu_notify": {"enabled": True, "webhooks": ["https://example.com/webhook"]},
+            "shop_sales_report_enabled": True,
+            "artifact_share_url": "https://example.com/dashboard",
+        })
+        result = QueryExecuteResult(template_id="qt_demo", columns=[], rows=_sample_sales_rows(),
+                                    row_count=4, execution_time_ms=1)
+        shops = [{"name": "全部店铺", "net": 10, "ops": 8, "live": 2}]
+        with (
+            patch("app.scheduled_tasks.pipeline.execute_query_by_id", return_value=result),
+            patch("app.reporting.dashboard_shops.fetch_task_all_shops", return_value=shops) as fetch,
+            patch("app.reporting.shop_sales_syncer.sync_task_shop_sales_report",
+                  return_value="https://example.com/shops"),
+            patch("app.reporting.realtime_dashboard_syncer.sync_task_artifact_report") as dashboard,
+            patch("app.scheduled_tasks.pipeline.feishu_app_notify",
+                  return_value={"ok": True, "sent_count": 1, "failed_count": 0}) as notify,
+        ):
+            completed = _execute_prepared_scheduled_task(db, task, run, manual=True)
+        assert completed.status == "succeeded", completed.error
+        card = notify.call_args.args[0].card
+        elements = card["card"]["body"]["elements"]
+        report_urls = [e["behaviors"][0]["default_url"] for e in elements
+                       if e.get("tag") == "button" and e.get("behaviors")]
+        assert report_urls == ["https://example.com/dashboard"]
+        assert "https://example.com/shops" not in str(card)
+        assert fetch.call_count == 1
+        assert dashboard.call_args.kwargs["all_shops"] is shops
+        assert "https://example.com/shops" not in str(completed.trace_json)
+
+
+def test_pipeline_does_not_fetch_shop_page_without_explicit_enablement() -> None:
+    """未开启独立页的任务不额外运行完整店铺查询。"""
+    with _test_session() as db:
+        _seed(db)
+        task, run = _make_pipeline_task(db, db.get(User, 'user_demo'), [
+            {'type': 'query', 'template_id': 'qt_demo'}, {'type': 'skill_notify'},
+        ], metadata={'feishu_notify': {'enabled': True, 'webhooks': ['https://example.com/hook']}})
+        result = QueryExecuteResult(template_id='qt_demo', columns=[], rows=_sample_sales_rows(),
+                                    row_count=4, execution_time_ms=1)
+        with (
+            patch('app.scheduled_tasks.pipeline.execute_query_by_id', return_value=result),
+            patch('app.reporting.dashboard_shops.fetch_task_all_shops', return_value=[]) as fetch,
+            patch('app.scheduled_tasks.pipeline.feishu_app_notify',
+                  return_value={'ok': True, 'sent_count': 1, 'failed_count': 0}),
+        ):
+            completed = _execute_prepared_scheduled_task(db, task, run, manual=True)
+        assert completed.status == 'succeeded', completed.error
+        assert fetch.call_count == 0
+
+
 def test_dabo_matrix_table_structure_and_position():
     """验证达播数据表结构正确性及在飞书卡片中位于24小时时段走势上方。"""
     from app.reporting.sales_metrics import build_dabo_matrix_table_elements
@@ -1196,3 +1282,26 @@ def test_pipeline_partial_notification_delivery() -> None:
         assert "webhook:https://open.feishu.cn/open-apis/bot/v2/hook/wh1" in meta["target_snapshots"]
         assert "webhook:https://open.feishu.cn/open-apis/bot/v2/hook/wh2" not in meta["target_snapshots"]
 
+
+
+def test_build_sales_feishu_card_sorts_positive_increment_shops_descending():
+    """验证飞书卡片中正增量领跑 Top 5 必须严格按环比增量降序排列。"""
+    rows = [
+        {"category": "大盘", "item": "电商整体", "净销_万": 1000.0, "环比增量_万": 50.0},
+        {"category": "店铺正增量Top5", "item": "京东-可复美京东自营旗舰店", "净销_万": 76.55, "环比增量_万": 7.24},
+        {"category": "店铺正增量Top5", "item": "天猫-可复美旗舰店", "净销_万": 200.93, "环比增量_万": 11.21},
+        {"category": "店铺正增量Top5", "item": "京东-可丽金化妆品京东自营旗舰店", "净销_万": 26.94, "环比增量_万": 2.31},
+        {"category": "店铺正增量Top5", "item": "天猫-巨子生物旗舰店", "净销_万": 20.56, "环比增量_万": 1.49},
+        {"category": "店铺正增量Top5", "item": "抖音-可复美旗舰店", "净销_万": 122.69, "环比增量_万": 10.62},
+    ]
+
+    card = build_sales_feishu_card(rows, title="实时销售播报", is_first_push=False)
+    elements = card["card"]["body"]["elements"]
+    ranking_colset = next(e for e in elements if "正增量领跑" in str(e))
+    pos_content = ranking_colset["columns"][0]["elements"][0]["content"]
+
+    assert "1. **天猫-可复美旗舰店**\n   增量: <font color='green'>**+11.21万**</font>" in pos_content
+    assert "2. **抖音-可复美旗舰店**\n   增量: <font color='green'>**+10.62万**</font>" in pos_content
+    assert "3. **京东-可复美京东自营旗舰店**\n   增量: <font color='green'>**+7.24万**</font>" in pos_content
+    assert "4. **京东-可丽金化妆品京东自营旗舰店**\n   增量: <font color='green'>**+2.31万**</font>" in pos_content
+    assert "5. **天猫-巨子生物旗舰店**\n   增量: <font color='green'>**+1.49万**</font>" in pos_content

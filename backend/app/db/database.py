@@ -140,6 +140,7 @@ def _migrate_sqlite_skill_schema() -> None:
         _migrate_harness_v2_schema(conn, inspector, tables)
         _migrate_ui_configs_data_query_grant_all(conn, tables)
         _migrate_data_query_integration_schema(conn, inspector, tables)
+        _migrate_artifact_share_links_schema(conn, tables)
 
         if "api_jobs" in tables:
             job_columns = {column["name"] for column in inspector.get_columns("api_jobs")}
@@ -777,6 +778,23 @@ def _migrate_ui_configs_data_query_grant_all(conn, tables: set[str]) -> None:
         conn.execute(
             text("ALTER TABLE ui_configs ADD COLUMN data_query_grant_all BOOLEAN NOT NULL DEFAULT 0")
         )
+
+
+def _migrate_artifact_share_links_schema(conn, tables: set[str]) -> None:
+    if "artifact_share_links" not in tables:
+        return
+    columns = {
+        str(row[1]) for row in conn.execute(text("PRAGMA table_info(artifact_share_links)")).all()
+    }
+    if "is_deleted" not in columns:
+        conn.execute(text("ALTER TABLE artifact_share_links ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_artifact_share_links_is_deleted ON artifact_share_links (is_deleted)")
+        )
+    if "deleted_at" not in columns:
+        conn.execute(text("ALTER TABLE artifact_share_links ADD COLUMN deleted_at DATETIME"))
+    if "deleted_by_user_id" not in columns:
+        conn.execute(text("ALTER TABLE artifact_share_links ADD COLUMN deleted_by_user_id VARCHAR"))
 
 
 def _migrate_channel_binding_agents_backfill(conn, tables: set[str]) -> None:

@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm.attributes import flag_modified
-from sqlmodel import Session, select
+from sqlmodel import Session, select, update
 
 from app.core.harness_session_cleanup import harness_task_workspace_path
 from app.db.models import ArtifactShareLink, Message, ScheduledTask
 from app.reporting.clickhouse_config import clickhouse_query_url
+from app.reporting.dashboard_viewport import adapt_dashboard_viewport
 
 logger = logging.getLogger(__name__)
 
@@ -110,16 +111,19 @@ def fetch_clickhouse_dy_order_metrics() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         logger.warning("ClickHouse dy_order query failed (fallback to empty): %s", e)
 
-    out["daren_top5"] = fetch_all_channel_daren_top5(url)
+    out["daren_top5"] = fetch_all_channel_daren_top5(url, limit=None)
     return out
 
 
-def fetch_all_channel_daren_top5(url: str) -> list[dict[str, Any]]:
+def fetch_all_channel_daren_top5(url: str, limit: int | None = 5) -> list[dict[str, Any]]:
     """Aggregate actual influencer names across brands/platforms before ranking.
 
     Tmall's 通用 bucket is unattributed sales, not an individual influencer.
     Keep the source-specific net-sales formulas used by the dashboard.
     """
+    # 与飞书卡片共用同一套达人归并规则（助播并入主达人）。
+    from app.reporting.sales_metrics import canonical_influencer_name
+
     queries = [
         """
         SELECT trim(author_name) AS author, '抖音' AS platform,
@@ -164,7 +168,8 @@ def fetch_all_channel_daren_top5(url: str) -> list[dict[str, Any]]:
             logger.warning('Influencer channel query failed: %s', exc)
             continue
         for row in rows:
-            name = str(row.get('author') or '').strip()
+            # 助播账号（如「李佳琦-助播」）并入主达人，不单独占一个名次。
+            name = canonical_influencer_name(row.get('author'))
             if name in ('', '-', '通用', '未知', '其他', '二梯队', '二梯队 (除李佳琦)'):
                 continue
             author = authors.setdefault(name, {
@@ -177,12 +182,14 @@ def fetch_all_channel_daren_top5(url: str) -> list[dict[str, Any]]:
                 value = str(row.get(field) or '').strip()
                 if value and value not in author[collection]:
                     author[collection].append(value)
-    ranked = sorted(authors.values(), key=lambda row: (-row['net_wan'], row['author']))[:5]
+    ranked = sorted(authors.values(), key=lambda row: (-row['net_wan'], row['author']))
+    if limit is not None:
+        ranked = ranked[:limit]
     return [{
         'author': row['author'], 'platform': ' / '.join(row['platforms']),
         'brand': ' / '.join(row['brands']),
         'net_wan': round(row['net_wan'], 2), 'gmv_wan': round(row['gmv_wan'], 2),
-    } for row in ranked]
+    } for row in ranked if (limit is not None or row['net_wan'] > 0 or row['gmv_wan'] > 0)]
 
 
 def _optional_amount(row: dict[str, Any], key: str) -> float | None:
@@ -359,6 +366,36 @@ def parse_pipeline_query_metrics(query_rows: list[dict[str, Any]]) -> dict[str, 
         })
     metrics["channels_all"] = channels_all
 
+    # 5. 抖音自营/官方店铺数据（当 ClickHouse 链路未配置时作为真实全盘兜底）
+    dy_shops: list[dict[str, Any]] = []
+    for r in query_rows:
+        dim = str(r.get("统计维度") or "").strip()
+        platform = str(r.get("平台") or "").strip()
+        shop_raw = str(r.get("平台店铺") or r.get("店铺") or r.get("item") or "").strip()
+        if (dim.startswith("2_店铺") or r.get("category") == "店铺汇总") and (platform == "抖音" or shop_raw.startswith("抖音-")):
+            shop_name = shop_raw.removeprefix("抖音-").strip()
+
+            def _conv_amt(row: dict[str, Any], k_yuan: str, k_wan: str) -> float:
+                if row.get(k_wan) is not None:
+                    return float(row.get(k_wan) or 0.0)
+                if row.get(k_yuan) is not None:
+                    return round(float(row.get(k_yuan) or 0.0) / 10000.0, 2)
+                return 0.0
+
+            gmv = _conv_amt(r, "成交金额", "成交金额_万")
+            ref = _conv_amt(r, "退款金额", "退款金额_万")
+            net = _conv_amt(r, "净销", "净销_万")
+            cnt = int(r.get("order_cnt") or r.get("订单量") or r.get("订单数") or 0)
+            dy_shops.append({
+                "shop_name": shop_name,
+                "gmv_wan": gmv,
+                "refund_wan": ref,
+                "net_wan": net,
+                "order_cnt": cnt,
+            })
+    dy_shops.sort(key=lambda s: s["net_wan"], reverse=True)
+    metrics["dy_shops"] = dy_shops
+
     return metrics
 
 
@@ -381,14 +418,14 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
     hourly_json = json.dumps(hourly, ensure_ascii=False)
 
     # ClickHouse filters 端口=自营; these totals exclude influencer sales.
-    shop_list = ck_data.get("shops") or ck_data.get("zibo_shops") or []
+    shop_list = ck_data.get("shops") or ck_data.get("zibo_shops") or metrics.get("dy_shops") or []
     shop_total_orders = sum(int(s.get("order_cnt") or 0) for s in shop_list)
     shop_total_gmv = sum(float(s.get("gmv_wan") or 0.0) for s in shop_list)
     shop_total_ref = sum(float(s.get("refund_wan") or 0.0) for s in shop_list)
     shop_total_net = sum(float(s.get("net_wan") or 0.0) for s in shop_list)
 
     # 全渠道达人按姓名汇总后统一排名
-    daren_top5 = ck_data.get("daren_top5") or []
+    daren_top5 = ck_data.get("daren_top5") or metrics.get("daren_top5") or []
 
     # 重点店铺明细
     complete_shops = metrics.get("all_shops")
@@ -406,7 +443,8 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
             continue
         shops_data.append({"name": f"抖音-{name}", "net": net, "ops": net,
                            "live": None, "mom": None, "neg": net < 0})
-    shops_data.sort(key=lambda shop: shop["net"], reverse=True)
+    shops_data.sort(key=lambda shop: (shop.get("net") is not None, shop.get("net") or 0),
+                    reverse=True)
     shops_json = json.dumps(shops_data, ensure_ascii=False).replace("<", "\\u003c")
 
     # 渠道结构数据（100% 真实数据驱动）
@@ -585,6 +623,16 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
   .eff td.n {{ font-family: var(--font-num); font-variant-numeric: tabular-nums; font-weight: 700; }}
   .eff tr:last-child td {{ border-bottom: none; }}
   .eff td.ch {{ font-size: 24px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 440px; }}
+  .eff td.time-cell {{ font-size: 20px; text-align: right; white-space: nowrap; }}
+  .row-delay {{
+    display: inline-block; font-size: 16px; font-weight: 600;
+    padding: 2px 8px; border-radius: 6px; margin-left: 8px; white-space: nowrap;
+    vertical-align: middle;
+  }}
+  .delay-good {{ color: #34D399; background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.3); }}
+  .delay-warn {{ color: #FBBF24; background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.3); }}
+  .delay-danger {{ color: #F87171; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); }}
+  .delay-missing {{ color: #94A3B8; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.25); }}
 
   .eff-pagination {{
     height: 64px; flex: none;
@@ -668,7 +716,20 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
   .trend-legend button[aria-pressed="false"] {{ opacity: .35; }}
   .trend-summary {{ display: flex; flex-wrap: wrap; gap: 24px; font-size: 20px; color: var(--text-secondary); margin-bottom: 12px; }}
   .trend-summary b {{ color: var(--text-primary); }}
-  #trendTooltip {{ display: none; position: absolute; top: 0; right: 12px; pointer-events: none; white-space: pre-line; background: #0a0f1df2; border: 1px solid #475569; border-radius: 8px; padding: 14px; color: #fff; font-size: 22px; z-index: 2; }}
+  #trendTooltip {{
+    display: none; position: absolute; pointer-events: none;
+    background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 8px; padding: 10px 14px;
+    color: #F8FAFC; font-size: 14px; z-index: 50; min-width: 190px;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.7), 0 0 12px rgba(59, 130, 246, 0.2);
+  }}
+  #trendTooltip .tip-hd {{ font-size: 13px; font-weight: 700; color: #F8FAFC; padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.12); }}
+  #trendTooltip .tip-rows {{ display: flex; flex-direction: column; gap: 4px; }}
+  #trendTooltip .tip-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }}
+  #trendTooltip .tip-row span {{ display: flex; align-items: center; color: var(--text-secondary); }}
+  #trendTooltip .tip-row i {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }}
+  #trendTooltip .tip-row b {{ font-family: var(--font-num); font-size: 12px; }}
+  #trendTooltip .tip-delta {{ font-size: 11px; font-weight: 600; margin-top: 4px; padding-top: 4px; border-top: 1px dashed rgba(255, 255, 255, 0.1); text-align: right; }}
   .trend-legend i {{ display: inline-block; width: 36px; height: 6px; border-radius: 3px; margin-right: 12px; vertical-align: middle; }}
   svg.trend {{ display: block; width: 100%; height: 100%; }}
 
@@ -719,11 +780,17 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
   .live-sub-row .v {{ font-size: 28px; font-weight: 700; text-align: right; }}
 
   /* ---------- 达人销售榜单 ---------- */
-  .tal-list {{ display: flex; flex-direction: column; gap: 18px; height: 100%; }}
+  .p-daren .p-bd {{ display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; }}
+  .tal-scroll-wrap {{ flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 8px; }}
+  .tal-scroll-wrap::-webkit-scrollbar {{ width: 8px; }}
+  .tal-scroll-wrap::-webkit-scrollbar-track {{ background: rgba(15,23,42,0.4); border-radius: 4px; }}
+  .tal-scroll-wrap::-webkit-scrollbar-thumb {{ background: rgba(147,197,253,0.3); border-radius: 4px; }}
+  .tal-scroll-wrap::-webkit-scrollbar-thumb:hover {{ background: rgba(147,197,253,0.6); }}
+  .tal-list {{ display: flex; flex-direction: column; gap: 14px; }}
   .tal-row {{
     background: var(--surface-raised); border-radius: 14px;
-    padding: 24px 18px; display: grid; grid-template-columns: 44px minmax(0,1fr) 150px 190px;
-    flex: 1; min-height: 0;
+    padding: 16px 18px; display: grid; grid-template-columns: 44px minmax(0,1fr) 150px 190px;
+    flex: none; min-height: 72px;
     align-items: center; gap: 20px; border: 1px solid var(--border-subtle);
   }}
   .tal-no {{ font-size: 32px; font-weight: 700; color: var(--text-tertiary); text-align: center; }}
@@ -736,6 +803,13 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
   .tal-gmv {{ font-size: 34px; font-weight: 700; text-align: right; }}
   .tal-gmv small {{ font-size: 22px; color: var(--text-tertiary); margin-left: 4px; }}
   .tal-cnt {{ white-space: nowrap; font-size: 26px; color: var(--text-secondary); text-align: right; }}
+  .tal-summary-bar {{
+    height: 60px; flex: none; margin-top: 14px; padding: 0 20px;
+    border-radius: 12px; background: var(--surface-raised); border: 1px solid var(--border-subtle);
+    display: flex; align-items: center; justify-content: space-between; font-size: 20px; color: var(--text-secondary);
+  }}
+  .tal-summary-bar b {{ color: var(--accent-gold); font-size: 24px; font-family: var(--font-num); }}
+  .tal-summary-bar .sep {{ color: var(--border-subtle); margin: 0 8px; }}
 
   .hint {{
     position: absolute; right: 48px; bottom: 16px;
@@ -764,6 +838,8 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
         <span class="dot"></span>
         <span class="status-txt">实时链路正常 · 自动增量比对</span>
         <span class="num" style="color:var(--text-secondary)">{now_str}</span>
+        <span id="syncPill" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#94a3b8;"></span>
+        <button id="btnReload" onclick="window.triggerManualSync ? window.triggerManualSync() : window.location.reload()" title="刷新获取最新大屏数据" style="background:rgba(59,130,246,0.18);border:1px solid rgba(96,165,250,0.4);color:#93C5FD;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;">&#x21bb; 刷新</button>
       </div>
     </div>
   </header>
@@ -796,11 +872,12 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
             <table class="eff">
               <thead>
                 <tr>
-                  <th style="width:38%;">店铺名称</th>
-                  <th style="width:15%;">净销</th>
-                  <th style="width:17%;">增量</th>
-                  <th style="width:15%;">自营</th>
-                  <th>达播</th>
+                  <th style="width:28%;">店铺名称</th>
+                  <th style="width:12%;">净销</th>
+                  <th style="width:13%;">增量</th>
+                  <th style="width:11%;">自营</th>
+                  <th style="width:11%;">达播</th>
+                  <th style="width:25%;">数据更新时间</th>
                 </tr>
               </thead>
               <tbody id="shopsBody"></tbody>
@@ -923,7 +1000,7 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
             </div>
             <div class="live-metrics">
               <div class="m"><div class="lb">店铺总净销</div><div class="v num">{shop_total_net:.2f}<small>万</small></div></div>
-              <div class="m"><div class="lb">店铺总订单</div><div class="v num">{shop_total_orders:,}<small>单</small></div></div>
+              <div class="m"><div class="lb">{"店铺总订单" if shop_total_orders > 0 else "核心店铺数"}</div><div class="v num">{f"{shop_total_orders:,}<small>单</small>" if shop_total_orders > 0 else f"{len(shop_list)}<small>家</small>"}</div></div>
               <div class="m"><div class="lb">综合退款率</div><div class="v num">{(shop_total_ref / shop_total_gmv * 100 if shop_total_gmv > 0 else 0.0):.1f}<small>%</small></div></div>
             </div>
           </div>
@@ -936,8 +1013,9 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
         sh_gmv = float(s.get("gmv_wan") or 0.0)
         sh_ref = float(s.get("refund_wan") or 0.0)
         sh_net = float(s.get("net_wan") or 0.0)
+        cnt_info = f" ({sh_cnt:,}单)" if sh_cnt > 0 else ""
         html_content += f"""            <div class="live-sub-row">
-              <div class="t">{sh_name}<small>GMV {sh_gmv:.2f}万 · 退款 {sh_ref:.2f}万 ({sh_cnt:,}单)</small></div>
+              <div class="t">{sh_name}<small>GMV {sh_gmv:.2f}万 · 退款 {sh_ref:.2f}万{cnt_info}</small></div>
               <span class="v num up">净销 {sh_net:.2f}万</span>
             </div>
 """
@@ -946,24 +1024,33 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
         </div>
       </section>
 
-      <!-- 2. 达人 TOP 5 排名 -->
+      <!-- 2. 达人排名 (支持上下滑动) -->
       <section class="panel p-daren">
         <div class="p-hd">
-          <h2>达人净销 TOP 5</h2>
+          <h2>达人排名</h2>
           <span class="unit">全渠道 / 万元</span>
         </div>
         <div class="p-bd" id="darenBody">
-          <div class="tal-list">
+          <div class="tal-scroll-wrap">
+            <div class="tal-list">
 """
 
-    # 动态渲染达人 Top 5
-    for idx, d in enumerate(daren_top5, 1):
+    # 动态渲染有销售达人排名
+    daren_list = [
+        d for d in daren_top5
+        if float(d.get("net_wan") or 0.0) > 0 or float(d.get("gmv_wan") or 0.0) > 0
+    ]
+    if not daren_list and daren_top5:
+        daren_list = daren_top5
+
+    for idx, d in enumerate(daren_list, 1):
         d_author = escape(str(d.get("author") or "合作达人"))
         d_brand = escape(str(d.get("brand") or ""))
         d_platform = escape(str(d.get("platform") or ""))
         d_label = " · ".join(part for part in (d_platform, d_brand) if part)
         d_gmv = float(d.get("gmv_wan") or 0.0)
         d_net = float(d.get("net_wan") or 0.0)
+        gmv_tag = f"GMV {d_gmv:.2f}万" if d_gmv > 0 else ""
         html_content += f"""            <div class="tal-row">
               <div class="tal-no num">{idx}</div>
               <div class="tal-name">
@@ -971,11 +1058,18 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
                 <span class="cg">{d_label}</span>
               </div>
               <div class="tal-gmv num">{d_net:.2f}<small>万</small></div>
-              <div class="tal-cnt num">GMV {d_gmv:.2f}万</div>
+              <div class="tal-cnt num">{gmv_tag}</div>
             </div>
 """
 
-    html_content += f"""          </div>
+    daren_sum_net = sum(float(d.get("net_wan") or 0.0) for d in daren_list)
+    daren_sum_gmv = sum(float(d.get("gmv_wan") or 0.0) for d in daren_list)
+    html_content += f"""            </div>
+          </div>
+          <div class="tal-summary-bar">
+            <span>有销达人全域贡献合计</span>
+            <span class="num">净销 <b>{daren_sum_net:.2f}万</b> <span class="sep">/</span> GMV {daren_sum_gmv:.2f}万</span>
+          </div>
         </div>
       </section>
     </div>
@@ -1005,8 +1099,9 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
 
   /* ---------- 24小时全盘销售总额汇总走势 (真实小时数据，不伪造未来数据) ---------- */
   var hiddenTrend = {{}};
+  var trendState = null;
   function drawTrend() {{
-    var w = 1340, h = 530, left = 96, right = 24, top = 36, bottom = 48;
+    var w = 1340, h = 530, left = 110, right = 30, top = 36, bottom = 48;
     var iw = w - left - right, ih = h - top - bottom;
     var definitions = [
       {{key:'v', label:'今日总净销', color:'#FFB84D'}},
@@ -1023,13 +1118,14 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
     var span = Math.max(hi - lo, 1); hi += span * .16; if (lo < 0) lo -= span * .08;
     var x = function(i) {{ return left + i * iw / 23; }};
     var y = function(v) {{ return top + (hi - v) * ih / (hi - lo); }};
+    trendState = {{ w: w, h: h, left: left, right: right, top: top, bottom: bottom, iw: iw, ih: ih, x: x, y: y, definitions: definitions, lo: lo, hi: hi }};
     var g = '';
     for (var t=0; t<=4; t++) {{
       var v = lo + (hi-lo)*t/4, py=y(v);
       g += '<line x1="'+left+'" y1="'+py+'" x2="'+(w-right)+'" y2="'+py+'" stroke="#263247" stroke-dasharray="6 8"/>';
-      g += '<text x="'+(left-12)+'" y="'+(py+7)+'" fill="#94A3B8" font-size="20" text-anchor="end">'+v.toFixed(0)+'万</text>';
+      g += '<text x="'+(left-14)+'" y="'+(py+6)+'" fill="#94A3B8" font-size="18" text-anchor="end" class="trend-axis-y">'+v.toFixed(0)+'万</text>';
     }}
-    for (var i=0;i<24;i+=2) g += '<text x="'+x(i)+'" y="'+(h-12)+'" fill="#94A3B8" font-size="20" text-anchor="middle">'+String(i).padStart(2,'0')+'时</text>';
+    for (var i=0;i<24;i+=2) g += '<text x="'+x(i)+'" y="'+(h-14)+'" fill="#94A3B8" font-size="18" text-anchor="middle" class="trend-axis-x">'+String(i).padStart(2,'0')+'时</text>';
     definitions.forEach(function(s) {{
       if (hiddenTrend[s.key]) return;
       var path='', connected=false, last=null;
@@ -1043,6 +1139,7 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
       g += '<path d="'+path+'" fill="none" stroke="'+s.color+'" stroke-width="4" '+(s.key==='yesterday'?'stroke-dasharray="10 8"':'')+' stroke-linejoin="round"/>';
       if(last && s.key==='v') g += '<text x="'+Math.min(last.px+12,w-200)+'" y="'+(last.py-18)+'" fill="'+s.color+'" font-size="22">'+last.value.toFixed(2)+'万</text>';
     }});
+    g += '<g id="trendHoverGroup"></g>';
     $('trendSvg').innerHTML=g;
     var current=REAL_HOURLY.filter(function(p) {{return p.v != null;}}).slice(-1)[0];
     if(current && current.yesterday != null) {{
@@ -1078,6 +1175,45 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
     $("rankList").innerHTML = html;
   }}
 
+  function formatUpdateTimeAndDelay(isoStr) {{
+    if (!isoStr) {{
+      return {{ time: "—", fullTime: "源数据未提供更新时间", delayText: "未提供", delayClass: "delay-missing" }};
+    }}
+    var stamp = Date.parse(isoStr);
+    if (!Number.isFinite(stamp)) {{
+      return {{ time: "—", fullTime: String(isoStr), delayText: "未提供", delayClass: "delay-missing" }};
+    }}
+    var timeStr = "";
+    var tIdx = isoStr.indexOf("T");
+    if (tIdx >= 0 && isoStr.length >= tIdx + 9) {{
+      timeStr = isoStr.substring(tIdx + 1, tIdx + 9);
+    }} else {{
+      var d = new Date(stamp);
+      var pad = function (n) {{ return (n < 10 ? "0" : "") + n; }};
+      timeStr = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    }}
+    var fullTimeStr = isoStr.replace("T", " ").substring(0, 19);
+    var now = Date.now();
+    var ageMin = Math.floor((now - stamp) / 60000);
+    if (ageMin < 0) ageMin = 0;
+    var delayText = "";
+    var delayClass = "";
+    if (ageMin < 1) {{
+      delayText = "延迟 <1 分钟";
+      delayClass = "delay-good";
+    }} else if (ageMin <= 15) {{
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-good";
+    }} else if (ageMin <= 30) {{
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-warn";
+    }} else {{
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-danger";
+    }}
+    return {{ time: timeStr, fullTime: fullTimeStr, delayText: delayText, delayClass: delayClass }};
+  }}
+
   /* ---------- 重点店铺明细（支持分页查看，已移除状态列） ---------- */
   var currentPage = 1;
   var pageSize = 10;
@@ -1098,12 +1234,17 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
       var isNeg = s.neg || s.net < 0;
       var momStr = s.mom == null ? "—" : String(s.mom);
       var isMomDown = momStr.indexOf("-") >= 0;
+      var dt = formatUpdateTimeAndDelay(s.updated_at);
       html += '<tr>' +
               '<td class="ch" title="' + escapeHtml(s.name) + '">' + escapeHtml(s.name) + '</td>' +
-              '<td class="n ' + (isNeg ? 'down' : '') + '">' + Number(s.net).toFixed(2) + '</td>' +
+              '<td class="n ' + (isNeg ? 'down' : '') + '">' + amount(s.net) + '</td>' +
               '<td class="n ' + (isMomDown ? 'down' : 'up') + '">' + escapeHtml(momStr) + '</td>' +
               '<td class="n">' + amount(s.ops) + '</td>' +
               '<td class="n split-live">' + amount(s.live) + '</td>' +
+              '<td class="time-cell" data-iso="' + escapeHtml(s.updated_at || '') + '" title="数据更新时间: ' + escapeHtml(dt.fullTime) + ' (' + escapeHtml(dt.delayText) + ')">' +
+                '<span class="t-stamp">' + escapeHtml(dt.time) + '</span>' +
+                '<span class="row-delay ' + dt.delayClass + '">' + escapeHtml(dt.delayText) + '</span>' +
+              '</td>' +
               '</tr>';
     }});
     $("shopsBody").innerHTML = html;
@@ -1169,14 +1310,36 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
   }}
   startAutoFlip();
 
-  /* ---------- 时钟 ---------- */
+  /* ---------- 店铺数据延迟动态计算与自动保活刷新 ---------- */
+  function updateShopDelays() {{
+    var cells = document.querySelectorAll(".time-cell[data-iso]");
+    cells.forEach(function (cell) {{
+      var iso = cell.getAttribute("data-iso");
+      if (!iso) return;
+      var dt = formatUpdateTimeAndDelay(iso);
+      var delaySpan = cell.querySelector(".row-delay");
+      if (delaySpan) {{
+        delaySpan.className = "row-delay " + dt.delayClass;
+        delaySpan.textContent = dt.delayText;
+      }}
+      cell.title = "数据更新时间: " + dt.fullTime + " (" + dt.delayText + ")";
+    }});
+  }}
+
+  /* ---------- 时钟与动态延迟刷新 ---------- */
   function tick() {{
     var now = new Date();
     var h = (now.getHours() < 10 ? "0" : "") + now.getHours();
     var m = (now.getMinutes() < 10 ? "0" : "") + now.getMinutes();
     var sec = (now.getSeconds() < 10 ? "0" : "") + now.getSeconds();
     $("clock").textContent = h + ":" + m + ":" + sec;
+    updateShopDelays();
   }}
+
+  // 大屏自动保活刷新：每 3 分钟自动重载页面获取最新数据快照
+  setTimeout(function () {{
+    window.location.reload();
+  }}, 180000);
 
   fit();
   drawTrend();
@@ -1188,33 +1351,159 @@ def build_realtime_sales_dashboard_html(metrics: dict[str, Any], ck_data: dict[s
       drawTrend();
     }});
   }});
-  $('trendSvg').addEventListener('mousemove',function(event) {{
-    var rect=this.getBoundingClientRect();
-    var hour=Math.max(0,Math.min(23,Math.round(((event.clientX-rect.left)/rect.width*1340-96)/(1340-96-24)*23)));
-    var point=REAL_HOURLY.find(function(p) {{ return parseInt(p.h,10)===hour; }});
-    if(!point) {{ $('trendTooltip').style.display='none'; return; }}
-    var lines=[point.h+' · 累计净销'];
-    [['v','今日总净销'],['yesterday','昨日总净销'],['live','今日达播'],['ops','今日自营']].forEach(function(s) {{
-      lines.push(s[1]+'：'+(point[s[0]]==null?'暂无数据':point[s[0]].toFixed(2)+'万'));
-    }});
-    if(point.v!=null && point.yesterday!=null) {{
-      var delta=point.v-point.yesterday;
-      lines.push('较昨日同期：'+(delta>=0?'+':'')+delta.toFixed(2)+'万');
+  $('trendSvg').addEventListener('mousemove', function(event) {{
+    if (!trendState) return;
+    var rect = this.getBoundingClientRect();
+    var svgX = (event.clientX - rect.left) / rect.width * trendState.w;
+    var svgY = (event.clientY - rect.top) / rect.height * trendState.h;
+    var hour = Math.max(0, Math.min(23, Math.round((svgX - trendState.left) / trendState.iw * 23)));
+    var point = REAL_HOURLY.find(function(p) {{ return parseInt(p.h, 10) === hour; }});
+    var tip = $('trendTooltip');
+    var hoverGroup = $('trendHoverGroup');
+    if (!point) {{
+      if (tip) tip.style.display = 'none';
+      if (hoverGroup) hoverGroup.innerHTML = '';
+      return;
     }}
-    $('trendTooltip').textContent=lines.join('\\n');
-    $('trendTooltip').style.display='block';
+    var px = trendState.x(hour);
+
+    // 1. 绘制跟随鼠标的指示线与坐标轴数字胶囊
+    var hg = '';
+    // X轴垂直参考线
+    hg += '<line x1="' + px + '" y1="' + trendState.top + '" x2="' + px + '" y2="' + (trendState.h - trendState.bottom) + '" stroke="rgba(255,184,77,0.7)" stroke-width="2" stroke-dasharray="4 4"/>';
+    // X轴时间胶囊 (跟随鼠标在底部X轴高亮显示对应时间)
+    hg += '<rect x="' + (px - 34) + '" y="' + (trendState.h - trendState.bottom + 4) + '" width="68" height="26" rx="6" fill="#1E293B" stroke="#60A5FA" stroke-width="1.5"/>';
+    hg += '<text x="' + px + '" y="' + (trendState.h - trendState.bottom + 22) + '" fill="#93C5FD" font-size="16" font-weight="700" text-anchor="middle">' + point.h + '</text>';
+
+    // 曲线数据靶点
+    trendState.definitions.forEach(function(s) {{
+      if (hiddenTrend[s.key] || point[s.key] == null) return;
+      var py = trendState.y(point[s.key]);
+      hg += '<circle cx="' + px + '" cy="' + py + '" r="5" fill="' + s.color + '" stroke="#0A0F1D" stroke-width="2"/>';
+      hg += '<circle cx="' + px + '" cy="' + py + '" r="9" fill="none" stroke="' + s.color + '" stroke-width="2" opacity="0.8"/>';
+    }});
+
+    // Y轴金额数值胶囊 (跟随鼠标/当前总净销在左侧Y轴高亮展示金额)
+    var displayVal = point.v != null ? point.v : (point.yesterday != null ? point.yesterday : null);
+    var yPy = displayVal != null ? trendState.y(displayVal) : Math.max(trendState.top, Math.min(trendState.h - trendState.bottom, svgY));
+    var valWan = displayVal != null ? displayVal.toFixed(2) + '万' : (trendState.hi - (svgY - trendState.top) / trendState.ih * (trendState.hi - trendState.lo)).toFixed(2) + '万';
+    
+    // 水平参考线 (从Y轴到当前点)
+    hg += '<line x1="' + trendState.left + '" y1="' + yPy + '" x2="' + px + '" y2="' + yPy + '" stroke="rgba(255,184,77,0.35)" stroke-width="1.5" stroke-dasharray="3 3"/>';
+    // Y轴胶囊背景及数值
+    hg += '<rect x="' + (trendState.left - 104) + '" y="' + (yPy - 13) + '" width="98" height="26" rx="5" fill="#FFB84D"/>';
+    hg += '<text x="' + (trendState.left - 8) + '" y="' + (yPy + 6) + '" fill="#0A0F1D" font-size="15" font-weight="700" text-anchor="end">' + valWan + '</text>';
+
+    if (hoverGroup) hoverGroup.innerHTML = hg;
+
+    // 2. 悬浮提示框跟随鼠标移动展示 (边缘避让)
+    var wrap = document.querySelector('.trend-wrap');
+    if (wrap && tip) {{
+      var wrapRect = wrap.getBoundingClientRect();
+      var mouseX = event.clientX - wrapRect.left;
+      var mouseY = event.clientY - wrapRect.top;
+      var lines = '<div class="tip-hd">' + point.h + ' · 24小时累计净销</div><div class="tip-rows">';
+      trendState.definitions.forEach(function(s) {{
+        if (hiddenTrend[s.key]) return;
+        var val = point[s.key];
+        var valStr = val == null ? '暂无数据' : val.toFixed(2) + '万';
+        lines += '<div class="tip-row"><span><i style="background:' + s.color + '"></i>' + s.label + '</span><b style="color:' + s.color + '">' + valStr + '</b></div>';
+      }});
+      if (point.v != null && point.yesterday != null) {{
+        var delta = point.v - point.yesterday;
+        var sign = delta >= 0 ? '+' : '';
+        var pct = point.yesterday > 0 ? ' (' + (delta / point.yesterday * 100).toFixed(1) + '%)' : '';
+        var dColor = delta >= 0 ? '#34D399' : '#F87171';
+        lines += '<div class="tip-delta" style="color:' + dColor + '">较昨日同期：' + sign + delta.toFixed(2) + '万' + pct + '</div>';
+      }}
+      lines += '</div>';
+      tip.innerHTML = lines;
+      tip.style.display = 'block';
+
+      var tipW = tip.offsetWidth || 210;
+      var tipH = tip.offsetHeight || 130;
+      var posX = mouseX + 18;
+      if (posX + tipW > wrapRect.width - 10) {{
+        posX = mouseX - tipW - 18;
+      }}
+      var posY = mouseY - 15;
+      if (posY + tipH > wrapRect.height - 10) {{
+        posY = wrapRect.height - tipH - 10;
+      }}
+      if (posY < 6) posY = 6;
+      tip.style.left = Math.max(6, posX) + 'px';
+      tip.style.top = Math.max(6, posY) + 'px';
+    }}
   }});
-  $('trendSvg').addEventListener('mouseleave',function() {{ $('trendTooltip').style.display='none'; }});
+
+  $('trendSvg').addEventListener('mouseleave', function() {{
+    var tip = $('trendTooltip');
+    if (tip) tip.style.display = 'none';
+    var hoverGroup = $('trendHoverGroup');
+    if (hoverGroup) hoverGroup.innerHTML = '';
+  }});
   renderChannels();
   renderShopsPage(1);
   tick();
   setInterval(tick, 1000);
+
+  // ====== 外链自动拉取最新实时数据控制 ======
+  (function initShareLinkAutoSync() {{
+    var pathParts = window.location.pathname.split('/');
+    var token = pathParts[pathParts.length - 1];
+    var syncPill = $('syncPill');
+    var isChecking = false;
+
+    window.triggerManualSync = function() {{
+      if (!token || isChecking) return;
+      if (syncPill) syncPill.innerHTML = '<span style="color:#60A5FA">🔄 正在拉取最新数据...</span>';
+      fetch('/api/chat/artifacts/sync/' + token, {{ method: 'POST' }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function() {{ pollSync(); }})
+        .catch(function() {{ window.location.reload(); }});
+    }};
+
+    function pollSync() {{
+      if (isChecking) return;
+      isChecking = true;
+      var timer = setInterval(function() {{
+        fetch('/api/chat/artifacts/sync-status/' + token)
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            if (!data.is_syncing) {{
+              clearInterval(timer);
+              isChecking = false;
+              if (syncPill) syncPill.innerHTML = '<span style="color:#34D399">✅ 数据已更新</span>';
+              setTimeout(function() {{ window.location.reload(); }}, 600);
+            }} else if (syncPill) {{
+              syncPill.innerHTML = '<span style="color:#60A5FA">🔄 正在拉取最新数据...</span>';
+            }}
+          }})
+          .catch(function() {{
+            clearInterval(timer);
+            isChecking = false;
+          }});
+      }}, 2500);
+    }}
+
+    if (token) {{
+      fetch('/api/chat/artifacts/sync-status/' + token)
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+          if (data && data.is_syncing) {{
+            if (syncPill) syncPill.innerHTML = '<span style="color:#60A5FA">🔄 正在后台拉取最新数据...</span>';
+            pollSync();
+          }}
+        }})
+        .catch(function() {{}});
+    }}
+  }})();
 }})();
 </script>
 </body>
 </html>
 """
-    return html_content
+    return adapt_dashboard_viewport(html_content)
 
 
 def sync_task_artifact_report(
@@ -1223,6 +1512,7 @@ def sync_task_artifact_report(
     query_rows: list[dict[str, Any]],
     *,
     hourly_series: list[dict[str, Any]] | None = None,
+    all_shops: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """自动将查询最新真实数据同步更新至已绑定的 HTML 交付物中，并更新 DB 校验哈希"""
     metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
@@ -1258,22 +1548,40 @@ def sync_task_artifact_report(
         if fetched_rows:
             query_rows = fetched_rows
 
+    # 手动刷新与流水线使用相同快照，避免回退到外部结果表的天猫归属。
+    if any(row.get("统计维度") == "5_天猫达播同源明细" for row in query_rows):
+        from app.reporting.sales_metrics import inject_dabo_matrix_rows
+
+        query_rows = inject_dabo_matrix_rows(query_rows)
+
     # 1. 抓取 ClickHouse 与解析 MySQL 全盘数据
     ck_data = fetch_clickhouse_dy_order_metrics()
     metrics = parse_pipeline_query_metrics(query_rows)
     # The card and linked dashboard must retain the same influencer snapshot.
-    from app.reporting.sales_metrics import get_top_influencers, is_dabo_row
+    from app.reporting.sales_metrics import (
+        canonical_influencer_name,
+        get_top_influencers,
+        is_dabo_row,
+    )
 
-    if any(row.get("category") == "达播矩阵" for row in query_rows):
+    if not ck_data.get("shops") and metrics.get("dy_shops"):
+        ck_data["shops"] = metrics["dy_shops"]
+
+    if any(row.get("category") == "达播矩阵" for row in query_rows) or (
+        not ck_data.get("daren_top5") and any(is_dabo_row(r) for r in query_rows)
+    ):
         influencer_rows = [row for row in query_rows if is_dabo_row(row)]
         ck_data["daren_top5"] = [
             {"author": row["name"], "net_wan": row["net_wan"],
              "gmv_wan": row["gmv_wan"],
              "platform": " / ".join(sorted({str(r.get("平台") or "")
-                 for r in influencer_rows if r.get("达人") == row["name"]})),
+                 for r in influencer_rows
+                 if canonical_influencer_name(r.get("达人") or r.get("author") or r.get("item")) == row["name"] and r.get("平台")})),
              "brand": " / ".join(sorted({str(r.get("品牌") or "")
-                 for r in influencer_rows if r.get("达人") == row["name"]}))}
-            for row in get_top_influencers(influencer_rows)
+                 for r in influencer_rows
+                 if canonical_influencer_name(r.get("达人") or r.get("author") or r.get("item")) == row["name"] and r.get("品牌")}))}
+            for row in get_top_influencers(influencer_rows, limit=None)
+            if row["name"] not in ("", "-", "通用", "未知", "其他", "二梯队", "二梯队 (除李佳琦)")
         ]
 
     from app.reporting.dashboard_hourly import align_current_hour, fetch_task_hourly_series
@@ -1285,7 +1593,8 @@ def sync_task_artifact_report(
 
     from app.reporting.dashboard_shops import fetch_task_all_shops
 
-    all_shops = fetch_task_all_shops(db, task)
+    if all_shops is None:
+        all_shops = fetch_task_all_shops(db, task)
     if all_shops is None:
         logger.warning("Skip dashboard update: complete shop sales unavailable")
         return None
@@ -1348,6 +1657,11 @@ def sync_task_artifact_report(
                 m.metadata_json = meta
                 flag_modified(m, "metadata_json")
                 db.add(m)
+                db.exec(
+                    update(Message)
+                    .where(Message.id == m.id)
+                    .values(metadata_json=meta)
+                )
                 modified_any = True
     if modified_any:
         db.commit()

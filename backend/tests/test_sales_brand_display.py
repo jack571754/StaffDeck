@@ -72,3 +72,15 @@ def test_brand_breakdown_excludes_platform_totals_and_stream_details(
     report = build_sales_report(rows)
     dataset = next(dataset for dataset in report.datasets if dataset.id == "brand_detail")
     assert [row["brand"] for row in dataset.rows] == expected
+
+
+def test_sales_report_sorts_positive_increment_shops_descending():
+    rows = [
+        {"category": "大盘", "item": "电商整体", "净销_万": 1000.0, "环比增量_万": 50.0},
+        {"category": "店铺正增量Top5", "item": "京东-店铺A", "净销_万": 70.0, "环比增量_万": 7.0},
+        {"category": "店铺正增量Top5", "item": "天猫-店铺B", "净销_万": 200.0, "环比增量_万": 11.0},
+        {"category": "店铺正增量Top5", "item": "抖音-店铺C", "净销_万": 120.0, "环比增量_万": 10.0},
+    ]
+    report = build_sales_report(rows, is_first_push=False)
+    rank_block = next(b for b in report.blocks if b.kind == "markdown" and "正增量领跑 Top 5" in b.text)
+    assert rank_block.text.index("天猫-店铺B") < rank_block.text.index("抖音-店铺C") < rank_block.text.index("京东-店铺A")

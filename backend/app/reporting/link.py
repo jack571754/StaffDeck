@@ -41,6 +41,7 @@ def mint_report_share_link(
     owner_id: str,
     path: str,
     ttl_seconds: int | None = None,
+    share_link_id: str | None = None,
 ) -> ReportShareLink:
     """Mint a signed share link for a report already written to a workspace.
 
@@ -61,6 +62,7 @@ def mint_report_share_link(
             if ttl_seconds is not None
             else artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
         ),
+        share_link_id=share_link_id,
     )
     payload = artifact_share_mod.decode_artifact_share_token(token)
     return ReportShareLink(

@@ -1315,7 +1315,9 @@ def automatic_task_message(task: ScheduledTask) -> str:
     return base
 
 
-def resolve_task_share_link_url(db: Session, task: ScheduledTask) -> str | None:
+def resolve_task_share_link_url(
+    db: Session, task: ScheduledTask, *, metadata_key: str = "artifact_share_link_id",
+) -> str | None:
     """返回任务绑定分享链接当前可用的 URL；剩余有效期不足 24h 时自动重签。
 
     重签会原地更新链接行（不写墓碑），旧卡片里的 token 仍可用到它自己的 exp；
@@ -1330,16 +1332,30 @@ def resolve_task_share_link_url(db: Session, task: ScheduledTask) -> str | None:
     from app.security import artifact_share as artifact_share_mod
 
     metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
-    link_id = str(metadata.get("artifact_share_link_id") or "").strip()
+    link_id = str(metadata.get(metadata_key) or "").strip()
     if not link_id:
         return None
     link = db.get(ArtifactShareLink, link_id)
-    if not link or link.is_revoked:
+    if not link or link.is_revoked or link.tenant_id != task.tenant_id:
         return None
 
     now = utc_now()
-    if (link.expires_at - now).total_seconds() > 86400:
+    shop_link = metadata_key == "shop_sales_share_link_id"
+    legacy_shop_token = False
+    if shop_link:
+        try:
+            claims = artifact_share_mod.decode_artifact_share_token(link.token)
+            legacy_shop_token = claims.get("share_link_id") != link.id
+        except HTTPException:
+            legacy_shop_token = True
+    if (link.expires_at - now).total_seconds() > 86400 and not legacy_shop_token:
         return link.url
+
+    if legacy_shop_token:
+        # 首次升级店铺页凭证时留下撤销记录，旧凭证不能脱离记录继续访问。
+        retired = link.model_dump(exclude={"id"})
+        retired.update(is_revoked=True, revoked_at=now)
+        db.add(ArtifactShareLink(**retired))
 
     ttl = artifact_share_mod.ARTIFACT_SHARE_TTL_SECONDS
     token = artifact_share_mod.mint_artifact_share_token(
@@ -1349,6 +1365,7 @@ def resolve_task_share_link_url(db: Session, task: ScheduledTask) -> str | None:
         owner_id=link.owner_id,
         path=link.path,
         ttl_seconds=ttl,
+        share_link_id=link.id if shop_link else None,
     )
     payload = artifact_share_mod.decode_artifact_share_token(token)
     link.token = token

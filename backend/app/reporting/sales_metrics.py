@@ -2,6 +2,7 @@
 
 Consolidates calculation and formatting for sales reports and interactive cards:
 - Influencer (达播/达人) row detection, metric extraction (净销, GMV in 万元), and aggregation.
+- Influencer name canonicalization: 助播 accounts (e.g. 李佳琦-助播) roll up into their host.
 - Top-N ranking and card line formatting.
 """
 
@@ -9,12 +10,27 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.request
 from typing import Any
 
 from app.reporting.clickhouse_config import clickhouse_query_url
 
 logger = logging.getLogger(__name__)
+
+# 李佳琦按业务口径归并全部场次；其他达人只归并助播后缀，保留普通专场名称。
+_ASSISTANT_STREAM_SUFFIX = re.compile(r"[\s\-－_—·•、/／:：]*[（(]?\s*助播\s*[)）]?$")
+
+
+def canonical_influencer_name(raw: Any) -> str:
+    """李佳琦的所有场次统一归并；其他达人继续只归并助播后缀。"""
+    name = str(raw or "").strip()
+    if "李佳琦" in name:
+        return "李佳琦"
+    if not name or "助播" not in name:
+        return name
+    # 去掉后缀后若为空（名字本身就叫「助播」），保留原名，不静默丢数。
+    return _ASSISTANT_STREAM_SUFFIX.sub("", name).strip() or name
 
 
 def is_dabo_row(row: dict[str, Any]) -> bool:
@@ -55,7 +71,7 @@ def extract_influencer_name(row: dict[str, Any]) -> str:
     ).strip()
     if name in ("", "-"):
         return ""
-    return name
+    return canonical_influencer_name(name)
 
 
 def extract_influencer_amounts(row: dict[str, Any]) -> tuple[float, float, bool]:
@@ -107,7 +123,7 @@ def aggregate_influencer_metrics(
 
 def get_top_influencers(
     rows: list[dict[str, Any]],
-    limit: int = 5,
+    limit: int | None = 5,
 ) -> list[dict[str, Any]]:
     """Return top N influencers sorted by net sales desc, then GMV desc."""
     aggregated = aggregate_influencer_metrics(rows)
@@ -117,11 +133,16 @@ def get_top_influencers(
         reverse=True,
     )
     result = []
-    for name, metrics in sorted_items[:limit]:
+    items = sorted_items if limit is None else sorted_items[:limit]
+    for name, metrics in items:
+        net_wan = round(float(metrics["net_wan"]), 2)
+        gmv_wan = round(float(metrics["gmv_wan"]), 2)
+        if limit is None and net_wan <= 0 and gmv_wan <= 0:
+            continue
         result.append({
             "name": name,
-            "net_wan": round(float(metrics["net_wan"]), 2),
-            "gmv_wan": round(float(metrics["gmv_wan"]), 2),
+            "net_wan": net_wan,
+            "gmv_wan": gmv_wan,
             "has_gmv": bool(metrics["has_gmv"]),
         })
     return result
@@ -153,7 +174,7 @@ def format_influencer_top_lines(
     return lines
 
 
-def fetch_influencer_sales_rows() -> list[dict[str, Any]]:
+def fetch_influencer_sales_rows(*, include_tmall: bool = True) -> list[dict[str, Any]]:
     """Fetch untruncated channel/brand rows using the matrix's live-sales scope."""
     url = clickhouse_query_url()
     if url is None:
@@ -192,6 +213,9 @@ def fetch_influencer_sales_rows() -> list[dict[str, Any]]:
         FORMAT JSON
         """,
     ]
+    if not include_tmall:
+        # 天猫已由销售汇总查询提供同源快照，不再读取独立结果表的归属。
+        queries.pop(1)
     result: list[dict[str, Any]] = []
     for sql in queries:
         request = urllib.request.Request(url, data=sql.encode("utf-8"))
@@ -216,7 +240,8 @@ def fetch_dabo_matrix_raw(
         if row.get("platform") != "天猫":
             continue
         brand = str(row.get("brand") or "")
-        group = "李佳琦" if str(row.get("author") or "").strip() == "李佳琦" else "二梯队 (除李佳琦)"
+        # 只按名称是否包含「李佳琦」分组，其余名称及空名称一律计入二梯队达人。
+        group = "李佳琦" if "李佳琦" in str(row.get("author") or "") else "二梯队达人"
         entry = tm_groups.setdefault((brand, group), {
             "brand": brand, "daren_group": group,
             "gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0,
@@ -233,7 +258,8 @@ def fetch_dabo_matrix_raw(
     for row in influencer_rows:
         platform = str(row.get("platform") or "")
         brand = str(row.get("brand") or "")
-        author = str(row.get("author") or "").strip()
+        # 助播账号并入主达人，矩阵明细里不重复出现同一人。
+        author = canonical_influencer_name(row.get("author"))
         if platform == "抖音":
             entry = dy_groups.setdefault((brand, author), {
                 "brand": brand, "author": author,
@@ -269,9 +295,9 @@ def fetch_dabo_matrix_raw(
     # 组装天猫数据
     tm_map = {(r["brand"], r["daren_group"]): r for r in tm_data}
     kfm_ljq = tm_map.get(("可复美", "李佳琦"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
-    kfm_sec = tm_map.get(("可复美", "二梯队 (除李佳琦)"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
+    kfm_sec = tm_map.get(("可复美", "二梯队达人"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
     clg_ljq = tm_map.get(("可丽金", "李佳琦"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
-    clg_sec = tm_map.get(("可丽金", "二梯队 (除李佳琦)"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
+    clg_sec = tm_map.get(("可丽金", "二梯队达人"), {"gmv_wan": 0.0, "net_wan": 0.0, "refund_wan": 0.0})
 
     kfm_tm_gmv = round(float(kfm_ljq["gmv_wan"]) + float(kfm_sec["gmv_wan"]), 2)
     kfm_tm_net = round(float(kfm_ljq["net_wan"]) + float(kfm_sec["net_wan"]), 2)
@@ -306,10 +332,10 @@ def fetch_dabo_matrix_raw(
         {"item": "天猫", "label": "**天猫**", "gmv": tm_total_gmv, "net": tm_total_net, "refund": tm_total_ref, "is_core": True},
         {"item": "天猫:可复美", "label": "**可复美**", "gmv": kfm_tm_gmv, "net": kfm_tm_net, "refund": kfm_tm_ref, "is_core": True},
         {"item": "天猫:可复美:李佳琦", "label": "　　李佳琦", "gmv": float(kfm_ljq["gmv_wan"]), "net": float(kfm_ljq["net_wan"]), "refund": float(kfm_ljq["refund_wan"]), "is_core": False},
-        {"item": "天猫:可复美:二梯队", "label": "　　二梯队（除李佳琦）", "gmv": float(kfm_sec["gmv_wan"]), "net": float(kfm_sec["net_wan"]), "refund": float(kfm_sec["refund_wan"]), "is_core": False},
+        {"item": "天猫:可复美:二梯队", "label": "　　二梯队达人", "gmv": float(kfm_sec["gmv_wan"]), "net": float(kfm_sec["net_wan"]), "refund": float(kfm_sec["refund_wan"]), "is_core": False},
         {"item": "天猫:可丽金", "label": "**可丽金**", "gmv": clg_tm_gmv, "net": clg_tm_net, "refund": clg_tm_ref, "is_core": True},
         {"item": "天猫:可丽金:李佳琦", "label": "　　李佳琦", "gmv": float(clg_ljq["gmv_wan"]), "net": float(clg_ljq["net_wan"]), "refund": float(clg_ljq["refund_wan"]), "is_core": False},
-        {"item": "天猫:可丽金:二梯队", "label": "　　二梯队（除李佳琦）", "gmv": float(clg_sec["gmv_wan"]), "net": float(clg_sec["net_wan"]), "refund": float(clg_sec["refund_wan"]), "is_core": False},
+        {"item": "天猫:可丽金:二梯队", "label": "　　二梯队达人", "gmv": float(clg_sec["gmv_wan"]), "net": float(clg_sec["net_wan"]), "refund": float(clg_sec["refund_wan"]), "is_core": False},
         {"item": "抖音", "label": "**抖音**", "gmv": dy_total_gmv, "net": dy_total_net, "refund": dy_total_ref, "is_core": True},
         {"item": "抖音:可复美", "label": "**可复美**", "gmv": float(dy_kfm["gmv_wan"]), "net": float(dy_kfm["net_wan"]), "refund": float(dy_kfm["refund_wan"]), "is_core": True},
     ]
@@ -380,13 +406,70 @@ def inject_dabo_matrix_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if any(str(r.get("category") or "") == "达播矩阵" for r in rows):
         return rows
 
-    influencer_rows = fetch_influencer_sales_rows()
+    tmall_rows = [r for r in rows if r.get("统计维度") == "5_天猫达播同源明细"]
+    if tmall_rows:
+        influencer_rows = [
+            r for r in fetch_influencer_sales_rows(include_tmall=False)
+            if r.get("platform") != "天猫"
+        ]
+        # 当外部 ClickHouse 未配置或未返回非天猫达人时，从流水线自身数据（如 3_达人TOP18）中提取
+        if not any(r.get("platform") != "天猫" for r in influencer_rows):
+            for r in rows:
+                if is_dabo_row(r) and str(r.get("平台") or "").strip() not in ("天猫", ""):
+                    net_wan, gmv_wan, _ = extract_influencer_amounts(r)
+                    shop = str(r.get("平台店铺") or "")
+                    brand = "可丽金" if "可丽金" in shop else ("可复美" if "可复美" in shop else str(r.get("品牌") or ""))
+                    author = str(r.get("达人") or r.get("item") or "").strip()
+                    if author:
+                        influencer_rows.append({
+                            "platform": str(r.get("平台") or "").strip(),
+                            "brand": brand,
+                            "author": author,
+                            "gmv_wan": gmv_wan,
+                            "net_wan": net_wan,
+                        })
+        influencer_rows.extend(
+            {
+                "platform": "天猫",
+                "brand": str(r["品牌"]),
+                "author": str(r.get("达人") or ""),
+                "gmv_wan": float(r.get("成交金额_万") or 0),
+                "net_wan": float(r.get("净销_万") or 0),
+            }
+            for r in tmall_rows if r.get("品牌")
+        )
+    else:
+        influencer_rows = fetch_influencer_sales_rows()
+        if not influencer_rows:
+            for r in rows:
+                if is_dabo_row(r):
+                    net_wan, gmv_wan, _ = extract_influencer_amounts(r)
+                    shop = str(r.get("平台店铺") or "")
+                    brand = "可丽金" if "可丽金" in shop else ("可复美" if "可复美" in shop else str(r.get("品牌") or ""))
+                    author = str(r.get("达人") or r.get("item") or "").strip()
+                    if author:
+                        influencer_rows.append({
+                            "platform": str(r.get("平台") or ("天猫" if "天猫" in shop else "")).strip(),
+                            "brand": brand,
+                            "author": author,
+                            "gmv_wan": gmv_wan,
+                            "net_wan": net_wan,
+                        })
+    # 同源明细只参与计算，不作为品牌表和快照中的独立展示行。
+    res = [r for r in rows if r.get("统计维度") != "5_天猫达播同源明细"]
     raw_items = fetch_dabo_matrix_raw(influencer_rows)
     if not raw_items:
-        return rows
+        if tmall_rows:
+            # 显式的零快照也保留来源标识，避免大屏重新采用外部表的历史排行。
+            return [*res, {
+                "category": "达播矩阵", "item": "天猫", "label": "**天猫**",
+                "净销_万": 0.0, "成交金额_万": 0.0, "退款金额_万": 0.0,
+                "price": 0.0, "is_core": True,
+            }]
+        return res
 
     # Discard the legacy, pre-truncated template ranking before adding live rows.
-    res = [r for r in rows if not is_dabo_row(r)]
+    res = [r for r in res if not is_dabo_row(r)]
     for row in influencer_rows:
         name = str(row.get("author") or "").strip()
         if name in ("", "-", "通用", "未知", "其他", "二梯队", "二梯队 (除李佳琦)"):

@@ -1,7 +1,11 @@
 """Pipeline Execution Engine for Scheduled Tasks.
 
+
+
 Executes deterministic, multi-step pipeline tasks (Query -> Process -> Notify)
+
 without LLM hallucination, context limits, or sandbox timeouts.
+
 """
 
 from __future__ import annotations
@@ -49,14 +53,24 @@ __all__ = [
 def sanitize_hourly_cumulative_trend(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """对 24 小时分时段累计数据执行 Forward-Fill 结转与当前小时大盘快照校准。
 
+
+
     业务背景：
+
     分时走势图展示的是「当日累计销售额」。当定时任务在整点过几分钟（如 09:03）执行时，
+
     当前小时由于各店铺异步抓取时延，仅有部分店铺入库，导致当前小时的累计值断崖式低于上一小时。
+
     保底校准规则：
+
     1. 提取大盘/电商整体当前的最新累计总净销；
+
     2. 按 00时..23时 顺序遍历，保证累计序列单调不减（Forward-Fill）；
+
     3. 当前最后一个有数据的小时若低于大盘总净销，向前补齐至大盘总净销；
+
     4. 未到达的未来时段保持 0.0。
+
     """
     total_net: float | None = None
     for r in rows:
@@ -128,8 +142,12 @@ def sanitize_hourly_cumulative_trend(rows: list[dict[str, Any]]) -> list[dict[st
 def _run_has_successful_push(run: ScheduledTaskRun) -> bool:
     """该 run 是否真的成功推送过飞书（notify 步骤存在且 notify_res.ok）。
 
+
+
     仅凭 ``run.status == "succeeded"`` 不够：只取数、推送被关闭的 run 同样会标记
+
     succeeded，若把它算作“当日已推送”，当天真正的首推会被误判为非首推，增量归零失效。
+
     """
 
     trace = run.trace_json if isinstance(run.trace_json, dict) else {}
@@ -151,10 +169,16 @@ def is_task_first_push_today(
 ) -> bool:
     """判断当前任务执行是否为当日首次推送。
 
+
+
     判定规则：
+
     1. 任务 metadata 或 pipeline 步骤参数中若显式指定 is_first_push，以显式配置为准；
+
     2. 若计划为 daily 多时段（如 ["08:00", "17:00", "23:58"]），且当前计划执行时间 scheduled_for 匹配当天的首个时段（如 08:00），视为当日首次推送；
+
     3. 查询在本地时区（Asia/Shanghai，UTC+8）下当天此前是否已有状态为 succeeded 的执行记录。若无，则视为当日首次推送。
+
     """
     metadata = task.metadata_json if isinstance(task.metadata_json, dict) else {}
     if "is_first_push" in metadata:
@@ -234,7 +258,10 @@ def apply_push_incremental_diff(
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
     """基于上一次成功推送的历史快照，在内存中重新计算各维度与大盘的增量差值。
 
+
+
     返回: (处理后的行列表, 本次快照数据字典, 上次推送时间字符串或None)
+
     """
     rows = sanitize_hourly_cumulative_trend(rows)
     current_snapshot = extract_sales_push_snapshot(rows)
@@ -404,7 +431,7 @@ def execute_pipeline_scheduled_task(
                     try:
                         from app.reporting.sales_metrics import inject_dabo_matrix_rows
                         query_rows = inject_dabo_matrix_rows(query_rows)
-                    except Exception as matrix_err:
+                    except Exception as matrix_err:  # noqa: BLE001
                         logger.warning("Pipeline step %d: failed to inject dabo matrix: %s", idx, matrix_err)
 
                 processed_rows, current_snapshot, prev_push_time = apply_push_incremental_diff(
@@ -425,11 +452,24 @@ def execute_pipeline_scheduled_task(
 
                 from app.scheduled_tasks.service import resolve_task_share_link_url
 
-                # 仅在销售业务任务中同步关联的大屏交付物
+                # 两个销售页面复用同一次全量店铺查询，独立页不依赖大屏是否已撤销。
                 if is_sales_task:
                     try:
-                        from app.reporting.realtime_dashboard_syncer import sync_task_artifact_report
-                        sync_task_artifact_report(db, task, query_rows)
+                        from app.reporting.realtime_dashboard_syncer import (
+                            sync_task_artifact_report,
+                        )
+                        if metadata.get("shop_sales_report_enabled") is True:
+                            from app.reporting.dashboard_shops import fetch_task_all_shops
+                            from app.reporting.shop_sales_syncer import (
+                                sync_task_shop_sales_report,
+                            )
+
+                            all_shops = fetch_task_all_shops(db, task)
+                            if all_shops is not None:
+                                sync_task_shop_sales_report(db, task, shops=all_shops)
+                                sync_task_artifact_report(db, task, query_rows, all_shops=all_shops)
+                        else:
+                            sync_task_artifact_report(db, task, query_rows)
                     except Exception as sync_err:  # noqa: BLE001
                         logger.warning("Pipeline step %d: failed to sync artifact report: %s", idx, sync_err)
 
@@ -481,6 +521,7 @@ def execute_pipeline_scheduled_task(
                                     }
                                 ],
                             })
+                # 卡片仅推送链接管理关联的报告，不额外添加独立页入口。
                 notify_req = FeishuAppNotifyRequest(
                     scheduled_task_id=task.id,
                     tenant_id=task.tenant_id,

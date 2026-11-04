@@ -111,6 +111,7 @@ export type ArtifactShareLinkRead = {
   remaining_seconds: number;
   bound_task_id?: string | null;
   bound_task_title?: string | null;
+  session_title?: string | null;
 };
 
 export type ArtifactShareLinksListResponse = {
@@ -584,14 +585,17 @@ export default function ShareLinksPage({ currentUser }: ShareLinksPageProps) {
   // Delete submit
   async function handleDeleteSubmit() {
     if (!selectedLink) return;
+    const linkToDelete = selectedLink;
     try {
-      await api.delete(`/api/chat/artifacts/share-links/${selectedLink.id}`);
+      setLinks((prev) => prev.filter((item) => item.id !== linkToDelete.id));
+      await api.delete(`/api/chat/artifacts/share-links/${linkToDelete.id}`);
       notify.success('外链记录已删除');
       setDeleteModalOpen(false);
       setSelectedLink(null);
       void loadShareLinks();
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '删除失败');
+      void loadShareLinks();
     }
   }
 
@@ -814,7 +818,7 @@ export default function ShareLinksPage({ currentUser }: ShareLinksPageProps) {
             <Search className="absolute left-[10px] top-[9px] size-[15px] text-[#9ca3af]" />
             <input
               type="text"
-              placeholder="搜索报告名称、文件路径、创建人..."
+              placeholder="搜索报告名称、文件路径、会话、创建人..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="h-[34px] w-full rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white pl-[32px] pr-[12px] text-[13px] outline-none focus:border-[#1a71ff]"
@@ -876,6 +880,11 @@ export default function ShareLinksPage({ currentUser }: ShareLinksPageProps) {
                             <div className="truncate text-[11px] text-[#858b9c]" title={link.path}>
                               {link.path}
                             </div>
+                            {link.session_title && (
+                              <div className="truncate text-[11px] text-[#6b7280]" title={`来源会话: ${link.session_title}`}>
+                                会话: {link.session_title}
+                              </div>
+                            )}
                             {link.bound_task_id && (
                               <div className="mt-[3px] flex items-center gap-[4px]">
                                 <span

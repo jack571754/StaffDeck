@@ -167,6 +167,16 @@
   .eff td.n { font-family: var(--font-num); font-variant-numeric: tabular-nums; font-weight: 700; }
   .eff tr:last-child td { border-bottom: none; }
   .eff td.ch { font-size: 24px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 440px; }
+  .eff td.time-cell { font-size: 20px; text-align: right; white-space: nowrap; }
+  .row-delay {
+    display: inline-block; font-size: 16px; font-weight: 600;
+    padding: 2px 8px; border-radius: 6px; margin-left: 8px; white-space: nowrap;
+    vertical-align: middle;
+  }
+  .delay-good { color: #34D399; background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.3); }
+  .delay-warn { color: #FBBF24; background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.3); }
+  .delay-danger { color: #F87171; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); }
+  .delay-missing { color: #94A3B8; background: rgba(148,163,184,0.12); border: 1px solid rgba(148,163,184,0.25); }
 
   .eff-pagination {
     height: 64px; flex: none;
@@ -250,7 +260,20 @@
   .trend-legend button[aria-pressed="false"] { opacity: .35; }
   .trend-summary { display: flex; flex-wrap: wrap; gap: 24px; font-size: 20px; color: var(--text-secondary); margin-bottom: 12px; }
   .trend-summary b { color: var(--text-primary); }
-  #trendTooltip { display: none; position: absolute; top: 0; right: 12px; pointer-events: none; white-space: pre-line; background: #0a0f1df2; border: 1px solid #475569; border-radius: 8px; padding: 14px; color: #fff; font-size: 22px; z-index: 2; }
+  #trendTooltip {
+    display: none; position: absolute; pointer-events: none;
+    background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 8px; padding: 10px 14px;
+    color: #F8FAFC; font-size: 14px; z-index: 50; min-width: 190px;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.7), 0 0 12px rgba(59, 130, 246, 0.2);
+  }
+  #trendTooltip .tip-hd { font-size: 13px; font-weight: 700; color: #F8FAFC; padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.12); }
+  #trendTooltip .tip-rows { display: flex; flex-direction: column; gap: 4px; }
+  #trendTooltip .tip-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; }
+  #trendTooltip .tip-row span { display: flex; align-items: center; color: var(--text-secondary); }
+  #trendTooltip .tip-row i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  #trendTooltip .tip-row b { font-family: var(--font-num); font-size: 12px; }
+  #trendTooltip .tip-delta { font-size: 11px; font-weight: 600; margin-top: 4px; padding-top: 4px; border-top: 1px dashed rgba(255, 255, 255, 0.1); text-align: right; }
   .trend-legend i { display: inline-block; width: 36px; height: 6px; border-radius: 3px; margin-right: 12px; vertical-align: middle; }
   svg.trend { display: block; width: 100%; height: 100%; }
 
@@ -301,11 +324,17 @@
   .live-sub-row .v { font-size: 28px; font-weight: 700; text-align: right; }
 
   /* ---------- 达人销售榜单 ---------- */
-  .tal-list { display: flex; flex-direction: column; gap: 18px; height: 100%; }
+  .p-daren .p-bd { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden; }
+  .tal-scroll-wrap { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 8px; }
+  .tal-scroll-wrap::-webkit-scrollbar { width: 8px; }
+  .tal-scroll-wrap::-webkit-scrollbar-track { background: rgba(15,23,42,0.4); border-radius: 4px; }
+  .tal-scroll-wrap::-webkit-scrollbar-thumb { background: rgba(147,197,253,0.3); border-radius: 4px; }
+  .tal-scroll-wrap::-webkit-scrollbar-thumb:hover { background: rgba(147,197,253,0.6); }
+  .tal-list { display: flex; flex-direction: column; gap: 14px; }
   .tal-row {
     background: var(--surface-raised); border-radius: 14px;
-    padding: 24px 18px; display: grid; grid-template-columns: 44px minmax(0,1fr) 150px 190px;
-    flex: 1; min-height: 0;
+    padding: 16px 18px; display: grid; grid-template-columns: 44px minmax(0,1fr) 150px 190px;
+    flex: none; min-height: 72px;
     align-items: center; gap: 20px; border: 1px solid var(--border-subtle);
   }
   .tal-no { font-size: 32px; font-weight: 700; color: var(--text-tertiary); text-align: center; }
@@ -318,11 +347,165 @@
   .tal-gmv { font-size: 34px; font-weight: 700; text-align: right; }
   .tal-gmv small { font-size: 22px; color: var(--text-tertiary); margin-left: 4px; }
   .tal-cnt { white-space: nowrap; font-size: 26px; color: var(--text-secondary); text-align: right; }
+  .tal-summary-bar {
+    height: 60px; flex: none; margin-top: 14px; padding: 0 20px;
+    border-radius: 12px; background: var(--surface-raised); border: 1px solid var(--border-subtle);
+    display: flex; align-items: center; justify-content: space-between; font-size: 20px; color: var(--text-secondary);
+  }
+  .tal-summary-bar b { color: var(--accent-gold); font-size: 24px; font-family: var(--font-num); }
+  .tal-summary-bar .sep { color: var(--border-subtle); margin: 0 8px; }
 
   .hint {
     position: absolute; right: 48px; bottom: 16px;
     font-size: 20px; color: #475569;
   }
+</style>
+<style id="staffdeck-notebook-layout">
+@media (max-width:1920px) {
+  html,body{overflow:hidden!important;user-select:text}
+  .stage{position:relative;width:100vw;height:100vh;max-height:100vh;padding:8px 12px;gap:8px;transform:none!important;box-sizing:border-box;overflow:hidden!important}
+  header{height:46px;flex:none;padding:0 4px;border-bottom-width:1px;display:flex;align-items:center;justify-content:space-between}
+  .hdr-brand{gap:8px}.logo-badge{width:28px;height:28px;border-radius:6px}.logo-badge svg{width:16px;height:16px}
+  .hdr-brand h1{font-size:18px;font-weight:700}.hdr-brand .tag{font-size:9px;margin-top:1px}
+  .hdr-right{gap:2px}.countdown{font-size:24px}.countdown small{font-size:10px;margin-right:4px}
+  .hdr-meta{gap:6px;font-size:9px}.dot{width:5px;height:5px}
+  
+  .grid{height:calc(100vh - 62px)!important;flex:1;min-height:0;grid-template-columns:minmax(0,1.25fr) minmax(0,1.25fr) minmax(0,1fr);gap:8px;overflow:hidden}
+  .col{gap:8px;min-width:0;min-height:0;height:100%;display:flex;flex-direction:column}
+  
+  .panel{padding:8px 10px;border-radius:8px;border-width:1px;overflow:hidden;box-shadow:none;display:flex;flex-direction:column}
+  .p-hd{height:22px;flex:none;margin-bottom:6px;gap:6px;display:flex;align-items:center;justify-content:space-between}
+  .p-hd h2{font-size:13px;gap:6px;white-space:nowrap;font-weight:600}.p-hd h2:before{width:3px;height:13px;border-radius:2px}.p-hd .unit{font-size:10px;white-space:normal;text-align:right}
+
+  /* Left Column: Channels ranking & Shop table */
+  .col-left>.p-rank{height:310px;flex:none;overflow:hidden}
+  .channel-head,.rank-row{grid-template-columns:18px minmax(0,1fr) 52px 52px 52px;gap:4px;padding:0 4px}
+  .channel-head{height:18px;flex:none;font-size:10px;color:var(--text-secondary);border-bottom:1px solid rgba(36,48,73,0.35);padding-bottom:2px}
+  .channel-head div:not(:first-child):not(:nth-child(2)){text-align:right}
+  .p-rank .p-bd{gap:2px;display:flex;flex-direction:column;min-height:0;flex:1;justify-content:space-between}
+  .rank-list{gap:2px;overflow:visible!important;display:flex;flex-direction:column;flex:1;justify-content:space-between}
+  .rank-row{flex:1;min-height:22px;max-height:25px;padding:1px 4px;border-bottom:1px solid rgba(36,48,73,0.25);display:grid;align-items:center}
+  .rk-no{font-size:11px;text-align:center}
+  .rk-name{font-size:11px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .rk-bar{height:2px;margin-top:2px}
+  .rk-val{font-size:11px;line-height:1.1;text-align:right}
+  .rk-val .r{font-size:9px;margin-top:0;display:block}
+
+  /* Left Column Bottom: Shop Table (Fills full height without void gaps) */
+  .col-left>.p-eff{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}
+  .eff-table-wrap{flex:1;min-height:0;overflow:hidden!important;display:flex;flex-direction:column}
+  .eff{width:100%;border-collapse:collapse;table-layout:fixed;flex:1}
+  .eff thead{flex:none}
+  .eff th{font-size:10px;padding:0 4px 6px;white-space:nowrap;border-bottom:1px solid rgba(36,48,73,0.5);color:var(--text-tertiary);text-align:right}
+  .eff th:first-child,.eff td:first-child{text-align:left;padding-left:6px}
+  .eff tbody{display:table-row-group}
+  .eff tr{height:auto}
+  .eff td{font-size:11px;height:27px;padding:2px 4px;border-bottom:1px solid rgba(36,48,73,0.3);text-align:right;vertical-align:middle}
+  .eff td.ch{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px;font-weight:600}
+  .eff td.time-cell{font-size:10px;white-space:nowrap;text-align:right;padding-right:6px}
+  .eff td.time-cell .t-stamp{font-family:var(--font-num);color:var(--text-secondary);margin-right:4px}
+  .row-delay{font-size:9px;font-weight:600;padding:1px 4px;border-radius:3px;display:inline-block;white-space:nowrap;vertical-align:middle}
+  .eff-pagination{height:32px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:4px;padding:0 8px;margin-top:4px;border-radius:6px;background:var(--surface-raised);border:1px solid var(--border-subtle)}
+  .page-info{font-size:10px;gap:4px;color:var(--text-secondary);white-space:nowrap}
+  .page-info b{font-size:11px;color:var(--accent-gold)}
+  .page-controls{gap:3px;display:flex;align-items:center}
+  .page-btn{padding:2px 5px;font-size:10px;border-radius:3px}
+  .page-pills{gap:2px;display:flex}
+  .page-pill{width:18px;height:18px;font-size:10px;border-radius:3px}
+
+  /* Mid Column: KPI, Trend, Brand */
+  .col-mid>.p-kpi{height:190px;flex:none;overflow:hidden}
+  .kpi-label{font-size:11px;color:var(--text-secondary);display:flex;align-items:center;justify-content:space-between}
+  .kpi-main{gap:6px;margin-top:2px;display:flex;align-items:baseline}
+  .kpi-main .big{font-size:42px;font-weight:700;line-height:1.0}
+  .kpi-main .u{font-size:14px;color:var(--text-secondary)}
+  .kpi-prog{margin-top:4px}
+  .kpi-prog .line{margin-bottom:2px;display:flex;align-items:center;justify-content:space-between}
+  .kpi-prog .line .lb{font-size:10px}
+  .kpi-prog .line .pc{font-size:12px;font-weight:700}
+  .bar{height:6px;padding:1px;border-radius:3px}
+  .kpi-yoy{gap:4px;margin-top:6px;display:grid;grid-template-columns:repeat(4,1fr)}
+  .kpi-yoy div{font-size:9px;padding:4px 6px;border-radius:5px}
+  .kpi-yoy b{font-size:12px;margin-top:1px;line-height:1.2}
+
+  .col-mid>.p-trend{height:auto;flex:1;min-height:170px;overflow:hidden}
+  .trend-wrap{position:relative;height:100%;min-height:0;overflow:hidden}
+  .trend-legend{font-size:10px;gap:6px;margin-bottom:2px;display:flex;flex-wrap:wrap}
+  .trend-legend button{padding:1px;background:none;border:0;color:inherit;cursor:pointer}
+  .trend-legend i{width:10px;height:3px;margin-right:3px;display:inline-block;border-radius:2px;vertical-align:middle}
+  .trend-summary{font-size:9px;gap:8px;margin-bottom:2px;display:flex;flex-wrap:wrap}
+  svg.trend{height:calc(100% - 36px);min-height:100px;display:block;width:100%}
+  svg.trend text.trend-axis-y{font-size:18px}
+  svg.trend text.trend-axis-x{font-size:18px}
+  #trendTooltip{font-size:11px;padding:6px 10px;min-width:160px}
+  #trendTooltip .tip-hd{font-size:11px;padding-bottom:3px;margin-bottom:3px}
+  #trendTooltip .tip-row{font-size:10px;gap:8px}
+  #trendTooltip .tip-row b{font-size:11px}
+  #trendTooltip .tip-delta{font-size:10px}
+
+  .col-mid>.p-mini{height:105px;flex:none;overflow:hidden}
+  .minis{gap:6px;display:grid;grid-template-columns:repeat(3,1fr);height:100%}
+  .mini{padding:6px 8px;gap:2px;border-radius:6px;min-width:0;display:flex;flex-direction:column;justify-content:center}
+  .mini .lb{font-size:10px}
+  .mini .v{font-size:18px;font-weight:700;white-space:nowrap}
+  .mini .v small{font-size:9px;margin-left:2px}
+  .mini .d{font-size:9px;overflow-wrap:anywhere}
+
+  /* Right Column: Live shops (Aligned at 310px) & Influencers */
+  .col-right>.p-live{height:310px;flex:none;overflow:hidden}
+  .p-live .p-bd{overflow:visible!important;display:flex;flex-direction:column;height:calc(100% - 28px);justify-content:space-between}
+  .live-main{padding:6px 8px;margin-bottom:4px;border-radius:6px}
+  .live-top{margin-bottom:2px;gap:4px;display:flex;align-items:center;justify-content:space-between}
+  .live-title{font-size:12px;font-weight:700}
+  .live-host{font-size:8px;margin-top:1px;color:var(--text-secondary)}
+  .badge.live{font-size:8px;padding:1px 4px;white-space:nowrap;border-radius:8px}
+  .live-metrics{gap:4px;display:grid;grid-template-columns:repeat(3,1fr);margin-top:2px}
+  .live-metrics .m{padding:2px 4px;border-radius:4px;min-width:0}
+  .live-metrics .lb{font-size:8px;color:var(--text-secondary)}
+  .live-metrics .v{font-size:13px;font-weight:700;margin-top:1px}
+  .live-metrics .v small{font-size:8px;margin-left:1px}
+  .live-sub{gap:3px;display:flex;flex-direction:column;flex:1;justify-content:space-between}
+  .live-sub-row{padding:3px 6px;border-radius:4px;gap:4px;display:flex;align-items:center;justify-content:space-between;min-height:24px;flex:1}
+  .live-sub-row .t{font-size:10px;font-weight:600;display:flex;align-items:baseline;gap:4px}
+  .live-sub-row .t small{font-size:8px;color:var(--text-tertiary);margin-left:2px;display:inline}
+  .live-sub-row .v{font-size:11px;font-weight:700;white-space:nowrap}
+
+  /* Right Column Bottom: Influencer Rankings (Scrollable with Deluxe Cards + Fixed Summary) */
+  .col-right>.p-daren{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .p-daren .p-bd{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden}
+  .tal-scroll-wrap{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:3px}
+  .tal-scroll-wrap::-webkit-scrollbar{width:4px}
+  .tal-scroll-wrap::-webkit-scrollbar-track{background:rgba(15,23,42,0.3);border-radius:2px}
+  .tal-scroll-wrap::-webkit-scrollbar-thumb{background:rgba(147,197,253,0.3);border-radius:2px}
+  .tal-scroll-wrap::-webkit-scrollbar-thumb:hover{background:rgba(147,197,253,0.6)}
+  .tal-list{gap:5px;display:flex;flex-direction:column}
+  .tal-row{grid-template-columns:22px minmax(0,1fr) 56px 64px;gap:6px;padding:6px 8px;border-radius:6px;min-height:42px;flex:none;display:grid;align-items:center;background:rgba(26,34,52,0.6);border:1px solid rgba(36,48,73,0.5)}
+  .tal-no{font-size:11px;font-weight:700;width:20px;height:20px;border-radius:4px;display:flex;align-items:center;justify-content:center;background:rgba(148,163,184,0.15);color:#94A3B8}
+  .tal-row:nth-child(1) .tal-no{background:#FFB84D;color:#000;box-shadow:0 0 6px rgba(255,184,77,0.4)}
+  .tal-row:nth-child(2) .tal-no{background:#CBD5E1;color:#000}
+  .tal-row:nth-child(3) .tal-no{background:#D97706;color:#FFF}
+  .tal-name{gap:1px;display:flex;flex-direction:column;min-width:0}
+  .tal-name .nm{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#F8FAFC}
+  .tal-name .cg{font-size:8px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tal-gmv{font-size:13px;font-weight:700;text-align:right;color:var(--accent-gold)}
+  .tal-gmv small{font-size:8px;margin-left:1px;color:var(--text-secondary)}
+  .tal-cnt{font-size:9px;color:var(--text-secondary);text-align:right;white-space:nowrap}
+  .tal-summary-bar{height:28px;flex:none;margin-top:4px;padding:0 8px;border-radius:5px;background:var(--surface-raised);border:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;font-size:9px;color:var(--text-secondary)}
+  .tal-summary-bar b{color:var(--accent-gold);font-size:11px;font-family:var(--font-num)}
+  .tal-summary-bar .sep{color:var(--border-subtle);margin:0 4px}
+
+  .hint{display:none}
+}
+@media (max-width:1100px) {
+  html,body{overflow:auto!important}
+  .stage{height:auto!important;min-height:100vh}
+  .grid{height:auto!important;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .col-mid{grid-column:1/-1;order:-1}.col-mid>.p-trend{height:300px;flex:none}
+  .col-left>.p-rank,.col-left>.p-eff,.col-right>.p-live,.col-right>.p-daren{height:340px;flex:none}
+}
+@media (max-width:700px) {
+  .stage{padding:10px}.grid{grid-template-columns:minmax(0,1fr)}header{height:auto;min-height:68px;gap:8px}.hdr-brand h1{font-size:16px}.hdr-meta{font-size:9px;gap:4px}.hdr-brand .tag{font-size:9px}.logo-badge{display:none}.countdown{font-size:22px}
+}
 </style>
 </head>
 <body>
@@ -346,6 +529,7 @@
         <span class="dot"></span>
         <span class="status-txt">实时链路正常 · 自动增量比对</span>
         <span class="num" style="color:var(--text-secondary)">2026-10-21 02:42:32 UTC</span>
+        <button id="btnReload" onclick="window.location.reload()" title="刷新获取最新大屏数据" style="background:rgba(59,130,246,0.18);border:1px solid rgba(96,165,250,0.4);color:#93C5FD;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;">&#x21bb; 刷新</button>
       </div>
     </div>
   </header>
@@ -378,11 +562,12 @@
             <table class="eff">
               <thead>
                 <tr>
-                  <th style="width:38%;">店铺名称</th>
-                  <th style="width:15%;">净销</th>
-                  <th style="width:17%;">增量</th>
-                  <th style="width:15%;">自营</th>
-                  <th>达播</th>
+                  <th style="width:28%;">店铺名称</th>
+                  <th style="width:12%;">净销</th>
+                  <th style="width:14%;">增量</th>
+                  <th style="width:12%;">自营</th>
+                  <th style="width:12%;">达播</th>
+                  <th style="width:25%;">数据更新时间</th>
                 </tr>
               </thead>
               <tbody id="shopsBody"></tbody>
@@ -399,6 +584,11 @@
               <div class="page-pills" id="pagePills"></div>
               <button class="page-btn" id="btnNextPage">下一页 ›</button>
             </div>
+            </div>
+          </div>
+          <div class=tal-summary-bar>
+            <span>有销达人全域贡献合计</span>
+            <span class=num>净销 <b>1318.47万</b> <span class=sep>/</span> GMV 2022.97万</span>
           </div>
         </div>
       </section>
@@ -533,11 +723,12 @@
       <!-- 2. 达人 TOP 5 排名 -->
       <section class="panel p-daren">
         <div class="p-hd">
-          <h2>达人净销 TOP 5</h2>
+          <h2>达人排名</h2>
           <span class="unit">全渠道 / 万元</span>
         </div>
         <div class="p-bd" id="darenBody">
-          <div class="tal-list">
+          <div class="tal-scroll-wrap">
+            <div class="tal-list">
             <div class="tal-row">
               <div class="tal-no num">1</div>
               <div class="tal-name">
@@ -613,8 +804,9 @@
 
   /* ---------- 24小时全盘销售总额汇总走势 (真实小时数据，不伪造未来数据) ---------- */
   var hiddenTrend = {};
+  var trendState = null;
   function drawTrend() {
-    var w = 1340, h = 530, left = 96, right = 24, top = 36, bottom = 48;
+    var w = 1340, h = 530, left = 110, right = 30, top = 36, bottom = 48;
     var iw = w - left - right, ih = h - top - bottom;
     var definitions = [
       {key:'v', label:'今日总净销', color:'#FFB84D'},
@@ -631,13 +823,14 @@
     var span = Math.max(hi - lo, 1); hi += span * .16; if (lo < 0) lo -= span * .08;
     var x = function(i) { return left + i * iw / 23; };
     var y = function(v) { return top + (hi - v) * ih / (hi - lo); };
+    trendState = { w: w, h: h, left: left, right: right, top: top, bottom: bottom, iw: iw, ih: ih, x: x, y: y, definitions: definitions, lo: lo, hi: hi };
     var g = '';
     for (var t=0; t<=4; t++) {
       var v = lo + (hi-lo)*t/4, py=y(v);
       g += '<line x1="'+left+'" y1="'+py+'" x2="'+(w-right)+'" y2="'+py+'" stroke="#263247" stroke-dasharray="6 8"/>';
-      g += '<text x="'+(left-12)+'" y="'+(py+7)+'" fill="#94A3B8" font-size="20" text-anchor="end">'+v.toFixed(0)+'万</text>';
+      g += '<text x="'+(left-14)+'" y="'+(py+6)+'" fill="#94A3B8" font-size="18" text-anchor="end" class="trend-axis-y">'+v.toFixed(0)+'万</text>';
     }
-    for (var i=0;i<24;i+=2) g += '<text x="'+x(i)+'" y="'+(h-12)+'" fill="#94A3B8" font-size="20" text-anchor="middle">'+String(i).padStart(2,'0')+'时</text>';
+    for (var i=0;i<24;i+=2) g += '<text x="'+x(i)+'" y="'+(h-14)+'" fill="#94A3B8" font-size="18" text-anchor="middle" class="trend-axis-x">'+String(i).padStart(2,'0')+'时</text>';
     definitions.forEach(function(s) {
       if (hiddenTrend[s.key]) return;
       var path='', connected=false, last=null;
@@ -651,6 +844,7 @@
       g += '<path d="'+path+'" fill="none" stroke="'+s.color+'" stroke-width="4" '+(s.key==='yesterday'?'stroke-dasharray="10 8"':'')+' stroke-linejoin="round"/>';
       if(last && s.key==='v') g += '<text x="'+Math.min(last.px+12,w-200)+'" y="'+(last.py-18)+'" fill="'+s.color+'" font-size="22">'+last.value.toFixed(2)+'万</text>';
     });
+    g += '<g id="trendHoverGroup"></g>';
     $('trendSvg').innerHTML=g;
     var current=REAL_HOURLY.filter(function(p) {return p.v != null;}).slice(-1)[0];
     if(current && current.yesterday != null) {
@@ -686,9 +880,61 @@
     $("rankList").innerHTML = html;
   }
 
+  function formatUpdateTimeAndDelay(isoStr) {
+    if (!isoStr) {
+      return { time: "—", fullTime: "源数据未提供更新时间", delayText: "未提供", delayClass: "delay-missing" };
+    }
+    var stamp = Date.parse(isoStr);
+    if (!Number.isFinite(stamp)) {
+      return { time: "—", fullTime: String(isoStr), delayText: "未提供", delayClass: "delay-missing" };
+    }
+    var timeStr = "";
+    var tIdx = isoStr.indexOf("T");
+    if (tIdx >= 0 && isoStr.length >= tIdx + 9) {
+      timeStr = isoStr.substring(tIdx + 1, tIdx + 9);
+    } else {
+      var d = new Date(stamp);
+      var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+      timeStr = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    }
+    var fullTimeStr = isoStr.replace("T", " ").substring(0, 19);
+    var now = Date.now();
+    var ageMin = Math.floor((now - stamp) / 60000);
+    if (ageMin < 0) ageMin = 0;
+    var delayText = "";
+    var delayClass = "";
+    if (ageMin < 1) {
+      delayText = "延迟 <1 分钟";
+      delayClass = "delay-good";
+    } else if (ageMin <= 15) {
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-good";
+    } else if (ageMin <= 30) {
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-warn";
+    } else {
+      delayText = "延迟 " + ageMin + " 分钟";
+      delayClass = "delay-danger";
+    }
+    return { time: timeStr, fullTime: fullTimeStr, delayText: delayText, delayClass: delayClass };
+  }
+
   /* ---------- 重点店铺明细（支持分页查看，已移除状态列） ---------- */
   var currentPage = 1;
   var pageSize = 10;
+  // staffdeck-notebook-pagination
+  function viewportShopPageSize() {
+    if (window.innerWidth > 1920) return 10;
+    var wrap = document.querySelector(".eff-table-wrap");
+    var h = wrap && wrap.clientHeight > 100 ? wrap.clientHeight : (window.innerHeight - 440);
+    var count = Math.floor((h - 26) / 29);
+    return Math.max(6, Math.min(14, count));
+  }
+  pageSize = viewportShopPageSize();
+  window.addEventListener('resize', function () {
+    var nextSize = viewportShopPageSize();
+    if (nextSize !== pageSize) { pageSize = nextSize; renderShopsPage(1); }
+  });
 
   function renderShopsPage(page) {
     var total = SHOPS_DATA.length;
@@ -706,12 +952,17 @@
       var isNeg = s.neg || s.net < 0;
       var momStr = s.mom == null ? "—" : String(s.mom);
       var isMomDown = momStr.indexOf("-") >= 0;
+      var dt = formatUpdateTimeAndDelay(s.updated_at);
       html += '<tr>' +
               '<td class="ch" title="' + escapeHtml(s.name) + '">' + escapeHtml(s.name) + '</td>' +
-              '<td class="n ' + (isNeg ? 'down' : '') + '">' + Number(s.net).toFixed(2) + '</td>' +
+              '<td class="n ' + (isNeg ? 'down' : '') + '">' + amount(s.net) + '</td>' +
               '<td class="n ' + (isMomDown ? 'down' : 'up') + '">' + escapeHtml(momStr) + '</td>' +
               '<td class="n">' + amount(s.ops) + '</td>' +
               '<td class="n split-live">' + amount(s.live) + '</td>' +
+              '<td class="time-cell" data-iso="' + escapeHtml(s.updated_at || '') + '" title="数据更新时间: ' + escapeHtml(dt.fullTime) + ' (' + escapeHtml(dt.delayText) + ')">' +
+                '<span class="t-stamp">' + escapeHtml(dt.time) + '</span>' +
+                '<span class="row-delay ' + dt.delayClass + '">' + escapeHtml(dt.delayText) + '</span>' +
+              '</td>' +
               '</tr>';
     });
     $("shopsBody").innerHTML = html;
@@ -777,14 +1028,36 @@
   }
   startAutoFlip();
 
-  /* ---------- 时钟 ---------- */
+  /* ---------- 店铺数据延迟动态计算与自动保活刷新 ---------- */
+  function updateShopDelays() {
+    var cells = document.querySelectorAll(".time-cell[data-iso]");
+    cells.forEach(function (cell) {
+      var iso = cell.getAttribute("data-iso");
+      if (!iso) return;
+      var dt = formatUpdateTimeAndDelay(iso);
+      var delaySpan = cell.querySelector(".row-delay");
+      if (delaySpan) {
+        delaySpan.className = "row-delay " + dt.delayClass;
+        delaySpan.textContent = dt.delayText;
+      }
+      cell.title = "数据更新时间: " + dt.fullTime + " (" + dt.delayText + ")";
+    });
+  }
+
+  /* ---------- 时钟与动态延迟刷新 ---------- */
   function tick() {
     var now = new Date();
     var h = (now.getHours() < 10 ? "0" : "") + now.getHours();
     var m = (now.getMinutes() < 10 ? "0" : "") + now.getMinutes();
     var sec = (now.getSeconds() < 10 ? "0" : "") + now.getSeconds();
     $("clock").textContent = h + ":" + m + ":" + sec;
+    updateShopDelays();
   }
+
+  // 大屏自动保活刷新：每 3 分钟自动重载页面获取最新数据快照
+  setTimeout(function () {
+    window.location.reload();
+  }, 180000);
 
   fit();
   drawTrend();
@@ -796,23 +1069,97 @@
       drawTrend();
     });
   });
-  $('trendSvg').addEventListener('mousemove',function(event) {
-    var rect=this.getBoundingClientRect();
-    var hour=Math.max(0,Math.min(23,Math.round(((event.clientX-rect.left)/rect.width*1340-96)/(1340-96-24)*23)));
-    var point=REAL_HOURLY.find(function(p) { return parseInt(p.h,10)===hour; });
-    if(!point) { $('trendTooltip').style.display='none'; return; }
-    var lines=[point.h+' · 累计净销'];
-    [['v','今日总净销'],['yesterday','昨日总净销'],['live','今日达播'],['ops','今日自营']].forEach(function(s) {
-      lines.push(s[1]+'：'+(point[s[0]]==null?'暂无数据':point[s[0]].toFixed(2)+'万'));
-    });
-    if(point.v!=null && point.yesterday!=null) {
-      var delta=point.v-point.yesterday;
-      lines.push('较昨日同期：'+(delta>=0?'+':'')+delta.toFixed(2)+'万');
+  $('trendSvg').addEventListener('mousemove', function(event) {
+    if (!trendState) return;
+    var rect = this.getBoundingClientRect();
+    var svgX = (event.clientX - rect.left) / rect.width * trendState.w;
+    var svgY = (event.clientY - rect.top) / rect.height * trendState.h;
+    var hour = Math.max(0, Math.min(23, Math.round((svgX - trendState.left) / trendState.iw * 23)));
+    var point = REAL_HOURLY.find(function(p) { return parseInt(p.h, 10) === hour; });
+    var tip = $('trendTooltip');
+    var hoverGroup = $('trendHoverGroup');
+    if (!point) {
+      if (tip) tip.style.display = 'none';
+      if (hoverGroup) hoverGroup.innerHTML = '';
+      return;
     }
-    $('trendTooltip').textContent=lines.join('\n');
-    $('trendTooltip').style.display='block';
+    var px = trendState.x(hour);
+
+    // 1. 绘制跟随鼠标的指示线与坐标轴数字胶囊
+    var hg = '';
+    // X轴垂直参考线
+    hg += '<line x1="' + px + '" y1="' + trendState.top + '" x2="' + px + '" y2="' + (trendState.h - trendState.bottom) + '" stroke="rgba(255,184,77,0.7)" stroke-width="2" stroke-dasharray="4 4"/>';
+    // X轴时间胶囊 (跟随鼠标在底部X轴高亮显示对应时间)
+    hg += '<rect x="' + (px - 34) + '" y="' + (trendState.h - trendState.bottom + 4) + '" width="68" height="26" rx="6" fill="#1E293B" stroke="#60A5FA" stroke-width="1.5"/>';
+    hg += '<text x="' + px + '" y="' + (trendState.h - trendState.bottom + 22) + '" fill="#93C5FD" font-size="16" font-weight="700" text-anchor="middle">' + point.h + '</text>';
+
+    // 曲线数据靶点
+    trendState.definitions.forEach(function(s) {
+      if (hiddenTrend[s.key] || point[s.key] == null) return;
+      var py = trendState.y(point[s.key]);
+      hg += '<circle cx="' + px + '" cy="' + py + '" r="5" fill="' + s.color + '" stroke="#0A0F1D" stroke-width="2"/>';
+      hg += '<circle cx="' + px + '" cy="' + py + '" r="9" fill="none" stroke="' + s.color + '" stroke-width="2" opacity="0.8"/>';
+    });
+
+    // Y轴金额数值胶囊 (跟随鼠标/当前总净销在左侧Y轴高亮展示金额)
+    var displayVal = point.v != null ? point.v : (point.yesterday != null ? point.yesterday : null);
+    var yPy = displayVal != null ? trendState.y(displayVal) : Math.max(trendState.top, Math.min(trendState.h - trendState.bottom, svgY));
+    var valWan = displayVal != null ? displayVal.toFixed(2) + '万' : (trendState.hi - (svgY - trendState.top) / trendState.ih * (trendState.hi - trendState.lo)).toFixed(2) + '万';
+    
+    // 水平参考线 (从Y轴到当前点)
+    hg += '<line x1="' + trendState.left + '" y1="' + yPy + '" x2="' + px + '" y2="' + yPy + '" stroke="rgba(255,184,77,0.35)" stroke-width="1.5" stroke-dasharray="3 3"/>';
+    // Y轴胶囊背景及数值
+    hg += '<rect x="' + (trendState.left - 104) + '" y="' + (yPy - 13) + '" width="98" height="26" rx="5" fill="#FFB84D"/>';
+    hg += '<text x="' + (trendState.left - 8) + '" y="' + (yPy + 6) + '" fill="#0A0F1D" font-size="15" font-weight="700" text-anchor="end">' + valWan + '</text>';
+
+    if (hoverGroup) hoverGroup.innerHTML = hg;
+
+    // 2. 悬浮提示框跟随鼠标移动展示 (边缘避让)
+    var wrap = document.querySelector('.trend-wrap');
+    if (wrap && tip) {
+      var wrapRect = wrap.getBoundingClientRect();
+      var mouseX = event.clientX - wrapRect.left;
+      var mouseY = event.clientY - wrapRect.top;
+      var lines = '<div class="tip-hd">' + point.h + ' · 24小时累计净销</div><div class="tip-rows">';
+      trendState.definitions.forEach(function(s) {
+        if (hiddenTrend[s.key]) return;
+        var val = point[s.key];
+        var valStr = val == null ? '暂无数据' : val.toFixed(2) + '万';
+        lines += '<div class="tip-row"><span><i style="background:' + s.color + '"></i>' + s.label + '</span><b style="color:' + s.color + '">' + valStr + '</b></div>';
+      });
+      if (point.v != null && point.yesterday != null) {
+        var delta = point.v - point.yesterday;
+        var sign = delta >= 0 ? '+' : '';
+        var pct = point.yesterday > 0 ? ' (' + (delta / point.yesterday * 100).toFixed(1) + '%)' : '';
+        var dColor = delta >= 0 ? '#34D399' : '#F87171';
+        lines += '<div class="tip-delta" style="color:' + dColor + '">较昨日同期：' + sign + delta.toFixed(2) + '万' + pct + '</div>';
+      }
+      lines += '</div>';
+      tip.innerHTML = lines;
+      tip.style.display = 'block';
+
+      var tipW = tip.offsetWidth || 210;
+      var tipH = tip.offsetHeight || 130;
+      var posX = mouseX + 18;
+      if (posX + tipW > wrapRect.width - 10) {
+        posX = mouseX - tipW - 18;
+      }
+      var posY = mouseY - 15;
+      if (posY + tipH > wrapRect.height - 10) {
+        posY = wrapRect.height - tipH - 10;
+      }
+      if (posY < 6) posY = 6;
+      tip.style.left = Math.max(6, posX) + 'px';
+      tip.style.top = Math.max(6, posY) + 'px';
+    }
   });
-  $('trendSvg').addEventListener('mouseleave',function() { $('trendTooltip').style.display='none'; });
+
+  $('trendSvg').addEventListener('mouseleave', function() {
+    var tip = $('trendTooltip');
+    if (tip) tip.style.display = 'none';
+    var hoverGroup = $('trendHoverGroup');
+    if (hoverGroup) hoverGroup.innerHTML = '';
+  });
   renderChannels();
   renderShopsPage(1);
   tick();

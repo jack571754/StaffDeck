@@ -9,20 +9,7 @@ Renders real-time e-commerce sales broadcasts with:
 6. Mentions and footer notes.
 """
 
-from __future__ import annotations
-
-from datetime import UTC, datetime
-from typing import Any
-
-from app.reporting.sales_metrics import (
-    build_dabo_matrix_table_elements,
-    format_influencer_top_lines,
-    is_dabo_row,
-)
-from app.scheduled_tasks.renderers.base import fmt_diff_styled, fmt_val_styled
-from app.scheduled_tasks.renderers.generic_table import build_generic_feishu_card
-
-CANONICAL_BRAND_ORDER: tuple[str, ...] = (
+from __future__ import annotationsfrom datetime import UTC, datetimefrom typing import Anyfrom app.reporting.sales_metrics import (    build_dabo_matrix_table_elements,    format_influencer_top_lines,    is_dabo_row,)from app.scheduled_tasks.renderers.base import fmt_diff_styled, fmt_val_styledfrom app.scheduled_tasks.renderers.generic_table import build_generic_feishu_cardCANONICAL_BRAND_ORDER: tuple[str, ...] = (
     "电商整体",
     "可复美整体",
     "天猫可复美",
@@ -51,6 +38,13 @@ def _build_dabo_top5_lines(dabo_rows: list[dict[str, Any]]) -> list[str]:
     return format_influencer_top_lines(dabo_rows, limit=5, empty_fallback="")
 
 
+def _to_float(v: Any) -> float:
+    try:
+        return float(v or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def build_sales_feishu_card(
     rows: list[dict[str, Any]],
     title: str = "",
@@ -59,6 +53,7 @@ def build_sales_feishu_card(
     is_first_push: bool = False,
     at_users: list[dict[str, Any]] | None = None,
     should_at_all: bool = False,
+    shop_sales_url: str | None = None,
     **_kwargs: Any,
 ) -> dict[str, Any]:
     """Assemble native Feishu interactive card 2.0 based on real-time sales query rows."""
@@ -236,11 +231,16 @@ def build_sales_feishu_card(
     # Dynamic Top 5 shops & Top 5 influencer sales
     dabo_lines = _build_dabo_top5_lines(dabo_top_rows)
     if not is_first_push and (pos_increment_shops or dabo_lines or neg_increment_shops):
+        sorted_pos = sorted(
+            [s for s in pos_increment_shops if _to_float(s.get("环比增量_万") or s.get("diff_amount")) > 0],
+            key=lambda s: _to_float(s.get("环比增量_万") or s.get("diff_amount")),
+            reverse=True,
+        )
         pos_lines = []
-        for i, s in enumerate(pos_increment_shops[:5], 1):
+        for i, s in enumerate(sorted_pos[:5], 1):
             name = s.get("item") or s.get("平台店铺") or s.get("name") or s.get("_identifier") or "未知店铺"
-            net = float(s.get("净销_万") or s.get("price") or 0)
-            diff = float(s.get("环比增量_万") or s.get("diff_amount") or 0)
+            net = _to_float(s.get("净销_万") or s.get("price"))
+            diff = _to_float(s.get("环比增量_万") or s.get("diff_amount"))
             pos_lines.append(f"{i}. **{name}**\n   增量: <font color='green'>**+{diff:.2f}万**</font> | 净销: {net:.2f}万")
 
         right_lines = dabo_lines if dabo_lines else ["*(暂无达人实时销售数据)*"]
@@ -431,6 +431,38 @@ def build_sales_feishu_card(
             "content": f"🔔 **通知负责人**：{' '.join(at_tags)}",
             "text_align": "left",
             "text_size": "normal",
+        })
+
+    target_shop_url = shop_sales_url or _kwargs.get("shop_sales_url")
+    if target_shop_url and str(target_shop_url).strip():
+        url_str = str(target_shop_url).strip()
+        elements.append({
+            "tag": "markdown",
+            "content": f"👉 **[点击打开：查看全部店铺实时销售]({url_str})**",
+            "text_align": "center",
+        })
+        elements.append({
+            "tag": "button",
+            "type": "primary",
+            "text": {
+                "tag": "plain_text",
+                "content": "查看全部店铺实时销售",
+            },
+            "multi_url": {
+                "url": url_str,
+                "pc_url": url_str,
+                "android_url": url_str,
+                "ios_url": url_str,
+            },
+            "behaviors": [
+                {
+                    "type": "open_url",
+                    "default_url": url_str,
+                    "pc_url": url_str,
+                    "android_url": url_str,
+                    "ios_url": url_str,
+                }
+            ],
         })
 
     return {

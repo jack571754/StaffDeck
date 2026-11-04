@@ -28,7 +28,10 @@
 | `html.py` | **唯一序列化器 + 唯一转义出口**：`render_report_html`（先 `validate_document`）、`build_island`（仅元数据，不含行数据）、`ISLAND_ID="staffdeck-report-data"`、`_esc` / `_json_island`（`<` `>` 全部 `\u` 转义）；图表是服务端内联 SVG（bar / line），**零外部资源** |
 | `renderers/` | rows → `ReportDocument` 的**注册表**：`REPORT_RENDERERS`（`generic_table`/`table` → 通用表；`sales_report`/`sales_card`/`sales` → 销售报告）、`get_report_renderer`、`report_renderer_names`、`DEFAULT_RENDERER_NAME="generic_table"`；`base.py`（`ReportRenderer`、`coerce_rows`、`rows_to_dataset`）、`generic_table.py`、`sales_report.py` |
 | `spec.py` | **扁平 spec → `ReportDocument`**（`build_report_from_spec`、`SPEC_KEYS`、`MAX_SPEC_ROWS=5000`）：把 `{title, subtitle, renderer, rows, columns, column_labels, summary, kpis, source, max_rows}` 交给注册表渲染器，再在顶部补 `markdown`（summary）与 `kpi_row`（kpis）块；未知字段/类型错误/空标题一律抛 `ReportDocumentError`。**这是模型、pipeline 步骤与 HTTP 调用方唯一需要知道的形状**——没有人再手搓 dataset 与 block |
-| `writer.py` | **唯一触 DB / 文件系统**：`write_report_html` → `PublishedReport`、`report_file_name`；`MAX_REPORT_BYTES=20MiB`、`_PUBLISH_MAX_FILE_BYTES=25MiB`、`_TEMP_PREFIX=".tmp-"`、`_REPORT_OPERATION="report_generation"`、`REPORT_CONTENT_TYPE="text/html; charset=utf-8"` |
+| `writer.py` | 通用报告写入：`write_report_html` → `PublishedReport`、`report_file_name`；`MAX_REPORT_BYTES=20MiB`、`_PUBLISH_MAX_FILE_BYTES=25MiB`、`_TEMP_PREFIX=".tmp-"`、`_REPORT_OPERATION="report_generation"`、`REPORT_CONTENT_TYPE="text/html; charset=utf-8"` |
+| `dashboard_shops.py` | 全店快照取数，返回平台、店铺 ID、运营/达播/合计净销及北京时间源时间；`None` 为失败，`[]` 为真实空结果，保留零销售和退款店铺 |
+| `shop_sales_report.py` / `templates/shop_sales_report.html` | 全店独立页纯渲染；全量明细、搜索、手机布局、源时间和延迟提示；每 60 秒重载页面，不额外取数 |
+| `shop_sales_syncer.py` | 仅处理 `shop_sales_report_enabled=true` 的任务；验证租户、创建者与 owner 后写入稳定交付物，维护摘要及 `shop_sales_share_link_id`；撤销后不重建 |
 | `link.py` | 分享链接签发：`mint_report_share_link` → `ReportShareLink`（`url` / `token` / `expires_at` / `remaining_seconds`）；**只签名，不校验存在性与权限** |
 | `errors.py` | `ReportError` / `ReportDocumentError(ReportError, ValueError)` / `ReportRenderError` |
 
@@ -114,6 +117,9 @@
 
 ## 变更记录 (Changelog)
 
+- 2026-11-02 — 全店销售独立页：周期任务每 15 分钟取数，卡片最下方提供独立入口；与原大屏复用一次全店查询。首次生成使用 `scripts/refresh_shop_sales_report.py <task_id> --apply`，默认运行仅检查，不改变调度状态或发送飞书。
+
+- 2026-10-23T10:35 — **达人助播归并（飞书卡片 TOP5 口径）**：新增 `sales_metrics.canonical_influencer_name`，把「李佳琦-助播」「李佳琦（助播）」等助播账号并入主达人后再排名；`extract_influencer_name` 统一走该函数（飞书卡片 `scheduled_tasks/renderers/sales_card.py`、HTML 销售报告 `renderers/sales_report.py`、大屏 `daren_top5` 三条链路共用同一规则）；达播矩阵的「李佳琦 / 二梯队（除李佳琦）」分组、大屏 `fetch_all_channel_daren_top5`、大屏 TOP5 的平台/品牌归属同步改为归并名比对，避免同一人两处口径不一致。只识别「助播」后缀，场次后缀（如「小豆芽儿-20号早8点护肤场超级补贴」）不受影响。回归：`test_sales_snapshot.py`（归并规则 + 矩阵跨平台合并）、`test_realtime_dashboard.py`、`test_scheduled_task_pipeline.py`（销售卡端到端）。
 - 2026-09-30T18:55 — **前端入口接入**：会话产物卡片（`frontend-enterprise/src/pages/chat/components/HarnessArtifactDownloads.tsx`）对 HTML 报告增加「预览/分享」（预览 = `share-link` + 相对路径新标签打开；分享 = 复制后端绝对 URL），无需新后端路由。
 - 2026-09-30T18:45 — **真机验证通过**（单端口应用 5173，admin/admin，demo 模型真实调用 `report_generate`）：产物落库、下载、铸造分享链接、**匿名打开**共 10 项检查全绿；据此修正「打开」一行中写错的端点（真实为 `POST /api/chat/artifacts/share-link`，下载需带 `session_id`）。
 - 2026-09-30T18:30 — 接线生产最小闭环：新增 `spec.py`（扁平 spec → `ReportDocument`）；新增内建能力 **`report_generate`**（manifest 声明 + always-expanded + invoker `_generate_report`）把本包接上会话链路，复用既有下载/预览/签名分享端点（无需新路由）；新增 `test_reporting_capability.py` 覆盖闭环（92 个相关测试通过）；更新「生产接入」一节与风险表（P0「无生产调用方」标记为已解决，pipeline 路径仍未接）。

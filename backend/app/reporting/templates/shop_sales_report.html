@@ -1,0 +1,950 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>全部店铺实时销售</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: #e2e8f0;
+      --line-subtle: #edf2f7;
+      --paper: #f8fafc;
+      --card-bg: #ffffff;
+      --primary: #0f392b;
+      --primary-light: #164e3b;
+      --ops: #0d9488;
+      --ops-bg: #f0fdfa;
+      --live: #d97706;
+      --live-bg: #fffbeb;
+      --negative: #dc2626;
+      --negative-bg: #fef2f2;
+      --negative-border: #fecaca;
+      --zero: #94a3b8;
+      --highlight: #2563eb;
+      --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.05);
+      --shadow-md: 0 4px 6px -1px rgba(15, 23, 42, 0.07), 0 2px 4px -2px rgba(15, 23, 42, 0.05);
+      --radius: 10px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, select { font: inherit; }
+    [hidden] { display: none !important; }
+    .shell { max-width: 1440px; margin: auto; padding: 32px 36px 48px; }
+
+    /* Top Masthead */
+    .masthead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 16px;
+      gap: 16px;
+    }
+    .brand-wrap { display: flex; align-items: center; gap: 12px; }
+    .wordmark {
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 1.5px;
+      color: var(--primary);
+    }
+    .wordmark span {
+      font-weight: 400;
+      letter-spacing: 0;
+      border-left: 1px solid #cbd5e1;
+      padding-left: 12px;
+      margin-left: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .masthead-actions { display: flex; align-items: center; gap: 10px; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--ops);
+      background: var(--ops-bg);
+      border: 1px solid #ccfbf1;
+      padding: 4px 10px;
+      border-radius: 20px;
+    }
+    .status:before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .status.delayed {
+      color: var(--negative);
+      background: var(--negative-bg);
+      border-color: var(--negative-border);
+    }
+    .auto-refresh-pill {
+      font-size: 12px;
+      color: var(--muted);
+      background: #f1f5f9;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 4px 10px;
+      white-space: nowrap;
+    }
+
+    /* Page Heading */
+    .heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 20px;
+      padding: 24px 0 20px;
+    }
+    h1 {
+      font-size: clamp(24px, 2.5vw, 32px);
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      margin: 0 0 8px;
+      color: var(--ink);
+    }
+    .subtitle {
+      font-size: 13px;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.6;
+    }
+    .subtitle strong { color: var(--ink); font-weight: 600; }
+    .heading-buttons { display: flex; align-items: center; gap: 8px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      background: var(--card-bg);
+      color: var(--ink);
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      min-height: 38px;
+      padding: 8px 15px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+      box-shadow: var(--shadow-sm);
+    }
+    .btn:hover { background: #f8fafc; border-color: #94a3b8; }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .btn-primary:hover { background: var(--primary-light); }
+    .btn:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid var(--ops);
+      outline-offset: 2px;
+    }
+
+    /* KPI Summary Cards */
+    .metrics {
+      display: grid;
+      grid-template-columns: 1.35fr 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .metric {
+      background: var(--card-bg);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      box-shadow: var(--shadow-sm);
+      position: relative;
+      overflow: hidden;
+    }
+    .metric.primary {
+      background: linear-gradient(145deg, #0f392b 0%, #164e3b 100%);
+      color: #fff;
+      border-color: #0f392b;
+      box-shadow: 0 4px 12px rgba(15, 57, 43, 0.15);
+    }
+    .metric-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 10px;
+      color: var(--muted);
+    }
+    .primary .metric-label { color: #a7f3d0; }
+    .metric-tag {
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    .primary .metric-tag { background: rgba(255, 255, 255, 0.18); color: #fff; }
+    .ops-tag { background: var(--ops-bg); color: var(--ops); border: 1px solid #ccfbf1; }
+    .live-tag { background: var(--live-bg); color: var(--live); border: 1px solid #fde68a; }
+    .metric-value {
+      font-size: clamp(26px, 2.6vw, 36px);
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -1px;
+      line-height: 1.1;
+    }
+    .metric-value.ops { color: var(--ops); }
+    .metric-value.live { color: var(--live); }
+    .metric-unit {
+      font-size: 14px;
+      letter-spacing: 0;
+      font-weight: 400;
+      margin-left: 4px;
+      opacity: 0.8;
+    }
+    .metric-caption {
+      font-size: 12px;
+      margin-top: 10px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .primary .metric-caption { color: #d1fae5; opacity: 0.9; }
+
+    /* Controls: Filter Pills & Search */
+    .controls-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px 18px;
+      margin-bottom: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      box-shadow: var(--shadow-sm);
+    }
+    .filter-tabs { display: flex; align-items: center; gap: 6px; overflow-x: auto; max-width: 100%; padding-bottom: 2px; }
+    .tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover { background: #f1f5f9; color: var(--ink); }
+    .tab-btn.active {
+      background: #f1f5f9;
+      color: var(--ink);
+      font-weight: 600;
+      border-color: #cbd5e1;
+    }
+    .tab-badge {
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      padding: 1px 6px;
+      border-radius: 10px;
+      background: #e2e8f0;
+      margin-left: 4px;
+      color: #475569;
+    }
+    .tab-btn.active .tab-badge { background: #0f172a; color: #fff; }
+    .search-filter-box { display: flex; align-items: center; gap: 10px; }
+    .search-wrap { position: relative; width: 260px; max-width: 100%; }
+    .search {
+      width: 100%;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #fff;
+      padding: 8px 30px 8px 12px;
+      font-size: 13px;
+      min-height: 38px;
+      color: var(--ink);
+      transition: border-color 0.15s;
+    }
+    .search:focus { border-color: var(--ops); }
+    .search-clear {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: 0;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 4px;
+      display: none;
+    }
+    .search-clear.visible { display: block; }
+    .count {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      font-weight: 500;
+    }
+
+    /* Table Component */
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow-x: auto;
+      background: var(--card-bg);
+      box-shadow: var(--shadow-sm);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+    th {
+      font-weight: 600;
+      color: #475569;
+      background: #f8fafc;
+      padding: 14px 16px;
+      white-space: nowrap;
+      border-bottom: 1px solid var(--line);
+      user-select: none;
+    }
+    th.sortable { cursor: pointer; transition: background 0.15s; }
+    th.sortable:hover { background: #f1f5f9; color: var(--ink); }
+    th.sort-active { background: #eef2f6; color: var(--ink); }
+    th .sort-icon { font-size: 11px; margin-left: 4px; opacity: 0.5; }
+    th.sort-active .sort-icon { opacity: 1; color: var(--ops); }
+    th:nth-child(3), th:nth-child(4), th:nth-child(5) { text-align: right; }
+    td {
+      padding: 16px;
+      border-bottom: 1px solid var(--line-subtle);
+      line-height: 1.45;
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr { transition: background 0.12s; }
+    tbody tr:hover { background: #f8fafc; }
+    .shop-name {
+      font-weight: 600;
+      color: var(--ink);
+      min-width: 180px;
+    }
+
+    /* Platform Badges */
+    .platform-tag {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 4px;
+      padding: 3px 8px;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .platform-tmall { background: #fff1eb; border-color: #ffcfb8; color: #e64500; }
+    .platform-douyin { background: #f0f2f5; border-color: #d5d8de; color: #1d2129; }
+    .platform-jd { background: #fef0f0; border-color: #fbc4c4; color: #d81e06; }
+    .platform-kuaishou { background: #fff4ed; border-color: #fed7be; color: #f34d00; }
+    .platform-vip { background: #fdf0f7; border-color: #f9c8e7; color: #cd0073; }
+    .platform-wechat { background: #eefbf3; border-color: #bdeccb; color: #079c4b; }
+    .platform-xhs { background: #fef0f2; border-color: #fac9cf; color: #eb2444; }
+    .platform-pdd { background: #fef5e7; border-color: #fcdbb3; color: #d4380d; }
+    .platform-other { background: #f1f5f9; border-color: #cbd5e1; color: #475569; }
+
+    /* Number Formats */
+    .amount {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .ops { color: var(--ops); }
+    .live { color: var(--live); }
+    .net { color: var(--ink); font-weight: 700; font-size: 15px; }
+    .negative-value {
+      color: var(--negative) !important;
+      display: inline-block;
+      padding: 2px 6px;
+      background: var(--negative-bg);
+      border: 1px solid var(--negative-border);
+      border-radius: 4px;
+    }
+    .zero { color: var(--zero) !important; font-weight: 400; }
+    .updated {
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .row-delay {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+      white-space: nowrap;
+      transition: all 0.2s ease;
+    }
+    .delay-good {
+      color: #0d9488;
+      background: #f0fdfa;
+      border: 1px solid #ccfbf1;
+    }
+    .delay-warn {
+      color: #d97706;
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+    }
+    .delay-danger {
+      color: var(--negative);
+      background: var(--negative-bg);
+      border: 1px solid var(--negative-border);
+    }
+    .delay-missing {
+      color: #64748b;
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+    }
+    .toast-banner {
+      position: fixed;
+      top: 18px;
+      right: 24px;
+      z-index: 1000;
+      background: #0f392b;
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.18);
+      opacity: 0;
+      transform: translateY(-10px);
+      transition: all 0.25s ease;
+      pointer-events: none;
+    }
+    .toast-banner.toast-show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* States & Notes */
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 56px 20px;
+      background: var(--card-bg);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      font-size: 14px;
+    }
+    .table-note {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      padding: 14px 4px 6px;
+      line-height: 1.6;
+    }
+    .footer {
+      border-top: 1px solid var(--line);
+      padding-top: 20px;
+      margin-top: 24px;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      font-size: 12px;
+      line-height: 1.8;
+      color: var(--muted);
+    }
+
+    /* Desktop Sticky Table Header */
+    @media (min-width: 1024px) {
+      th { position: sticky; top: 0; z-index: 10; }
+      .table-wrap { max-height: 72vh; }
+    }
+
+    /* Mobile Responsive Card View */
+    @media (max-width: 768px) {
+      .shell { padding: 16px 12px 36px; }
+      .masthead { padding-bottom: 12px; }
+      .wordmark { font-size: 12px; }
+      .wordmark span { display: none; }
+      .heading {
+        padding: 18px 0 16px;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 14px;
+      }
+      h1 { font-size: 22px; }
+      .subtitle { font-size: 12px; }
+      .heading-buttons { width: 100%; }
+      .heading-buttons .btn { flex: 1; }
+      .metrics { grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+      .metric { padding: 16px; }
+      .metric.primary { grid-column: 1 / -1; }
+      .metric-value { font-size: 26px; }
+      .primary .metric-value { font-size: 34px; }
+      .controls-panel { padding: 12px; flex-direction: column; align-items: stretch; gap: 10px; }
+      .filter-tabs { width: 100%; }
+      .search-wrap { width: 100%; }
+      .search-filter-box { flex-direction: column; align-items: stretch; }
+
+      /* Transform table to cards on mobile */
+      .table-wrap { background: transparent; border: 0; border-radius: 0; overflow: visible; }
+      table, tbody { display: block; }
+      thead { display: none; }
+      tbody { display: grid; gap: 10px; }
+      tr {
+        display: block;
+        background: var(--card-bg);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 14px 16px;
+        box-shadow: var(--shadow-sm);
+      }
+      td { display: block; padding: 0; border: 0; min-width: 0; }
+      .card-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      .shop-name { font-size: 15px; font-weight: 700; line-height: 1.35; flex: 1; }
+      .card-metrics-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1.2fr;
+        gap: 8px;
+        background: #f8fafc;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+      }
+      .amount { text-align: left; font-size: 14px; }
+      .amount.net { font-size: 16px; font-weight: 700; color: var(--primary); }
+      .amount:before {
+        content: attr(data-label);
+        display: block;
+        color: var(--muted);
+        font-weight: 400;
+        font-size: 11px;
+        margin-bottom: 4px;
+      }
+      .updated {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 11px;
+        color: var(--muted);
+        border-top: 1px solid var(--line-subtle);
+        padding-top: 8px;
+      }
+      .updated time:before { content: "更新于 "; }
+      .table-note, .footer { flex-direction: column; gap: 6px; }
+    }
+  </style>
+</head>
+<body data-refresh-seconds="$refresh_seconds">
+<main class="shell">
+  <!-- Masthead -->
+  <header class="masthead">
+    <div class="brand-wrap">
+      <div class="wordmark">STAFFDECK<span>电商实时销售中心</span></div>
+      <span id="dataStatus" class="status $status_class" role="status">$status</span>
+    </div>
+    <div class="masthead-actions">
+      <span class="auto-refresh-pill" id="refreshCountdown"><strong id="countdownSec">$refresh_seconds</strong>s 后刷新</span>
+      <button class="btn" id="pauseRefreshBtn" type="button" title="暂停/继续自动刷新">暂停</button>
+    </div>
+  </header>
+
+  <!-- Page Title & Heading -->
+  <section class="heading" aria-labelledby="pageTitle">
+    <div>
+      <h1 id="pageTitle">全部店铺实时销售</h1>
+      <p class="subtitle">
+        每一笔销售，分清运营与达播。<br>
+        <strong>数据每 15 分钟更新</strong> · 页面每 $refresh_seconds 秒自动刷新 · 金额单位：万元
+      </p>
+    </div>
+    <div class="heading-buttons">
+      <button class="btn btn-primary" id="refreshButton" type="button">立即刷新 ↻</button>
+    </div>
+  </section>
+
+  <!-- KPI Summary Cards -->
+  <section class="metrics" aria-label="全店销售汇总">
+    <article class="metric primary">
+      <div class="metric-label">
+        <span>合计净销</span>
+        <span class="metric-tag">$shop_count 家店铺</span>
+      </div>
+      <div class="metric-value">$net<span class="metric-unit">万元</span></div>
+      <div class="metric-caption">
+        正销 $pos_count 家 · 零销 $zero_count 家 · 退款负销 $neg_count 家
+      </div>
+    </article>
+    <article class="metric">
+      <div class="metric-label">
+        <span>运营净销</span>
+        <span class="metric-tag ops-tag">占比 $ops_ratio</span>
+      </div>
+      <div class="metric-value ops">$ops<span class="metric-unit">万元</span></div>
+      <div class="metric-caption">自营/自然流量运营净销售额</div>
+    </article>
+    <article class="metric">
+      <div class="metric-label">
+        <span>达播净销</span>
+        <span class="metric-tag live-tag">占比 $live_ratio</span>
+      </div>
+      <div class="metric-value live">$live<span class="metric-unit">万元</span></div>
+      <div class="metric-caption">达人合作/专场带货净销售额</div>
+    </article>
+  </section>
+
+  <!-- Filter & Search Controls -->
+  <section aria-labelledby="shopsTitle">
+    <div class="controls-panel">
+      <div class="filter-tabs" role="tablist" aria-label="店铺状态筛选">
+        <button class="tab-btn active" data-tab="all" type="button">全部 <span class="tab-badge">$shop_count</span></button>
+        <button class="tab-btn" data-tab="pos" type="button">正净销 <span class="tab-badge">$pos_count</span></button>
+        <button class="tab-btn" data-tab="zero" type="button">零净销 <span class="tab-badge">$zero_count</span></button>
+        <button class="tab-btn" data-tab="neg" type="button">负净销 (退款) <span class="tab-badge">$neg_count</span></button>
+      </div>
+      <div class="search-filter-box">
+        <div class="search-wrap">
+          <input class="search" id="shopSearch" type="search" placeholder="搜索店铺名称或平台..." aria-label="搜索店铺名称或平台" autocomplete="off">
+          <button class="search-clear" id="searchClear" type="button" aria-label="清空搜索">×</button>
+        </div>
+        <span class="count" id="shopCount">$shop_count 家店铺</span>
+      </div>
+    </div>
+
+    <!-- Data Table -->
+    <div class="table-wrap">
+      <table aria-label="全部店铺销售明细">
+        <thead>
+          <tr>
+            <th class="sortable" data-col="platform" scope="col">平台 <span class="sort-icon">↕</span></th>
+            <th class="sortable" data-col="shop-name" scope="col">店铺名称 <span class="sort-icon">↕</span></th>
+            <th class="sortable" data-col="ops" scope="col">运营净销 (万元) <span class="sort-icon">↕</span></th>
+            <th class="sortable" data-col="live" scope="col">达播净销 (万元) <span class="sort-icon">↕</span></th>
+            <th class="sortable sort-active" data-col="net" scope="col">合计净销 (万元) <span class="sort-icon">↓</span></th>
+            <th class="sortable" data-col="updated" scope="col">数据更新时间 <span class="sort-icon">↕</span></th>
+          </tr>
+        </thead>
+        <tbody id="shopTableBody">$rows</tbody>
+      </table>
+    </div>
+
+    <div class="empty" id="emptyState" $empty_hidden>暂无店铺销售数据</div>
+
+    <div class="table-note">
+      <span>💡 金额单位：万元 · 默认按合计净销降序 · 点击表头可升降排序</span>
+      <span>运营净销与达播净销四舍五入保留两位小数，与合计净销可能存在微小尾差；“—” 表示尚未返回快照。</span>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div>
+      各店铺源快照时间范围：<strong id="sourceRange">$source_range</strong><br>
+      各店铺数据更新节奏存在差异，单店超 30 分钟未更新会自动标注延迟提醒。
+    </div>
+    <div>
+      页面生成时间：$generated<br>
+      刷新页面只拉取最新快照，不额外发起业务重算或打扰飞书推送群。
+    </div>
+  </footer>
+</main>
+
+<script>
+  (function () {
+    'use strict';
+    var search = document.getElementById('shopSearch');
+    var clearBtn = document.getElementById('searchClear');
+    var tbody = document.getElementById('shopTableBody');
+    var rows = Array.from(document.querySelectorAll('[data-shop-row]'));
+    var empty = document.getElementById('emptyState');
+    var status = document.getElementById('dataStatus');
+    var tabBtns = Array.from(document.querySelectorAll('.tab-btn'));
+    var sortHeaders = Array.from(document.querySelectorAll('th.sortable'));
+    var countdownSec = document.getElementById('countdownSec');
+    var pauseBtn = document.getElementById('pauseRefreshBtn');
+    var refreshSeconds = Number(document.body.dataset.refreshSeconds) || 60;
+    var remainingSeconds = refreshSeconds;
+    var isPaused = false;
+    var currentTab = 'all';
+    var sortCol = 'net';
+    var sortDir = 'desc';
+
+    // Parse URL Hash state
+    function loadHashState() {
+      if (!window.location.hash) return;
+      var params = new URLSearchParams(window.location.hash.slice(1));
+      if (params.get('q')) {
+        search.value = params.get('q');
+        clearBtn.classList.add('visible');
+      }
+      if (params.get('tab')) {
+        currentTab = params.get('tab');
+        tabBtns.forEach(function (btn) {
+          btn.classList.toggle('active', btn.dataset.tab === currentTab);
+        });
+      }
+      if (params.get('sort')) {
+        sortCol = params.get('sort');
+        sortDir = params.get('dir') === 'asc' ? 'asc' : 'desc';
+      }
+    }
+
+    function syncHashState() {
+      var params = new URLSearchParams();
+      if (search.value.trim()) params.set('q', search.value.trim());
+      if (currentTab !== 'all') params.set('tab', currentTab);
+      if (sortCol !== 'net' || sortDir !== 'desc') {
+        params.set('sort', sortCol);
+        params.set('dir', sortDir);
+      }
+      return params.toString();
+    }
+
+    // Filter by Tab and Search
+    function filter() {
+      var query = search.value.trim().toLocaleLowerCase();
+      var visible = 0;
+
+      rows.forEach(function (row) {
+        var statusMatch = true;
+        if (currentTab === 'pos') statusMatch = row.dataset.status === 'pos';
+        else if (currentTab === 'zero') statusMatch = row.dataset.status === 'zero';
+        else if (currentTab === 'neg') statusMatch = row.dataset.status === 'neg';
+
+        var queryMatch = !query || row.dataset.search.toLocaleLowerCase().indexOf(query) !== -1;
+        var show = statusMatch && queryMatch;
+        row.hidden = !show;
+        if (show) visible += 1;
+      });
+
+      var countText = query || currentTab !== 'all' ? visible + ' / ' + rows.length + ' 家店铺' : rows.length + ' 家店铺';
+      document.getElementById('shopCount').textContent = countText;
+      empty.hidden = visible > 0;
+      empty.textContent = rows.length ? '没有匹配的店铺，请调整筛选条件或搜索词' : '暂无店铺销售数据';
+      clearBtn.classList.toggle('visible', Boolean(search.value.trim()));
+      syncHashState();
+    }
+
+    // Sort table rows
+    function sortRows() {
+      sortHeaders.forEach(function (th) {
+        var isThis = th.dataset.col === sortCol;
+        th.classList.toggle('sort-active', isThis);
+        var icon = th.querySelector('.sort-icon');
+        if (icon) {
+          icon.textContent = isThis ? (sortDir === 'asc' ? '↑' : '↓') : '↕';
+        }
+      });
+
+      rows.sort(function (a, b) {
+        var aVal, bVal;
+        if (sortCol === 'platform') {
+          aVal = a.dataset.platform || '';
+          bVal = b.dataset.platform || '';
+          return sortDir === 'asc' ? aVal.localeCompare(bVal, 'zh-CN') : bVal.localeCompare(aVal, 'zh-CN');
+        } else if (sortCol === 'shop-name') {
+          aVal = a.dataset.shopName || '';
+          bVal = b.dataset.shopName || '';
+          return sortDir === 'asc' ? aVal.localeCompare(bVal, 'zh-CN') : bVal.localeCompare(aVal, 'zh-CN');
+        } else if (sortCol === 'updated') {
+          aVal = a.querySelector('[data-updated-at]').dataset.updatedAt || '';
+          bVal = b.querySelector('[data-updated-at]').dataset.updatedAt || '';
+          return sortDir === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+        } else {
+          // Numeric: net, ops, live
+          aVal = a.dataset[sortCol];
+          bVal = b.dataset[sortCol];
+          var aNum = aVal === '' || aVal === undefined ? -Infinity : Number(aVal);
+          var bNum = bVal === '' || bVal === undefined ? -Infinity : Number(bVal);
+          return sortDir === 'asc' ? aNum - bNum : bNum - aNum;
+        }
+      });
+
+      rows.forEach(function (r) { tbody.appendChild(r); });
+      syncHashState();
+    }
+
+    function onHeaderClick(e) {
+      var th = e.currentTarget;
+      var col = th.dataset.col;
+      if (sortCol === col) {
+        sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        sortCol = col;
+        sortDir = (col === 'platform' || col === 'shop-name') ? 'asc' : 'desc';
+      }
+      sortRows();
+    }
+
+    // Data Staleness Check & Dynamic Delay Display
+    function updateDelay() {
+      var delayed = false;
+      var now = Date.now();
+      document.querySelectorAll('[data-updated-at]').forEach(function (cell) {
+        var raw = cell.dataset.updatedAt;
+        var stamp = Date.parse(raw);
+        var badge = cell.querySelector('.row-delay');
+        if (!badge) return;
+        badge.className = 'row-delay';
+        if (!raw || !Number.isFinite(stamp)) {
+          badge.textContent = '时间未提供';
+          badge.classList.add('delay-missing');
+          delayed = true;
+          return;
+        }
+        var age = Math.floor((now - stamp) / 60000);
+        if (age < 0) age = 0;
+        if (age < 1) {
+          badge.textContent = '延迟 <1 分钟';
+          badge.classList.add('delay-good');
+        } else if (age <= 15) {
+          badge.textContent = '延迟 ' + age + ' 分钟';
+          badge.classList.add('delay-good');
+        } else if (age <= 30) {
+          badge.textContent = '延迟 ' + age + ' 分钟';
+          badge.classList.add('delay-warn');
+        } else {
+          badge.textContent = '延迟 ' + age + ' 分钟';
+          badge.classList.add('delay-danger');
+          delayed = true;
+        }
+      });
+      status.textContent = delayed ? '数据可能延迟' : (rows.length ? '快照已更新' : '暂无数据');
+      status.classList.toggle('delayed', delayed);
+    }
+
+    // 仅重新加载已生成快照，不访问销售源；搜索与排序保存在 URL 片段中。
+    function refresh() {
+      var hash = syncHashState();
+      var btn = document.getElementById('refreshButton');
+      btn.disabled = true;
+      btn.textContent = '正在加载最新页面... ↻';
+      var url = new URL(window.location.href);
+      url.searchParams.delete('refresh');
+      url.searchParams.set('_t', String(Date.now()));
+      url.hash = hash;
+      window.location.href = url.toString();
+    }
+
+    // Auto-refresh countdown tick
+    function tickCountdown() {
+      if (isPaused) return;
+      remainingSeconds -= 1;
+      if (remainingSeconds <= 0) {
+        if (document.activeElement === search || (window.getSelection && window.getSelection().toString())) {
+          // User is typing or selecting, defer reload by 10s
+          remainingSeconds = 10;
+          countdownSec.textContent = remainingSeconds;
+          return;
+        }
+        refresh();
+      } else {
+        countdownSec.textContent = remainingSeconds;
+      }
+    }
+
+    // Event Listeners
+    search.addEventListener('input', filter);
+    clearBtn.addEventListener('click', function () {
+      search.value = '';
+      filter();
+      search.focus();
+    });
+
+    tabBtns.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        tabBtns.forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        currentTab = btn.dataset.tab;
+        filter();
+      });
+    });
+
+    sortHeaders.forEach(function (th) {
+      th.addEventListener('click', onHeaderClick);
+    });
+
+    document.getElementById('refreshButton').addEventListener('click', refresh);
+
+    pauseBtn.addEventListener('click', function () {
+      isPaused = !isPaused;
+      pauseBtn.textContent = isPaused ? '继续' : '暂停';
+      document.getElementById('refreshCountdown').style.opacity = isPaused ? '0.5' : '1';
+    });
+
+    // Mobile layout card wrap adjustment
+    function checkMobileView() {
+      var isMobile = window.innerWidth <= 768;
+      rows.forEach(function (row) {
+        var existingCard = row.querySelector('.card-header-row');
+        if (isMobile && !existingCard) {
+          var platformCell = row.querySelector('.platform');
+          var nameCell = row.querySelector('.shop-name');
+          var opsCell = row.querySelector('.ops');
+          var liveCell = row.querySelector('.live');
+          var netCell = row.querySelector('.net');
+          var updatedCell = row.querySelector('.updated');
+
+          var headerDiv = document.createElement('div');
+          headerDiv.className = 'card-header-row';
+          headerDiv.appendChild(nameCell);
+          headerDiv.appendChild(platformCell);
+
+          var gridDiv = document.createElement('div');
+          gridDiv.className = 'card-metrics-grid';
+          gridDiv.appendChild(opsCell);
+          gridDiv.appendChild(liveCell);
+          gridDiv.appendChild(netCell);
+
+          row.innerHTML = '';
+          row.appendChild(headerDiv);
+          row.appendChild(gridDiv);
+          row.appendChild(updatedCell);
+        }
+      });
+    }
+
+    // Init
+    loadHashState();
+    filter();
+    if (sortCol !== 'net' || sortDir !== 'desc') {
+      sortRows();
+    }
+    updateDelay();
+    checkMobileView();
+
+    window.setInterval(updateDelay, 10000);
+    window.setInterval(tickCountdown, 1000);
+  }());
+</script>
+</body>
+</html>

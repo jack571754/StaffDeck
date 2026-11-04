@@ -238,7 +238,7 @@ def aggregate_tmall_hourly(
     migrations: list[dict[str, Any]],
 ) -> dict[tuple[str, int], float]:
     """Apply the template's migration-first attribution in memory, avoiding a huge join."""
-    from datetime import datetime, time
+    from datetime import datetime, time, timedelta
 
     def stamp(value: Any) -> datetime:
         if isinstance(value, datetime):
@@ -252,7 +252,7 @@ def aggregate_tmall_hourly(
             for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
                 try:
                     # Match the naive local timestamps returned by the MySQL driver.
-                    return datetime.strptime(text, fmt)  # noqa: DTZ007
+                    return datetime.strptime(text, fmt)
                 except ValueError:
                     continue
             raise ValueError("Unsupported attribution timestamp") from None
@@ -272,7 +272,11 @@ def aggregate_tmall_hourly(
             live_count = sum(
                 (
                     rule["迁移归属"]
-                    if stamp(rule["迁移开始日期"]) <= instant <= stamp(rule["迁移截止日期"])
+                    if (
+                        stamp(rule["迁移开始日期"])
+                        <= instant
+                        < stamp(rule["迁移截止日期"]) + timedelta(days=1)
+                    )
                     else rule["原始归属"]
                 )
                 == "达播"

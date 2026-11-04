@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{title}}</title>
+  <style>
+    :root { color-scheme: light dark; --bg: light-dark(#f5f7fa,#14191f); --fg: light-dark(#172536,#e4eaf1); --panel: light-dark(#fff,#202832); --line: light-dark(#dbe1e9,#3b4859); --muted: light-dark(#526478,#b0becd); --accent: light-dark(#245ca4,#8cb8f4); --chip: light-dark(#e9f0fa,#2d3c51); }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.6 "Microsoft YaHei","PingFang SC",sans-serif; }
+    main { max-width: 1680px; margin: auto; padding: 28px 32px 40px; }
+    header { display: flex; gap: 20px; justify-content: space-between; align-items: flex-start; padding-bottom: 16px; border-bottom: 2px solid var(--accent); }
+    h1 { font-size: 24px; font-weight: 600; margin: 0 0 8px; }
+    h2 { font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+    .meta,.note,footer { color: var(--muted); }
+    .meta { margin: 0; }
+    .note { margin: 0 0 12px; font-size: 13px; }
+    .badge { flex-shrink: 0; background: var(--chip); color: var(--accent); padding: 5px 12px; border-radius: 4px; }
+    .kpis { display: grid; grid-template-columns: repeat(3,1fr); margin-top: 20px; gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .kpi { background: var(--panel); padding: 18px 24px; }
+    .kpi span { display: block; color: var(--muted); }
+    .kpi strong { font-size: 32px; letter-spacing: -.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    small { font-size: 14px; font-weight: 400; }
+    .delta { margin: 0; padding: 12px 0 20px; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .panels { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; align-items: start; }
+    section:not(.kpis) { min-width: 0; background: var(--panel); padding: 18px; border: 1px solid var(--line); }
+    .panels section:nth-child(2),.panels .trend { grid-column: 1/-1; }
+    .scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th,td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { white-space: nowrap; color: var(--muted); font-size: 13px; font-weight: 500; }
+    td { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    th:first-child,td:first-child { padding-left: 0; }
+    tr:last-child td { border-bottom: 0; }
+    svg { display: block; width: 100%; min-width: 640px; }
+    svg text { fill: var(--muted); font-size: 12px; font-family: inherit; }
+    .gridline { stroke: var(--line); stroke-width: 1; }
+    polyline { fill: none; stroke-width: 2; }
+    polyline.today,circle.today { stroke: var(--accent); }
+    circle.today { fill: var(--accent); }
+    polyline.yesterday,circle.yesterday { stroke: var(--muted); }
+    polyline.yesterday { stroke-dasharray: 5 4; }
+    circle.yesterday { fill: var(--muted); }
+    .legend { display: flex; gap: 24px; margin-bottom: 12px; }
+    .legend .today { color: var(--accent); }
+    .legend .yesterday { color: var(--muted); }
+    footer { margin-top: 22px; font-size: 13px; }
+    @media(min-width:1900px) { main { max-width: 2200px; } .panels { grid-template-columns: repeat(3,minmax(0,1fr)); } .panels section:nth-child(2) { grid-column: span 2; } }
+    @media(max-width:850px) { main { padding: 18px; } .panels { grid-template-columns: 1fr; } .panels section { grid-column: 1!important; } header { display: block; } .badge { display: inline-block; margin-top: 12px; } .kpi { padding: 14px; } .kpi strong { font-size: 25px; } }
+    @media(max-width:480px) { .kpis { grid-template-columns: 1fr; } h1 { font-size: 21px; } }
+    @media print { :root { color-scheme: light; } main { padding: 0; } .panels { display: block; } section { break-inside: avoid; margin-bottom: 14px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><h1>{{title}}</h1><p class="meta">业务日期 {{date}}<br>上游汇总时间 {{source_time}}　报告生成时间 {{generated_at}}</p></div>
+      <span class="badge">测试副本 · 未发送消息</span>
+    </header>
+    <section class="kpis" aria-label="净销指标，单位万元">{{kpis}}</section>
+    <p class="delta">{{delta}}</p>
+    <div class="panels">{{panels}}</div>
+    <footer>所有指标继承所选查询模板的业务口径。跨次差值比较的是成功预览，不是生产推送；数据缺失显示“—”。仅发布本副本的独立报告，不更新原生产看板。</footer>
+  </main>
+</body>
+</html>
