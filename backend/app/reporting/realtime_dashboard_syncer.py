@@ -330,29 +330,22 @@ def parse_pipeline_query_metrics(query_rows: list[dict[str, Any]]) -> dict[str, 
         item = str(row.get("item") or "").strip()
         if category in ("可复美", "可丽金") and item in channel_names:
             name = channel_names[item]
-        elif category == "其他品牌" and item in ("巨子生物", "可预", "分销", "以我"):
-            name = {
+        elif category == "其他品牌" and item in ("巨子生物", "可预", "分销", "以我", "1'me以我旗舰", "1'me以我旗舰店"):
+            name = "以我" if "以我" in item else {
                 "分销": "分销渠道",
-                "巨子生物": "其它品牌(巨子/可预)",
-                "可预": "其它品牌(巨子/可预)",
             }.get(item, item)
         else:
             continue
         bucket = buckets.setdefault(name, {"name": name, "gmv": 0.0, "diff": 0.0,
-                                            "ops": 0.0, "live": 0.0})
+                                            "ops": None, "live": None})
         bucket["gmv"] += float(row.get("净销_万") or 0)
         bucket["diff"] += float(row.get("环比增量_万") or 0)
         for key, field in (("ops", "运营净销_万"), ("live", "达播净销_万")):
             value = _optional_amount(row, field)
-            bucket[key] = bucket[key] + value if bucket[key] is not None and value is not None else None
+            if value is not None:
+                bucket[key] = (bucket[key] or 0.0) + value
 
-    # Never inflate the leading channel to reconcile missing channel data.
-    residual = round(metrics["gmv_all"] - sum(row["gmv"] for row in buckets.values()), 2)
-    has_summary = any(row.get("category") == "大盘" and row.get("item") == "电商整体"
-                      for row in query_rows)
-    if has_summary and abs(residual) >= 0.01:
-        buckets["未分配净销"] = {"name": "未分配净销", "gmv": residual, "diff": 0,
-                                 "ops": None, "live": None}
+    total_channels_gmv = sum(row["gmv"] for row in buckets.values())
     channels_all = []
     for channel in sorted(buckets.values(), key=lambda row: row["gmv"], reverse=True):
         net = round(channel["gmv"], 2)
@@ -361,7 +354,7 @@ def parse_pipeline_query_metrics(query_rows: list[dict[str, Any]]) -> dict[str, 
             "ops": round(channel["ops"], 2) if channel["ops"] is not None else None,
             "live": round(channel["live"], 2) if channel["live"] is not None else None,
             "yoy": f"{channel['diff']:+.2f}万",
-            "share": f"{net / metrics['gmv_all'] * 100:.1f}%" if metrics["gmv_all"] else "—",
+            "share": f"{net / total_channels_gmv * 100:.1f}%" if total_channels_gmv else "—",
             "neg": net < 0,
         })
     metrics["channels_all"] = channels_all

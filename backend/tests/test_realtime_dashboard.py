@@ -104,7 +104,8 @@ def test_channels_preserve_real_totals_and_split_missing_values():
     assert channels["天猫渠道"]["ops"] == 35
     assert channels["天猫渠道"]["live"] == 65
     assert channels["以我"]["ops"] is None
-    assert sum(row["gmv"] for row in channels.values()) == 120
+    assert "未分配净销" not in channels
+    assert sum(row["gmv"] for row in channels.values()) == 110
 
 
 def test_priority_shops_are_deduplicated_and_sorted():
@@ -277,3 +278,47 @@ def test_influencer_ranking_includes_cross_platform_pipeline_rows():
         assert "抖音 · 可丽金" in html
         assert "抖音 · 可复美" in html
         monkeypatch.undo()
+
+
+def test_channels_combine_brands_without_unassigned_residual():
+    from app.reporting.realtime_dashboard_syncer import parse_pipeline_query_metrics
+
+    query_rows = [
+        {"category": "大盘", "item": "电商整体", "净销_万": 700.0, "运营净销_万": 500.0, "达播净销_万": 200.0},
+        {"category": "可复美", "item": "天猫", "净销_万": 200.0, "运营净销_万": 180.0, "达播净销_万": 20.0, "环比增量_万": 10.0},
+        {"category": "可复美", "item": "抖音", "净销_万": 150.0, "运营净销_万": 100.0, "达播净销_万": 50.0, "环比增量_万": 5.0},
+        {"category": "可丽金", "item": "天猫", "净销_万": 50.0, "运营净销_万": 40.0, "达播净销_万": 10.0, "环比增量_万": 2.0},
+        {"category": "可丽金", "item": "抖音", "净销_万": 20.0, "运营净销_万": 15.0, "达播净销_万": 5.0, "环比增量_万": 1.0},
+        {"category": "其他品牌", "item": "分销", "净销_万": 60.0, "环比增量_万": 1.0},
+        {"category": "其他品牌", "item": "巨子生物", "净销_万": 25.0, "环比增量_万": 0.5},
+        {"category": "其他品牌", "item": "可预", "净销_万": 5.0, "环比增量_万": 0.2},
+        {"category": "其他品牌", "item": "以我", "净销_万": 0.5, "环比增量_万": 0.0},
+    ]
+    metrics = parse_pipeline_query_metrics(query_rows)
+    channel_map = {row["name"]: row for row in metrics["channels_all"]}
+
+    # 天猫渠道 = 天猫可复美 (200) + 天猫可丽金 (50) = 250
+    assert channel_map["天猫渠道"]["gmv"] == 250.0
+    assert channel_map["天猫渠道"]["ops"] == 220.0
+    assert channel_map["天猫渠道"]["live"] == 30.0
+    assert channel_map["天猫渠道"]["yoy"] == "+12.00万"
+
+    # 抖音渠道 = 抖音可复美 (150) + 抖音可丽金 (20) = 170
+    assert channel_map["抖音渠道"]["gmv"] == 170.0
+    assert channel_map["抖音渠道"]["ops"] == 115.0
+    assert channel_map["抖音渠道"]["live"] == 55.0
+    assert channel_map["抖音渠道"]["yoy"] == "+6.00万"
+
+    # 其他品牌单列
+    assert channel_map["分销渠道"]["gmv"] == 60.0
+    assert channel_map["巨子生物"]["gmv"] == 25.0
+    assert channel_map["可预"]["gmv"] == 5.0
+    assert channel_map["以我"]["gmv"] == 0.5
+
+    # 差额归零，无未分配净销
+    assert "未分配净销" not in channel_map
+    assert "其它品牌(巨子/可预)" not in channel_map
+
+    # 占比总和为 100%
+    total_gmv = sum(row["gmv"] for row in metrics["channels_all"])
+    assert total_gmv == 250.0 + 170.0 + 60.0 + 25.0 + 5.0 + 0.5
